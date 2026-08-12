@@ -7,8 +7,45 @@
 use std::collections::BTreeMap;
 
 use cbor2::Cbor;
+use nutype::nutype;
 
-use crate::EnvelopeDigest;
+use crate::{EnvelopeDigest, subkey::SubkeyPath};
+
+/// The name a namespace is filed under in the ledger.
+#[nutype(
+    validate(not_empty),
+    derive(
+        Debug,
+        Clone,
+        PartialEq,
+        Eq,
+        PartialOrd,
+        Ord,
+        Hash,
+        AsRef,
+        Display,
+        Borrow,
+        Serialize,
+        Deserialize
+    )
+)]
+pub struct NamespaceKey(String);
+
+/// A retention floor, in minutes.
+#[nutype(derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Display,
+    Serialize,
+    Deserialize
+))]
+pub struct MinKeepMinutes(u32);
 
 /// A specific message in the ledger.
 ///
@@ -22,6 +59,9 @@ pub enum Msg {
     /// Sets the value of a namespace entirely.
     #[serde(rename = "s")]
     SetNamespace(SetNamespace),
+    /// Sets or clears a single value nested inside a namespace.
+    #[serde(rename = "sk")]
+    SetNamespaceKey(SetNamespaceKey),
     /// Deletes an entire namespace.
     #[serde(rename = "dn")]
     DeleteNamespace(DeleteNamespace),
@@ -33,6 +73,7 @@ impl Msg {
         match self {
             Msg::Init(_) => None,
             Msg::SetNamespace(s) => Some(&s.prev),
+            Msg::SetNamespaceKey(s) => Some(&s.prev),
             Msg::DeleteNamespace(d) => Some(&d.prev),
         }
     }
@@ -46,6 +87,7 @@ impl Msg {
         match self {
             Msg::Init(_) => panic!("must_prev_digest called on Msg::Init"),
             Msg::SetNamespace(s) => &s.prev,
+            Msg::SetNamespaceKey(s) => &s.prev,
             Msg::DeleteNamespace(d) => &d.prev,
         }
     }
@@ -55,16 +97,16 @@ impl Msg {
 #[derive(Debug, Clone, Cbor, Hash, PartialEq, Eq)]
 pub struct InitMsg {
     #[cbor(key = 1)]
-    state: FullCheckpoint,
+    pub state: FullCheckpoint,
 }
 
 /// A complete encoding of the data contained in the ledger.
 #[derive(Debug, Default, Clone, Cbor, Hash, PartialEq, Eq)]
 pub struct FullCheckpoint {
     #[cbor(key = 1)]
-    namespaces: BTreeMap<String, Namespace>,
+    pub namespaces: BTreeMap<NamespaceKey, Namespace>,
     #[cbor(key = 2)]
-    config: LedgerConfig,
+    pub config: LedgerConfig,
 }
 
 /// The configuration of the ledger.
@@ -76,13 +118,13 @@ pub struct LedgerConfig {
     /// The determination that enough time has passed MUST be relative
     /// to a local time source, and/or using a signed timestamp.
     #[cbor(key = 1)]
-    min_keep_minutes: usize,
+    pub min_keep_minutes: MinKeepMinutes,
 }
 
 impl Default for LedgerConfig {
     fn default() -> Self {
         Self {
-            min_keep_minutes: 5 * 24 * 60,
+            min_keep_minutes: MinKeepMinutes::new(5 * 24 * 60),
         }
     }
 }
@@ -91,27 +133,44 @@ impl Default for LedgerConfig {
 #[derive(Debug, Clone, Cbor, Hash, PartialEq, Eq)]
 pub struct SetNamespace {
     #[cbor(key = 1)]
-    prev: EnvelopeDigest,
+    pub prev: EnvelopeDigest,
     #[cbor(key = 2)]
-    key: String,
+    pub key: NamespaceKey,
     #[cbor(key = 3)]
-    namespace: Namespace,
+    pub namespace: Namespace,
+}
+
+/// Sets or clears a single value nested inside a namespace.
+///
+/// Lets a large namespace be amended without republishing the whole of it.
+#[derive(Debug, Clone, Cbor, Hash, PartialEq, Eq)]
+pub struct SetNamespaceKey {
+    #[cbor(key = 1)]
+    pub prev: EnvelopeDigest,
+    #[cbor(key = 2)]
+    pub key: NamespaceKey,
+    /// The path to walk from the namespace's value to the value being set.
+    #[cbor(key = 3)]
+    pub path: SubkeyPath,
+    /// The value to write, or `None` to clear what the path addresses.
+    #[cbor(key = 4)]
+    pub value: Option<Value>,
 }
 
 /// Deletes a namespace.
 #[derive(Debug, Clone, Cbor, Hash, PartialEq, Eq)]
 pub struct DeleteNamespace {
     #[cbor(key = 1)]
-    prev: EnvelopeDigest,
+    pub prev: EnvelopeDigest,
     #[cbor(key = 2)]
-    key: String,
+    pub key: NamespaceKey,
 }
 
 /// A complete representation of the data & configuration of a namespace.
 #[derive(Debug, Clone, Cbor, Hash, PartialEq, Eq)]
 pub struct Namespace {
     #[cbor(key = 1)]
-    value: Value,
+    pub value: Value,
 }
 
 /// A data value.
@@ -134,7 +193,10 @@ pub enum Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::assert_wire;
+    use crate::{
+        subkey::Subkey,
+        testutil::{assert_wire, unhex},
+    };
 
     fn val(v: &str) -> Value {
         Value::String(v.to_string())
@@ -142,6 +204,10 @@ mod tests {
 
     fn ns(v: &str) -> Namespace {
         Namespace { value: val(v) }
+    }
+
+    fn key(k: &str) -> NamespaceKey {
+        NamespaceKey::try_new(k).unwrap()
     }
 
     /// Each variant is a one-entry map keyed by the renamed variant tag:
@@ -183,19 +249,19 @@ mod tests {
     fn config_encodes_min_keep_minutes() {
         assert_wire(
             &LedgerConfig {
-                min_keep_minutes: 0,
+                min_keep_minutes: MinKeepMinutes::new(0),
             },
             "a10100",
         );
         assert_wire(
             &LedgerConfig {
-                min_keep_minutes: 23,
+                min_keep_minutes: MinKeepMinutes::new(23),
             },
             "a10117",
         );
         assert_wire(
             &LedgerConfig {
-                min_keep_minutes: 24,
+                min_keep_minutes: MinKeepMinutes::new(24),
             },
             "a1011818",
         );
@@ -210,7 +276,7 @@ mod tests {
         assert_wire(&FullCheckpoint::default(), "a201a002a101191c20");
         assert_wire(
             &FullCheckpoint {
-                namespaces: BTreeMap::from([("a".to_string(), ns("1"))]),
+                namespaces: BTreeMap::from([(key("a"), ns("1"))]),
                 ..Default::default()
             },
             "a201a16161a101a16173613102a101191c20",
@@ -225,10 +291,7 @@ mod tests {
     fn checkpoint_sorts_keys_canonically() {
         assert_wire(
             &FullCheckpoint {
-                namespaces: BTreeMap::from([
-                    ("z".to_string(), ns("1")),
-                    ("aa".to_string(), ns("2")),
-                ]),
+                namespaces: BTreeMap::from([(key("z"), ns("1")), (key("aa"), ns("2"))]),
                 ..Default::default()
             },
             "a201a2617aa101a161736131626161a101a16173613202a101191c20",
@@ -239,11 +302,11 @@ mod tests {
     #[test]
     fn checkpoint_encoding_depends_only_on_content() {
         let forwards = FullCheckpoint {
-            namespaces: BTreeMap::from([("z".to_string(), ns("1")), ("aa".to_string(), ns("2"))]),
+            namespaces: BTreeMap::from([(key("z"), ns("1")), (key("aa"), ns("2"))]),
             ..Default::default()
         };
         let backwards = FullCheckpoint {
-            namespaces: BTreeMap::from([("aa".to_string(), ns("2")), ("z".to_string(), ns("1"))]),
+            namespaces: BTreeMap::from([(key("aa"), ns("2")), (key("z"), ns("1"))]),
             ..Default::default()
         };
 
@@ -287,7 +350,7 @@ mod tests {
     fn set_namespace_carries_prev_digest() {
         let msg = Msg::SetNamespace(SetNamespace {
             prev: EnvelopeDigest::from_bytes([0xab; 32]),
-            key: "a".to_string(),
+            key: key("a"),
             namespace: ns("1"),
         });
         assert_wire(
@@ -312,11 +375,76 @@ mod tests {
         let digest = EnvelopeDigest::from_bytes([0xab; 32]);
         let set = Msg::SetNamespace(SetNamespace {
             prev: digest,
-            key: "a".to_string(),
+            key: key("a"),
             namespace: ns("1"),
         });
         assert_eq!(set.prev_digest(), Some(&digest));
         assert_eq!(set.must_prev_digest(), &digest);
+    }
+
+    fn path(segments: impl IntoIterator<Item = Subkey>) -> SubkeyPath {
+        SubkeyPath::try_new(segments.into_iter().collect()).unwrap()
+    }
+
+    /// `a4` (map, 4 pairs): prev, namespace key, path, then the value —
+    /// `f6` (null) when the message clears rather than sets.
+    #[test]
+    fn set_namespace_key_carries_a_path_and_optional_value() {
+        let set = |value| {
+            Msg::SetNamespaceKey(SetNamespaceKey {
+                prev: EnvelopeDigest::from_bytes([0xab; 32]),
+                key: key("a"),
+                path: path([Subkey::Key("b".into())]),
+                value,
+            })
+        };
+
+        assert_wire(
+            &set(Some(val("1"))),
+            &format!(
+                "a162736ba4015820{}0261610381a1616b616204a161736131",
+                "ab".repeat(32)
+            ),
+        );
+        assert_wire(
+            &set(None),
+            &format!(
+                "a162736ba4015820{}0261610381a1616b616204f6",
+                "ab".repeat(32)
+            ),
+        );
+    }
+
+    /// The newtype validates on the way in, so an empty key never reaches
+    /// state — a peer can't smuggle one past by hand-rolling the CBOR.
+    #[test]
+    fn namespace_key_rejects_empty() {
+        assert!(NamespaceKey::try_new("").is_err());
+        assert!(NamespaceKey::try_new(" ").is_ok()); // validated, not sanitized
+
+        // a3 01 5820… prev, 02 60 (empty text string) key, 03 … namespace
+        let empty_key = format!("a16173a3015820{}026003a101a161736131", "ab".repeat(32));
+        assert!(crate::decode::<Msg>(&unhex(&empty_key)).is_err());
+
+        // The same message with a one-character key (`02 6161`) decodes.
+        let one_char = format!("a16173a3015820{}02616103a101a161736131", "ab".repeat(32));
+        assert!(crate::decode::<Msg>(&unhex(&one_char)).is_ok());
+    }
+
+    /// `u32`, not `usize`: the wire width can't depend on the host that
+    /// decoded it, and an over-range value is rejected rather than
+    /// truncated.
+    #[test]
+    fn min_keep_minutes_is_bounded_at_u32() {
+        assert_wire(
+            &LedgerConfig {
+                min_keep_minutes: MinKeepMinutes::new(u32::MAX),
+            },
+            "a1011affffffff",
+        );
+
+        // u32::MAX + 1, encoded as a 64-bit CBOR integer.
+        assert!(crate::decode::<LedgerConfig>(&unhex("a1011b0000000100000000")).is_err());
     }
 
     #[test]

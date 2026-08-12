@@ -13,6 +13,7 @@ as long as compaction has not run on the oldest trustworthy message.
 | Crate  | Role |
 |--------|------|
 | `wire` | Types for serializing messages on the wire. CBOR2 canonical used so messages have hash stability and can be signed. |
+| `state` | The state a chain folds down to. `Ledger::apply` advances it one envelope at a time, like replaying a database log. |
 
 ## Development conventions and hard rules
 
@@ -36,6 +37,10 @@ as long as compaction has not run on the oldest trustworthy message.
  - `impl IntoIterator<Item = T>` for consuming a sequence; `impl Iterator<Item = T>` for returning one (avoid allocating).
  - Make illegal states unrepresentable. Encode invariants in the type system: enums for mutually exclusive states (not bool flags + Options), non-empty collections via Vec1 or `(T, Vec<T>)`, parsed types instead of
    validated-then-passed-as-string. If a function can't be called in some state, that state shouldn't typecheck.
+ - **Never `usize`/`isize` in wire types.** Their width follows the host, so the same value encodes differently on a
+   32- vs 64-bit node and an over-range value silently truncates. Pick an explicit width (`u32`, `u64`) and let decoding
+   reject what doesn't fit. Newtypes on wire fields validate, never sanitize — rewriting a decoded value makes it
+   re-encode to different bytes than it arrived as, and the digests depend on those bytes.
  - Newtypes for domain values (struct UserId(u64)) over bare primitives. Use the https://crates.io/crates/nutype crate when the type needs trivial invariants enforced (non-empty, range bounds, regex, trimmed, etc.), it generates the
    validating constructor and keeps the inner value unconstructable elsewhere.
  - Default only when the default is meaningful.

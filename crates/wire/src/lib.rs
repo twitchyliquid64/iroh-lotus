@@ -12,5 +12,8 @@ pub use envelope::{Envelope, EnvelopeDigest, EnvelopeSignature, SignedTimestamp}
 pub mod msg;
 pub use msg::Msg;
 
+pub mod subkey;
+pub use subkey::{Subkey, SubkeyPath};
+
 #[cfg(test)]
 mod testutil;
