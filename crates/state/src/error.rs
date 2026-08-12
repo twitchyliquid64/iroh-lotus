@@ -5,17 +5,24 @@ use core::fmt;
 use wire::{EnvelopeDigest, msg::NamespaceKey, subkey::SubkeyPath};
 
 /// An error produced while working with a ledger.
+///
+/// Generic over the storage backend's error `E`; a backend that cannot
+/// fail declares `Infallible` and the impossibility shows in the type.
 #[derive(Debug)]
 #[non_exhaustive]
-pub enum Error {
+pub enum Error<E> {
     /// An envelope's digest could not be computed.
     Wire(wire::Error),
     /// A ledger was opened from an envelope that does not start a chain.
     NotInit,
     /// A chain was replayed from nothing.
     EmptyChain,
+    /// A ledger was opened at a head the store holds no version for.
+    UnknownHead(EnvelopeDigest),
     /// An envelope could not be applied.
-    Apply(ApplyError),
+    Apply(ApplyError<E>),
+    /// The storage backend failed.
+    Storage(E),
 }
 
 /// An error produced while applying an envelope to a ledger.
@@ -25,7 +32,7 @@ pub enum Error {
 /// ledger is not one of them.
 #[derive(Debug)]
 #[non_exhaustive]
-pub enum ApplyError {
+pub enum ApplyError<E> {
     /// The envelope's digest could not be computed.
     Wire(wire::Error),
     /// An `Init` envelope arrived at a ledger that is already open.
@@ -54,20 +61,26 @@ pub enum ApplyError {
         /// The path that was walked.
         path: SubkeyPath,
     },
+    /// The storage backend failed.
+    Storage(E),
 }
 
-impl fmt::Display for Error {
+impl<E> fmt::Display for Error<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Wire(_) => f.write_str("could not compute an envelope digest"),
             Error::NotInit => f.write_str("ledger must be opened from an Init envelope"),
             Error::EmptyChain => f.write_str("cannot replay an empty chain"),
+            Error::UnknownHead(head) => {
+                write!(f, "store holds no version at {}", head.to_hex().as_ref())
+            }
             Error::Apply(_) => f.write_str("could not apply an envelope"),
+            Error::Storage(_) => f.write_str("storage backend failed"),
         }
     }
 }
 
-impl fmt::Display for ApplyError {
+impl<E> fmt::Display for ApplyError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ApplyError::Wire(_) => f.write_str("could not compute an envelope digest"),
@@ -85,43 +98,46 @@ impl fmt::Display for ApplyError {
             ApplyError::PathTypeMismatch { key, path } => {
                 write!(f, "namespace {key} cannot be walked to {path}")
             }
+            ApplyError::Storage(_) => f.write_str("storage backend failed"),
         }
     }
 }
 
-impl core::error::Error for Error {
+impl<E: core::error::Error + 'static> core::error::Error for Error<E> {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Error::Wire(err) => Some(err),
             Error::Apply(err) => Some(err),
-            Error::NotInit | Error::EmptyChain => None,
+            Error::Storage(err) => Some(err),
+            Error::NotInit | Error::EmptyChain | Error::UnknownHead(_) => None,
         }
     }
 }
 
-impl core::error::Error for ApplyError {
+impl<E: core::error::Error + 'static> core::error::Error for ApplyError<E> {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             ApplyError::Wire(err) => Some(err),
+            ApplyError::Storage(err) => Some(err),
             _ => None,
         }
     }
 }
 
-impl From<wire::Error> for Error {
+impl<E> From<wire::Error> for Error<E> {
     fn from(err: wire::Error) -> Self {
         Error::Wire(err)
     }
 }
 
-impl From<wire::Error> for ApplyError {
+impl<E> From<wire::Error> for ApplyError<E> {
     fn from(err: wire::Error) -> Self {
         ApplyError::Wire(err)
     }
 }
 
-impl From<ApplyError> for Error {
-    fn from(err: ApplyError) -> Self {
+impl<E> From<ApplyError<E>> for Error<E> {
+    fn from(err: ApplyError<E>) -> Self {
         Error::Apply(err)
     }
 }

@@ -1,5 +1,5 @@
 [package]
-name = "state"
+name = "storage"
 version.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -7,5 +7,4 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-storage.workspace = true
 wire.workspace = true

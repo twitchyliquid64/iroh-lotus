@@ -14,11 +14,10 @@ as long as compaction has not run on the oldest trustworthy message.
 |--------|------|
 | `wire` | Types for serializing messages on the wire. CBOR2 canonical used so messages have hash stability and can be signed. |
 | `state` | The state a chain folds down to. `Ledger::apply` advances it one envelope at a time, like replaying a database log. |
+| `storage` | Where ledger state lives: a content-addressed version store keyed by envelope digest, so many ledgers (forks, rewrites, old positions) share one backend. Namespace/path-granular reads and writes, plus the in-memory backend and the conformance suite every backend must pass. |
 
 ## Development conventions and hard rules
 
- - **Never commit to `main`.** Branch first, with a `feat/`, `fix/`, `docs/`,
-   `chore/`, or `refactor/` prefix.
  - Use **Conventional Commits** for the commit message. Don't commit unless asked.
  - Every change: run `cargo clippy --all-targets -- -D warnings`, `cargo test`. Justify any #[allow(...)] with a comment.
 

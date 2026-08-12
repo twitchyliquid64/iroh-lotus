@@ -1,0 +1,91 @@
+//! Walks over an in-memory [`Value`] tree.
+//!
+//! Shared by backends that hold a namespace as one tree — [`MemStorage`]
+//! and the default [`Storage::resolve`] — so their semantics can't drift.
+//! A backend that stores the tree decomposed implements the same walk
+//! against its own layout and proves agreement with the
+//! [`conformance`](crate::conformance) suite.
+//!
+//! [`MemStorage`]: crate::MemStorage
+//! [`Storage::resolve`]: crate::Storage::resolve
+
+use wire::{
+    msg::Value,
+    subkey::{Subkey, SubkeyPath},
+};
+
+use crate::{NodeKind, Resolution};
+
+/// The kind of node `value` is.
+pub fn kind(value: &Value) -> NodeKind {
+    match value {
+        Value::Map(_) => NodeKind::Map,
+        Value::Array(_) => NodeKind::Array,
+        Value::String(_) | Value::Int(_) | Value::Bool(_) => NodeKind::Leaf,
+    }
+}
+
+/// Walks `path` from `root`, reporting how far it got.
+pub fn resolve(root: &Value, path: &[Subkey]) -> Resolution {
+    path.iter()
+        .enumerate()
+        .try_fold(root, |node, (depth, segment)| match (node, segment) {
+            (Value::Map(map), Subkey::Key(key)) => map.get(key).ok_or(Resolution::Missing {
+                depth,
+                at: NodeKind::Map,
+            }),
+            (Value::Array(array), Subkey::Index(index)) => {
+                array.get(*index as usize).ok_or(Resolution::Missing {
+                    depth,
+                    at: NodeKind::Array,
+                })
+            }
+            _ => Err(Resolution::Mismatch { depth }),
+        })
+        .map_or_else(|stopped| stopped, |node| Resolution::Node(kind(node)))
+}
+
+/// Applies a pre-validated [`SetAt`](crate::NamespaceOp::SetAt) to a tree.
+///
+/// # Panics
+///
+/// The op's contract is that the caller [`resolve`]d the path and found it
+/// legal; a path that isn't is a broken invariant, not an error.
+pub fn set_at(root: &mut Value, path: &SubkeyPath, value: Option<Value>) {
+    let (last, parents) = path
+        .as_ref()
+        .split_last()
+        .expect("SubkeyPath is validated non-empty");
+
+    let parent = walk_mut(root, parents).expect("SetAt is pre-validated: every parent exists");
+
+    match (parent, last, value) {
+        (Value::Map(map), Subkey::Key(key), Some(value)) => {
+            map.insert(key.clone(), value);
+        }
+        (Value::Map(map), Subkey::Key(key), None) => {
+            map.remove(key)
+                .expect("SetAt is pre-validated: the value being cleared exists");
+        }
+        (Value::Array(array), Subkey::Index(index), Some(value)) => {
+            *array
+                .get_mut(*index as usize)
+                .expect("SetAt is pre-validated: the index is in bounds") = value;
+        }
+        (Value::Array(array), Subkey::Index(index), None) => {
+            // Vec::remove panics out of bounds, which is the contract here.
+            array.remove(*index as usize);
+        }
+        _ => unreachable!("SetAt is pre-validated: the parent's shape matches the segment"),
+    }
+}
+
+/// Walks `path` from `root`, yielding the value it addresses.
+fn walk_mut<'a>(root: &'a mut Value, path: &[Subkey]) -> Option<&'a mut Value> {
+    path.iter()
+        .try_fold(root, |value, segment| match (value, segment) {
+            (Value::Map(map), Subkey::Key(key)) => map.get_mut(key),
+            (Value::Array(array), Subkey::Index(index)) => array.get_mut(*index as usize),
+            _ => None,
+        })
+}
