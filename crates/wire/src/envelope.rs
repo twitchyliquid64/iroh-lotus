@@ -20,6 +20,30 @@ pub struct Envelope {
 }
 
 impl Envelope {
+    /// A new envelope carrying `payload`, with nothing attested over it yet.
+    pub fn new(payload: super::Msg) -> Self {
+        Self {
+            payload,
+            signatures: Vec::new(),
+            timestamps: Vec::new(),
+        }
+    }
+
+    /// The message this envelope carries.
+    pub fn payload(&self) -> &super::Msg {
+        &self.payload
+    }
+
+    /// The signatures attached to this envelope.
+    pub fn signatures(&self) -> &[EnvelopeSignature] {
+        &self.signatures
+    }
+
+    /// The timestamps attested over this envelope.
+    pub fn timestamps(&self) -> &[SignedTimestamp] {
+        &self.timestamps
+    }
+
     /// The digest of this envelope, taken over its canonical CBOR encoding.
     ///
     /// The digest covers the whole envelope, signatures and timestamps
