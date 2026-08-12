@@ -1,0 +1,32 @@
+[workspace]
+members = [
+    "crates/wire",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+rust-version = "1.95" # MSRV
+version = "0.0.1"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+
+[workspace.dependencies]
+blake3 = { version = "1", features = ["serde"] }
+cbor2 = { version = "1.1", features = ["std", "alloc", "derive", "futures", "tokio"] }
+chrono = {version = "0.4", features = ["serde", "std"]}
+
+rand = "0.10"
+serde = { version = "1.0", features = ["derive", "rc"] }
+sha2 = "0.11"
+tempfile = "3.27"
+
+uuid = { version = "1.24", features = ["v4", "v7", "serde"] }
+
+# Our crates
+wire = { path = "crates/wire" }

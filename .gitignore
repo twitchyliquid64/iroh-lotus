@@ -1,0 +1,6 @@
+target/
+.scratch/
+
+# Claude Code / git worktree scratch dirs (agent worktrees, embedded repos)
+.claude/
+.worktrees/
