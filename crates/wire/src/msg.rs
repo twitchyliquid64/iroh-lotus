@@ -65,6 +65,9 @@ pub enum Msg {
     /// Deletes an entire namespace.
     #[serde(rename = "dn")]
     DeleteNamespace(DeleteNamespace),
+    /// Replaces the ledger's configuration.
+    #[serde(rename = "c")]
+    SetConfig(SetConfig),
 }
 
 impl Msg {
@@ -75,6 +78,7 @@ impl Msg {
             Msg::SetNamespace(s) => Some(&s.prev),
             Msg::SetNamespaceKey(s) => Some(&s.prev),
             Msg::DeleteNamespace(d) => Some(&d.prev),
+            Msg::SetConfig(s) => Some(&s.prev),
         }
     }
 
@@ -89,6 +93,7 @@ impl Msg {
             Msg::SetNamespace(s) => &s.prev,
             Msg::SetNamespaceKey(s) => &s.prev,
             Msg::DeleteNamespace(d) => &d.prev,
+            Msg::SetConfig(s) => &s.prev,
         }
     }
 }
@@ -164,6 +169,19 @@ pub struct DeleteNamespace {
     pub prev: EnvelopeDigest,
     #[cbor(key = 2)]
     pub key: NamespaceKey,
+}
+
+/// Replaces the ledger's configuration, wholesale.
+///
+/// The config in force at any position is that of the nearest
+/// config-bearing envelope at or above it — a `SetConfig`, else the
+/// `Init` — derived from the messages, never stored beside the state.
+#[derive(Debug, Clone, Cbor, Hash, PartialEq, Eq)]
+pub struct SetConfig {
+    #[cbor(key = 1)]
+    pub prev: EnvelopeDigest,
+    #[cbor(key = 2)]
+    pub config: LedgerConfig,
 }
 
 /// A complete representation of the data & configuration of a namespace.
@@ -361,6 +379,23 @@ mod tests {
                 "03a101a161736131"
             ),
         );
+    }
+
+    /// `a2` (map, 2 pairs): the digest under `01`, the whole config under
+    /// `02` — a replacement, not a patch.
+    #[test]
+    fn set_config_carries_prev_and_config() {
+        let msg = Msg::SetConfig(SetConfig {
+            prev: EnvelopeDigest::from_bytes([0xab; 32]),
+            config: LedgerConfig::default(),
+        });
+        assert_wire(
+            &msg,
+            &format!("a16163a2015820{}02a101191c20", "ab".repeat(32)),
+        );
+
+        let digest = EnvelopeDigest::from_bytes([0xab; 32]);
+        assert_eq!(msg.prev_digest(), Some(&digest));
     }
 
     /// Only `SetNamespace` chains; `Init` starts the ledger and has nothing

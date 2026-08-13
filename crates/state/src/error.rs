@@ -17,8 +17,13 @@ pub enum Error<E> {
     NotInit,
     /// A chain was replayed from nothing.
     EmptyChain,
-    /// A ledger was opened at a head the store holds no version for.
+    /// A ledger was opened at a head the store holds no version for, or
+    /// a chain at a root the log holds no envelope for.
     UnknownHead(EnvelopeDigest),
+    /// An envelope chains onto an envelope the store's log does not hold.
+    /// Sync delivers parent-first, so this is a protocol breach, not a
+    /// gap to buffer around.
+    UnknownParent(EnvelopeDigest),
     /// An envelope could not be applied.
     Apply(ApplyError<E>),
     /// The storage backend failed.
@@ -72,7 +77,10 @@ impl<E> fmt::Display for Error<E> {
             Error::NotInit => f.write_str("ledger must be opened from an Init envelope"),
             Error::EmptyChain => f.write_str("cannot replay an empty chain"),
             Error::UnknownHead(head) => {
-                write!(f, "store holds no version at {}", head.to_hex().as_ref())
+                write!(f, "store holds nothing at {}", head.to_hex().as_ref())
+            }
+            Error::UnknownParent(prev) => {
+                write!(f, "log holds no parent envelope {}", prev.to_hex().as_ref())
             }
             Error::Apply(_) => f.write_str("could not apply an envelope"),
             Error::Storage(_) => f.write_str("storage backend failed"),
@@ -109,7 +117,10 @@ impl<E: core::error::Error + 'static> core::error::Error for Error<E> {
             Error::Wire(err) => Some(err),
             Error::Apply(err) => Some(err),
             Error::Storage(err) => Some(err),
-            Error::NotInit | Error::EmptyChain | Error::UnknownHead(_) => None,
+            Error::NotInit
+            | Error::EmptyChain
+            | Error::UnknownHead(_)
+            | Error::UnknownParent(_) => None,
         }
     }
 }

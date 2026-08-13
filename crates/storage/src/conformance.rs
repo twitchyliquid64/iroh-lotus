@@ -17,8 +17,8 @@
 use std::collections::BTreeMap;
 
 use wire::{
-    EnvelopeDigest,
-    msg::{FullCheckpoint, Namespace, NamespaceKey, Value},
+    Envelope, EnvelopeDigest, Msg,
+    msg::{Namespace, NamespaceKey, SetNamespace, Value},
     subkey::{Subkey, SubkeyPath},
 };
 
@@ -29,8 +29,8 @@ use crate::{NamespaceOp, NodeKind, Resolution, Storage};
 macro_rules! storage_conformance {
     ($make:expr) => {
         #[test]
-        fn conformance_unknown_heads_have_no_config() {
-            $crate::conformance::unknown_heads_have_no_config($make);
+        fn conformance_unknown_heads_are_absent() {
+            $crate::conformance::unknown_heads_are_absent($make);
         }
         #[test]
         fn conformance_install_creates_a_version() {
@@ -43,6 +43,10 @@ macro_rules! storage_conformance {
         #[test]
         fn conformance_commit_keeps_the_parent_intact() {
             $crate::conformance::commit_keeps_the_parent_intact($make);
+        }
+        #[test]
+        fn conformance_commit_without_an_op_copies_the_version() {
+            $crate::conformance::commit_without_an_op_copies_the_version($make);
         }
         #[test]
         fn conformance_put_creates_and_overwrites() {
@@ -84,6 +88,22 @@ macro_rules! storage_conformance {
         fn conformance_retain_prunes_unkept_versions() {
             $crate::conformance::retain_prunes_unkept_versions($make);
         }
+        #[test]
+        fn conformance_envelopes_file_and_read_back() {
+            $crate::conformance::envelopes_file_and_read_back($make);
+        }
+        #[test]
+        fn conformance_children_come_back_in_digest_order() {
+            $crate::conformance::children_come_back_in_digest_order($make);
+        }
+        #[test]
+        fn conformance_retain_leaves_the_envelope_log_alone() {
+            $crate::conformance::retain_leaves_the_envelope_log_alone($make);
+        }
+        #[test]
+        fn conformance_remove_envelope_unfiles_and_unindexes() {
+            $crate::conformance::remove_envelope_unfiles_and_unindexes($make);
+        }
     };
 }
 
@@ -118,11 +138,10 @@ fn sub(k: &str) -> Subkey {
     Subkey::Key(k.to_string())
 }
 
-fn checkpoint(entries: impl IntoIterator<Item = (&'static str, Namespace)>) -> FullCheckpoint {
-    FullCheckpoint {
-        namespaces: entries.into_iter().map(|(k, ns)| (key(k), ns)).collect(),
-        ..Default::default()
-    }
+fn namespaces(
+    entries: impl IntoIterator<Item = (&'static str, Namespace)>,
+) -> BTreeMap<NamespaceKey, Namespace> {
+    entries.into_iter().map(|(k, ns)| (key(k), ns)).collect()
 }
 
 /// A namespace whose value is `{"a": {"b": "1"}, "list": ["x", "y"]}` —
@@ -139,13 +158,14 @@ fn nested() -> Namespace {
     }
 }
 
-/// A `SetAt` against the `n` namespace the nested fixtures install.
-fn set_at(p: SubkeyPath, value: Option<Value>) -> NamespaceOp {
-    NamespaceOp::SetAt {
+/// A `SetAt` against the `n` namespace the nested fixtures install,
+/// ready to hand to `commit`.
+fn set_at(p: SubkeyPath, value: Option<Value>) -> Option<NamespaceOp> {
+    Some(NamespaceOp::SetAt {
         key: key("n"),
         path: p,
         value,
-    }
+    })
 }
 
 fn fetch<S: Storage>(store: &S, head: u8, k: &str) -> Option<Namespace> {
@@ -154,20 +174,16 @@ fn fetch<S: Storage>(store: &S, head: u8, k: &str) -> Option<Namespace> {
         .expect("namespace read must not fail")
 }
 
-pub fn unknown_heads_have_no_config<S: Storage>(store: S) {
-    assert_eq!(store.config(digest(9)).expect("config"), None);
+pub fn unknown_heads_are_absent<S: Storage>(store: S) {
+    assert!(!store.contains_version(digest(9)).expect("contains_version"));
 }
 
 pub fn install_creates_a_version<S: Storage>(mut store: S) {
-    let checkpoint = checkpoint([("a", leaf("1")), ("b", leaf("2"))]);
     store
-        .install(digest(1), checkpoint.clone())
+        .install(digest(1), namespaces([("a", leaf("1")), ("b", leaf("2"))]))
         .expect("install");
 
-    assert_eq!(
-        store.config(digest(1)).expect("config"),
-        Some(checkpoint.config)
-    );
+    assert!(store.contains_version(digest(1)).expect("contains_version"));
     assert_eq!(fetch(&store, 1, "a"), Some(leaf("1")));
     assert_eq!(fetch(&store, 1, "missing"), None);
 
@@ -180,10 +196,10 @@ pub fn install_creates_a_version<S: Storage>(mut store: S) {
 
 pub fn install_keeps_other_chains<S: Storage>(mut store: S) {
     store
-        .install(digest(1), checkpoint([("a", leaf("1"))]))
+        .install(digest(1), namespaces([("a", leaf("1"))]))
         .expect("install");
     store
-        .install(digest(2), checkpoint([("b", leaf("2"))]))
+        .install(digest(2), namespaces([("b", leaf("2"))]))
         .expect("install");
 
     assert_eq!(
@@ -198,10 +214,14 @@ pub fn install_keeps_other_chains<S: Storage>(mut store: S) {
 
 pub fn commit_keeps_the_parent_intact<S: Storage>(mut store: S) {
     store
-        .install(digest(1), checkpoint([("a", leaf("1"))]))
+        .install(digest(1), namespaces([("a", leaf("1"))]))
         .expect("install");
     store
-        .commit(digest(1), digest(2), NamespaceOp::Put(key("a"), leaf("9")))
+        .commit(
+            digest(1),
+            digest(2),
+            Some(NamespaceOp::Put(key("a"), leaf("9"))),
+        )
         .expect("commit");
 
     assert_eq!(fetch(&store, 2, "a"), Some(leaf("9")));
@@ -212,32 +232,48 @@ pub fn commit_keeps_the_parent_intact<S: Storage>(mut store: S) {
     );
 }
 
+/// A `None` op is the commit of a message that writes no namespace (a
+/// config change): the new version is an untouched copy of its parent.
+pub fn commit_without_an_op_copies_the_version<S: Storage>(mut store: S) {
+    store
+        .install(digest(1), namespaces([("a", leaf("1"))]))
+        .expect("install");
+    store.commit(digest(1), digest(2), None).expect("commit");
+
+    assert!(store.contains_version(digest(2)).expect("contains_version"));
+    assert_eq!(fetch(&store, 2, "a"), Some(leaf("1")));
+    assert_eq!(fetch(&store, 1, "a"), Some(leaf("1")));
+}
+
 pub fn put_creates_and_overwrites<S: Storage>(mut store: S) {
     store
-        .install(digest(1), checkpoint([("a", leaf("1"))]))
+        .install(digest(1), namespaces([("a", leaf("1"))]))
         .expect("install");
     store
-        .commit(digest(1), digest(2), NamespaceOp::Put(key("b"), leaf("2")))
+        .commit(
+            digest(1),
+            digest(2),
+            Some(NamespaceOp::Put(key("b"), leaf("2"))),
+        )
         .expect("commit");
     store
-        .commit(digest(2), digest(3), NamespaceOp::Put(key("a"), leaf("9")))
+        .commit(
+            digest(2),
+            digest(3),
+            Some(NamespaceOp::Put(key("a"), leaf("9"))),
+        )
         .expect("commit");
 
     assert_eq!(fetch(&store, 3, "a"), Some(leaf("9")));
     assert_eq!(fetch(&store, 3, "b"), Some(leaf("2")));
-    assert_eq!(
-        store.config(digest(3)).expect("config"),
-        store.config(digest(1)).expect("config"),
-        "config rides along the chain"
-    );
 }
 
 pub fn delete_removes_the_namespace<S: Storage>(mut store: S) {
     store
-        .install(digest(1), checkpoint([("a", leaf("1")), ("b", leaf("2"))]))
+        .install(digest(1), namespaces([("a", leaf("1")), ("b", leaf("2"))]))
         .expect("install");
     store
-        .commit(digest(1), digest(2), NamespaceOp::Delete(key("a")))
+        .commit(digest(1), digest(2), Some(NamespaceOp::Delete(key("a"))))
         .expect("commit");
 
     assert_eq!(fetch(&store, 2, "a"), None);
@@ -255,7 +291,7 @@ pub fn delete_removes_the_namespace<S: Storage>(mut store: S) {
 
 pub fn set_at_writes_and_creates_leaves<S: Storage>(mut store: S) {
     store
-        .install(digest(1), checkpoint([("n", nested())]))
+        .install(digest(1), namespaces([("n", nested())]))
         .expect("install");
 
     // Overwrite an existing leaf, then create a fresh one under a map.
@@ -289,7 +325,7 @@ pub fn set_at_writes_and_creates_leaves<S: Storage>(mut store: S) {
 
 pub fn set_at_replaces_array_elements<S: Storage>(mut store: S) {
     store
-        .install(digest(1), checkpoint([("n", nested())]))
+        .install(digest(1), namespaces([("n", nested())]))
         .expect("install");
 
     store
@@ -315,7 +351,7 @@ pub fn set_at_replaces_array_elements<S: Storage>(mut store: S) {
 
 pub fn set_at_clears_values<S: Storage>(mut store: S) {
     store
-        .install(digest(1), checkpoint([("n", nested())]))
+        .install(digest(1), namespaces([("n", nested())]))
         .expect("install");
 
     // Clear a map entry, then remove an array element — later indices
@@ -347,7 +383,7 @@ pub fn set_at_clears_values<S: Storage>(mut store: S) {
 /// where structural sharing lets a write leak across versions.
 pub fn set_at_does_not_bleed_into_other_versions<S: Storage>(mut store: S) {
     store
-        .install(digest(1), checkpoint([("n", nested())]))
+        .install(digest(1), namespaces([("n", nested())]))
         .expect("install");
 
     let at_b = || path([sub("a"), sub("b")]);
@@ -384,13 +420,21 @@ pub fn set_at_does_not_bleed_into_other_versions<S: Storage>(mut store: S) {
 
 pub fn forks_diverge_independently<S: Storage>(mut store: S) {
     store
-        .install(digest(1), checkpoint([("a", leaf("1"))]))
+        .install(digest(1), namespaces([("a", leaf("1"))]))
         .expect("install");
     store
-        .commit(digest(1), digest(2), NamespaceOp::Put(key("b"), leaf("2")))
+        .commit(
+            digest(1),
+            digest(2),
+            Some(NamespaceOp::Put(key("b"), leaf("2"))),
+        )
         .expect("commit");
     store
-        .commit(digest(1), digest(3), NamespaceOp::Put(key("c"), leaf("3")))
+        .commit(
+            digest(1),
+            digest(3),
+            Some(NamespaceOp::Put(key("c"), leaf("3"))),
+        )
         .expect("commit");
 
     assert_eq!(fetch(&store, 2, "a"), Some(leaf("1")));
@@ -407,7 +451,7 @@ pub fn forks_diverge_independently<S: Storage>(mut store: S) {
 
 pub fn resolve_reports_the_walk<S: Storage>(mut store: S) {
     store
-        .install(digest(1), checkpoint([("n", nested())]))
+        .install(digest(1), namespaces([("n", nested())]))
         .expect("install");
 
     let resolve = |p: &[Subkey]| {
@@ -494,16 +538,116 @@ pub fn namespaces_reencode_to_identical_bytes<S: Storage>(mut store: S) {
     let before = wire::encode(&nested()).expect("encode");
 
     store
-        .install(digest(1), checkpoint([("n", nested())]))
+        .install(digest(1), namespaces([("n", nested())]))
         .expect("install");
 
     let after = fetch(&store, 1, "n").expect("n exists");
     assert_eq!(wire::encode(&after).expect("encode"), before);
 }
 
+/// An envelope chaining onto `prev`, distinguished by its value.
+fn envelope(prev: EnvelopeDigest, v: &str) -> Envelope {
+    Envelope::new(Msg::SetNamespace(SetNamespace {
+        prev,
+        key: key("a"),
+        namespace: leaf(v),
+    }))
+}
+
+fn digest_of(envelope: &Envelope) -> EnvelopeDigest {
+    envelope.digest().expect("suite envelopes encode")
+}
+
+fn file<S: Storage>(store: &mut S, envelope: &Envelope) -> EnvelopeDigest {
+    let digest = digest_of(envelope);
+    store
+        .put_envelope(digest, envelope.clone())
+        .expect("put_envelope");
+    digest
+}
+
+fn children_of<S: Storage>(store: &S, parent: EnvelopeDigest) -> Vec<EnvelopeDigest> {
+    store
+        .children(parent)
+        .collect::<Result<_, _>>()
+        .expect("children")
+}
+
+pub fn envelopes_file_and_read_back<S: Storage>(mut store: S) {
+    let filed = envelope(digest(1), "1");
+    let d = digest_of(&filed);
+
+    assert_eq!(store.envelope(d).expect("envelope"), None);
+    file(&mut store, &filed);
+    assert_eq!(store.envelope(d).expect("envelope"), Some(filed.clone()));
+
+    // The log is content-addressed: refiling changes nothing, and the
+    // parent doesn't grow a second child.
+    file(&mut store, &filed);
+    assert_eq!(store.envelope(d).expect("envelope"), Some(filed));
+    assert_eq!(children_of(&store, digest(1)), vec![d]);
+}
+
+pub fn children_come_back_in_digest_order<S: Storage>(mut store: S) {
+    let siblings: Vec<_> = ["1", "2", "3", "4"]
+        .iter()
+        .map(|v| file(&mut store, &envelope(digest(1), v)))
+        .collect();
+    let elsewhere = file(&mut store, &envelope(digest(2), "1"));
+
+    let expected = siblings
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        children_of(&store, digest(1)),
+        expected.into_iter().collect::<Vec<_>>(),
+        "siblings must come back ascending — the fork rule reads them in order"
+    );
+
+    assert_eq!(children_of(&store, digest(2)), vec![elsewhere]);
+    assert_eq!(children_of(&store, digest(9)), Vec::new());
+}
+
+pub fn remove_envelope_unfiles_and_unindexes<S: Storage>(mut store: S) {
+    let kept_envelope = envelope(digest(1), "1");
+    let kept = file(&mut store, &kept_envelope);
+    let removed = file(&mut store, &envelope(digest(1), "2"));
+
+    store.remove_envelope(removed).expect("remove");
+
+    assert_eq!(store.envelope(removed).expect("envelope"), None);
+    assert_eq!(
+        store.envelope(kept).expect("envelope"),
+        Some(kept_envelope),
+        "siblings must survive"
+    );
+    assert_eq!(children_of(&store, digest(1)), vec![kept]);
+
+    // Removing what isn't filed is a no-op.
+    store.remove_envelope(digest(9)).expect("remove");
+    assert_eq!(children_of(&store, digest(1)), vec![kept]);
+}
+
+/// Versions are what the log folds down to; pruning them must not touch
+/// the log itself.
+pub fn retain_leaves_the_envelope_log_alone<S: Storage>(mut store: S) {
+    store
+        .install(digest(1), namespaces([("a", leaf("1"))]))
+        .expect("install");
+    let filed = envelope(digest(1), "2");
+    let d = file(&mut store, &filed);
+
+    store.retain(&[]).expect("retain");
+
+    assert!(!store.contains_version(digest(1)).expect("contains_version"));
+    assert_eq!(store.envelope(d).expect("envelope"), Some(filed));
+    assert_eq!(children_of(&store, digest(1)), vec![d]);
+}
+
 pub fn retain_prunes_unkept_versions<S: Storage>(mut store: S) {
     store
-        .install(digest(1), checkpoint([("n", nested())]))
+        .install(digest(1), namespaces([("n", nested())]))
         .expect("install");
     store
         .commit(
@@ -515,8 +659,8 @@ pub fn retain_prunes_unkept_versions<S: Storage>(mut store: S) {
 
     store.retain(&[digest(2)]).expect("retain");
 
-    assert_eq!(store.config(digest(1)).expect("config"), None);
-    assert!(store.config(digest(2)).expect("config").is_some());
+    assert!(!store.contains_version(digest(1)).expect("contains_version"));
+    assert!(store.contains_version(digest(2)).expect("contains_version"));
 
     // The untouched subtree was shared with the pruned parent; pruning
     // must not tear it out from under the survivor.

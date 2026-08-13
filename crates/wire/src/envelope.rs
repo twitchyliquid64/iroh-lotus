@@ -70,6 +70,20 @@ pub struct SignedTimestamp {}
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct EnvelopeDigest(blake3::Hash);
 
+/// Ordered by the digest's numeric value: bytewise over the 32 bytes,
+/// ala big-endian number. Used as the final tie-breaker for fork resolution.
+impl Ord for EnvelopeDigest {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.as_bytes().cmp(other.as_bytes())
+    }
+}
+
+impl PartialOrd for EnvelopeDigest {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl serde::Serialize for EnvelopeDigest {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_bytes(self.0.as_bytes())
@@ -271,6 +285,30 @@ mod tests {
                 "expected {bad} to be rejected",
             );
         }
+    }
+
+    /// Fork choice reads a digest as one big-endian number, so `Ord` must
+    /// let the leading byte dominate whatever follows it.
+    #[test]
+    fn digest_orders_as_a_big_endian_number() {
+        let zero = EnvelopeDigest::from_bytes([0x00; 32]);
+        let low = EnvelopeDigest::from_bytes({
+            let mut bytes = [0xff; 32];
+            bytes[0] = 0x00;
+            bytes
+        });
+        let high = EnvelopeDigest::from_bytes({
+            let mut bytes = [0x00; 32];
+            bytes[0] = 0x01;
+            bytes
+        });
+
+        assert!(low < high, "0x00ff… must order below 0x0100…");
+        assert!(zero < low);
+
+        let mut sorted = vec![high, low, zero];
+        sorted.sort();
+        assert_eq!(sorted, [zero, low, high]);
     }
 
     #[test]

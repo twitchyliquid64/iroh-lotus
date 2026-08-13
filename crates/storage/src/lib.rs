@@ -9,6 +9,14 @@
 //! reading, all sharing the entries they have in common. Versions
 //! accumulate until [`retain`](Storage::retain) prunes them.
 //!
+//! Beside the versions sits the envelope log: the envelopes themselves,
+//! filed by digest and indexed by parent through
+//! [`children`](Storage::children). The log is what fork resolution walks
+//! and what a node gossips from; versions are merely what the log folds
+//! down to, and any pruned version can be re-derived from it. Versions
+//! hold namespaces alone — chain-level facts like the config are derived
+//! from the config-bearing envelopes the log already keeps.
+//!
 //! The surface is namespace- and path-granular on purpose: a backend can
 //! keep state on disk and page in only what an envelope touches, so
 //! applying a message costs O(path), not O(state).
@@ -20,8 +28,8 @@
 //! disagree about what a commit does.
 
 use wire::{
-    EnvelopeDigest,
-    msg::{FullCheckpoint, LedgerConfig, Namespace, NamespaceKey, Value},
+    Envelope, EnvelopeDigest,
+    msg::{Namespace, NamespaceKey, Value},
     subkey::{Subkey, SubkeyPath},
 };
 
@@ -88,17 +96,16 @@ pub enum NamespaceOp {
 /// - The pre-validated contract on [`NamespaceOp`]: an op that doesn't
 ///   fit the version it is applied to is a broken invariant, never an
 ///   error.
-/// - Except through [`config`](Storage::config) — the existence check a
-///   ledger opens through — addressing a head the store doesn't hold is
-///   a broken invariant too. A ledger must only be driven against the
-///   store it was opened from, and [`retain`](Storage::retain) must keep
-///   every head still in use.
+/// - Except through [`contains_version`](Storage::contains_version) — the
+///   existence check a ledger opens through — addressing a head the store
+///   doesn't hold is a broken invariant too. A ledger must only be driven
+///   against the store it was opened from, and
+///   [`retain`](Storage::retain) must keep every head still in use.
 pub trait Storage {
     type Error: core::error::Error + Send + Sync + 'static;
 
-    /// The configuration of the version at `head`, or `None` when the
-    /// store holds no such version.
-    fn config(&self, head: EnvelopeDigest) -> Result<Option<LedgerConfig>, Self::Error>;
+    /// Whether the store holds an envelope with the given digest.
+    fn contains_version(&self, head: EnvelopeDigest) -> Result<bool, Self::Error>;
 
     /// Walks `path` from the root of the namespace filed under `key` in
     /// the version at `head`, yielding `None` when that version holds no
@@ -134,26 +141,56 @@ pub trait Storage {
     ) -> impl Iterator<Item = Result<(NamespaceKey, Namespace), Self::Error>>;
 
     /// Derives the version at `head` by applying `op` to the version at
-    /// `parent`, atomically — a crash must never leave a half-written
-    /// version. The parent version is left intact; other ledgers may be
-    /// standing on it.
+    /// `parent` — or as an untouched copy when `op` is `None`, the commit
+    /// of a message that writes no namespace (a config change). Atomic: a
+    /// crash must never leave a half-written version. The parent version
+    /// is left intact; other ledgers may be standing on it.
     fn commit(
         &mut self,
         parent: EnvelopeDigest,
         head: EnvelopeDigest,
-        op: NamespaceOp,
+        op: Option<NamespaceOp>,
     ) -> Result<(), Self::Error>;
 
-    /// Installs `checkpoint` as the version at `head` — the `Init` that
+    /// Installs `namespaces` as the version at `head` — the `Init` that
     /// opens a chain. Versions of other chains are unaffected.
     fn install(
         &mut self,
         head: EnvelopeDigest,
-        checkpoint: FullCheckpoint,
+        namespaces: impl IntoIterator<Item = (NamespaceKey, Namespace)>,
     ) -> Result<(), Self::Error>;
 
     /// Drops every version whose head is not in `keep` — the garbage
     /// collection that bounds a store's growth. What a kept version
-    /// shared with a pruned one must survive.
+    /// shared with a pruned one must survive. The envelope log is not
+    /// versions and is left alone; pruning it is compaction's business.
     fn retain(&mut self, keep: &[EnvelopeDigest]) -> Result<(), Self::Error>;
+
+    /// Stores `envelope` in the log under `digest`, indexing it under its
+    /// `prev` for [`children`](Storage::children).
+    fn put_envelope(
+        &mut self,
+        digest: EnvelopeDigest,
+        envelope: Envelope,
+    ) -> Result<(), Self::Error>;
+
+    /// The envelope filed under `digest`, or `None` when the log holds no
+    /// such envelope.
+    fn envelope(&self, digest: EnvelopeDigest) -> Result<Option<Envelope>, Self::Error>;
+
+    /// Removes the envelope filed under `digest` from the log, unindexing
+    /// it from its parent's [`children`](Storage::children). Removing what
+    /// isn't filed is a no-op.
+    ///
+    /// For envelopes proven unable to ever be canonical — rejection is
+    /// deterministic, so the log needn't keep paying for them.
+    fn remove_envelope(&mut self, digest: EnvelopeDigest) -> Result<(), Self::Error>;
+
+    /// The digests of every filed envelope whose `prev` is `parent`, in
+    /// ascending digest order. Fork resolution leans on the order: the
+    /// first child yielded is the fork's preferred winner.
+    fn children(
+        &self,
+        parent: EnvelopeDigest,
+    ) -> impl Iterator<Item = Result<EnvelopeDigest, Self::Error>>;
 }
