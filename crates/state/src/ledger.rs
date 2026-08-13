@@ -3,49 +3,61 @@
 use storage::{NamespaceOp, NodeKind, Resolution, Storage};
 use wire::{
     Envelope, EnvelopeDigest, Msg,
-    msg::{FullCheckpoint, LedgerConfig, Namespace, NamespaceKey, SetNamespaceKey},
+    msg::{FullCheckpoint, Namespace, NamespaceKey, SetNamespaceKey, Value},
     subkey::{Subkey, SubkeyPath},
 };
 
 use crate::{ApplyError, Error};
 
+/// The reserved namespace holding the minimum number of minutes every
+/// node must keep a message before it is eligible for compaction. Writes
+/// are validated: the value must be a [`Value::Int`] that is positive
+/// and fits a `u32`. Absent, the [`DEFAULT_MIN_KEEP_MINUTES`] applies.
+///
+/// The determination that enough time has passed MUST be relative to a
+/// local time source, and/or using a signed timestamp.
+pub const MIN_KEEP_MINUTES_KEY: &str = "_lotus_min_keep_minutes";
+
+/// The compaction floor in force when a chain never set
+/// [`MIN_KEEP_MINUTES_KEY`]: five days.
+pub const DEFAULT_MIN_KEEP_MINUTES: u32 = 5 * 24 * 60;
+
 /// The ledger, as of some position in the chain.
 ///
-/// A ledger is a cursor: the head it stands at, and the config in force
-/// there — the latter derived by folding the messages, never stored
-/// beside the state. State lives in the [`Storage`] each operation is
-/// handed, where it is addressed by head — so any number of ledgers can
-/// drive one store at once, and cloning a ledger is how a chain forks in
-/// place. Applying an envelope touches only what the envelope addresses,
-/// never the whole state — and files the envelope in the store's log, so
-/// a version never exists without the message that made it.
+/// A ledger is a cursor: nothing but the head it stands at. State lives
+/// in the [`Storage`] each operation is handed, where it is addressed by
+/// head — so any number of ledgers can drive one store at once, and
+/// copying a ledger is how a chain forks in place. Applying an envelope
+/// touches only what the envelope addresses, never the whole state. Even
+/// the ledger's config is just state, filed under reserved `_lotus_`
+/// namespaces.
 ///
 /// A ledger must only be used with the store it was opened from; a store
 /// treats an unknown head as a broken invariant, not an error.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ledger {
     head: EnvelopeDigest,
-    config: LedgerConfig,
 }
 
 impl Ledger {
     /// Opens a ledger from the `Init` envelope that starts a chain,
-    /// filing the envelope and installing its checkpoint's namespaces in
-    /// `storage`. Chains already in the store are left alone.
+    /// installing its checkpoint's namespaces in `storage`. Chains
+    /// already in the store are left alone.
     pub fn init<S: Storage>(storage: &mut S, envelope: &Envelope) -> Result<Self, Error<S::Error>> {
         match envelope.payload() {
             Msg::Init(init) => {
+                // The boundary covers genesis too: a checkpoint can't
+                // smuggle in a value an update would be refused for.
+                init.state
+                    .namespaces
+                    .iter()
+                    .try_for_each(|(key, namespace)| Self::validate_value(key, &namespace.value))?;
+
                 let head = envelope.digest()?;
                 storage
                     .install(head, init.state.namespaces.clone())
                     .map_err(Error::Storage)?;
-                storage
-                    .put_envelope(head, envelope.clone())
-                    .map_err(Error::Storage)?;
-                Ok(Self {
-                    head,
-                    config: init.state.config.clone(),
-                })
+                Ok(Self { head })
             }
             _ => Err(Error::NotInit),
         }
@@ -53,16 +65,13 @@ impl Ledger {
 
     /// Reopens a ledger standing at `head`. Any version the store still
     /// holds works, so an old head opens a historical view — readable,
-    /// and appendable as a fork. The config in force there is re-derived
-    /// from the log.
+    /// and appendable as a fork.
     pub fn open<S: Storage>(storage: &S, head: EnvelopeDigest) -> Result<Self, Error<S::Error>> {
-        if !storage.contains_version(head).map_err(Error::Storage)? {
-            return Err(Error::UnknownHead(head));
-        }
-        Ok(Self {
-            head,
-            config: derive_config(storage, head)?,
-        })
+        storage
+            .contains_version(head)
+            .map_err(Error::Storage)?
+            .then_some(Self { head })
+            .ok_or(Error::UnknownHead(head))
     }
 
     /// Replays a whole chain into `storage`, `Init` envelope first.
@@ -107,45 +116,22 @@ impl Ledger {
             // so the check above has already rejected it.
             Msg::Init(_) => return Err(ApplyError::UnexpectedInit),
             Msg::SetNamespace(set) => {
-                Some(NamespaceOp::Put(set.key.clone(), set.namespace.clone()))
+                Self::validate_value(&set.key, &set.namespace.value)?;
+                NamespaceOp::Put(set.key.clone(), set.namespace.clone())
             }
-            Msg::SetNamespaceKey(set) => Some(self.validate_set_key(storage, set)?),
+            Msg::SetNamespaceKey(set) => self.validate_set_key(storage, set)?,
             Msg::DeleteNamespace(del) => {
                 self.resolve(storage, &del.key, &[])?
                     .ok_or_else(|| ApplyError::UnknownNamespace(del.key.clone()))?;
-                Some(NamespaceOp::Delete(del.key.clone()))
+                NamespaceOp::Delete(del.key.clone())
             }
-            // Touches no namespace; the commit derives an untouched copy
-            // and the config folds into the cursor below.
-            Msg::SetConfig(_) => None,
         };
 
         storage
             .commit(self.head, head, op)
             .map_err(ApplyError::Storage)?;
-        storage
-            .put_envelope(head, envelope.clone())
-            .map_err(ApplyError::Storage)?;
-        self.fold_config(msg);
         self.head = head;
         Ok(())
-    }
-
-    /// Moves the cursor over `envelope` without validating or committing
-    /// — for stepping onto a version the store already holds. The
-    /// envelope must chain onto the current head.
-    pub(crate) fn advance(&mut self, envelope: &Envelope) -> Result<(), wire::Error> {
-        self.fold_config(envelope.payload());
-        self.head = envelope.digest()?;
-        Ok(())
-    }
-
-    /// Config is cursor state, folded out of the messages rather than
-    /// read from the store.
-    fn fold_config(&mut self, msg: &Msg) {
-        if let Msg::SetConfig(set) = msg {
-            self.config = set.config.clone();
-        }
     }
 
     /// Checks a `SetNamespaceKey` against the store, yielding the op that
@@ -204,9 +190,33 @@ impl Ledger {
         self.head
     }
 
-    /// The configuration in force at the ledger's position.
-    pub fn config(&self) -> &LedgerConfig {
-        &self.config
+    /// The compaction floor in force at the ledger's position, read from
+    /// the reserved [`MIN_KEEP_MINUTES_KEY`] namespace. Absent — or,
+    /// defensively, holding an invalid value validation never saw — the
+    /// [`DEFAULT_MIN_KEEP_MINUTES`] applies: a malformed floor must not
+    /// split nodes over an unreadable value.
+    pub fn min_keep_minutes<S: Storage>(&self, storage: &S) -> Result<u32, S::Error> {
+        let key = NamespaceKey::try_new(MIN_KEEP_MINUTES_KEY).expect("the reserved key is static");
+        Ok(self
+            .namespace(storage, &key)?
+            .and_then(|namespace| parse_min_keep(&namespace.value))
+            .unwrap_or(DEFAULT_MIN_KEEP_MINUTES))
+    }
+
+    /// Validates the value `key` would hold after a write.
+    ///
+    /// The rules are looked up by key and judge the resulting value.
+    /// Today the lookup has one baked-in arm, for
+    /// [`MIN_KEEP_MINUTES_KEY`]; a schema published under a reserved key
+    /// can become another arm without the callers moving.
+    fn validate_value<E>(key: &NamespaceKey, value: &Value) -> Result<(), ApplyError<E>> {
+        let valid = match key.as_ref() {
+            MIN_KEEP_MINUTES_KEY => parse_min_keep(value).is_some(),
+            _ => true,
+        };
+        valid
+            .then_some(())
+            .ok_or_else(|| ApplyError::InvalidValue { key: key.clone() })
     }
 
     /// The namespace filed under `key`, if the ledger holds one.
@@ -234,29 +244,16 @@ impl Ledger {
     pub fn checkpoint<S: Storage>(&self, storage: &S) -> Result<FullCheckpoint, S::Error> {
         Ok(FullCheckpoint {
             namespaces: storage.namespaces(self.head).collect::<Result<_, _>>()?,
-            config: self.config.clone(),
         })
     }
 }
 
-/// The config in force at `head`: that of the nearest config-bearing
-/// envelope at or above it — a `SetConfig`, else the chain's `Init`.
-/// O(distance to that envelope), walking the store's log.
-fn derive_config<S: Storage>(
-    storage: &S,
-    head: EnvelopeDigest,
-) -> Result<LedgerConfig, Error<S::Error>> {
-    let mut cursor = head;
-    loop {
-        let envelope = storage
-            .envelope(cursor)
-            .map_err(Error::Storage)?
-            .ok_or(Error::UnknownHead(cursor))?;
-        match envelope.payload() {
-            Msg::Init(init) => return Ok(init.state.config.clone()),
-            Msg::SetConfig(set) => return Ok(set.config.clone()),
-            msg => cursor = *msg.must_prev_digest(),
-        }
+/// A valid compaction floor: a positive integer that fits a `u32`.
+/// Shared by validation and the read, so what applies is what reads.
+fn parse_min_keep(value: &Value) -> Option<u32> {
+    match value {
+        Value::Int(minutes) => u32::try_from(*minutes).ok().filter(|&minutes| minutes > 0),
+        _ => None,
     }
 }
 
@@ -282,7 +279,7 @@ mod tests {
     use std::convert::Infallible;
 
     use storage::MemStorage;
-    use wire::msg::{DeleteNamespace, InitMsg, MinKeepMinutes, SetConfig, SetNamespace, Value};
+    use wire::msg::{DeleteNamespace, InitMsg, SetNamespace};
 
     use super::*;
 
@@ -360,7 +357,6 @@ mod tests {
         setup(&Envelope::new(Msg::Init(InitMsg {
             state: FullCheckpoint {
                 namespaces: [(key("n"), nested())].into_iter().collect(),
-                ..Default::default()
             },
         })))
     }
@@ -402,7 +398,6 @@ mod tests {
         let (store, ledger) = setup(&Envelope::new(Msg::Init(InitMsg {
             state: FullCheckpoint {
                 namespaces: [(key("a"), ns("1"))].into_iter().collect(),
-                ..Default::default()
             },
         })));
 
@@ -426,7 +421,6 @@ mod tests {
         let (mut store, first) = setup(&Envelope::new(Msg::Init(InitMsg {
             state: FullCheckpoint {
                 namespaces: [(key("old"), ns("1"))].into_iter().collect(),
-                ..Default::default()
             },
         })));
 
@@ -477,12 +471,12 @@ mod tests {
         assert_eq!(ledger.namespace(&store, &key("a")).unwrap(), Some(ns("1")));
     }
 
-    /// Cloning a ledger forks the chain: both cursors advance from the
+    /// Copying a ledger forks the chain: both cursors advance from the
     /// same head, in one store, without treading on each other.
     #[test]
     fn forked_ledgers_share_one_store() {
         let (mut store, mut left) = setup(&init());
-        let mut right = left.clone();
+        let mut right = left;
 
         left.apply(&mut store, &set(left.head(), "a", "1")).unwrap();
         right
@@ -892,59 +886,95 @@ mod tests {
         ));
     }
 
-    fn set_config(prev: EnvelopeDigest, minutes: u32) -> Envelope {
-        Envelope::new(Msg::SetConfig(SetConfig {
+    fn set_minutes(prev: EnvelopeDigest, value: Value) -> Envelope {
+        Envelope::new(Msg::SetNamespace(SetNamespace {
             prev,
-            config: LedgerConfig {
-                min_keep_minutes: MinKeepMinutes::new(minutes),
-            },
+            key: key(MIN_KEEP_MINUTES_KEY),
+            namespace: Namespace { value },
         }))
     }
 
-    /// Config is derived by folding the messages: a `SetConfig` changes
-    /// what's in force from its position on, and reopening at any head
-    /// re-derives what held there — nothing is stored beside the state.
+    /// Config is namespace data under a reserved key: setting it is an
+    /// ordinary write, versioned per position like everything else.
     #[test]
-    fn set_config_folds_and_rederives() {
+    fn min_keep_minutes_reads_the_reserved_namespace() {
         let (mut store, mut ledger) = setup(&init());
         let before = ledger.head();
-        assert_eq!(ledger.config(), &LedgerConfig::default());
+        assert_eq!(
+            ledger.min_keep_minutes(&store).unwrap(),
+            DEFAULT_MIN_KEEP_MINUTES
+        );
 
-        let envelope = set_config(ledger.head(), 42);
-        ledger.apply(&mut store, &envelope).unwrap();
-
-        assert_eq!(ledger.config().min_keep_minutes, MinKeepMinutes::new(42));
-        assert_eq!(ledger.head(), envelope.digest().unwrap());
-
-        // A later, unrelated envelope carries the config forward.
         ledger
-            .apply(&mut store, &set(ledger.head(), "a", "1"))
+            .apply(&mut store, &set_minutes(ledger.head(), Value::Int(42)))
             .unwrap();
-        assert_eq!(ledger.config().min_keep_minutes, MinKeepMinutes::new(42));
+        assert_eq!(ledger.min_keep_minutes(&store).unwrap(), 42);
 
-        // Reopening re-derives per position: the change holds at the new
-        // head, and the old head still sees what was in force then.
-        let reopened = Ledger::open(&store, ledger.head()).unwrap();
-        assert_eq!(reopened, ledger);
+        // The old head still sees what was in force there.
         let past = Ledger::open(&store, before).unwrap();
-        assert_eq!(past.config(), &LedgerConfig::default());
+        assert_eq!(
+            past.min_keep_minutes(&store).unwrap(),
+            DEFAULT_MIN_KEEP_MINUTES
+        );
+
+        // Deleting the namespace reverts to the default.
+        ledger
+            .apply(&mut store, &delete(ledger.head(), MIN_KEEP_MINUTES_KEY))
+            .unwrap();
+        assert_eq!(
+            ledger.min_keep_minutes(&store).unwrap(),
+            DEFAULT_MIN_KEEP_MINUTES
+        );
     }
 
-    /// A `SetConfig` writes no namespace: the state after it is exactly
-    /// the state before it.
+    /// Updates to the reserved floor are validated at apply: anything but
+    /// a positive integer that fits a `u32` is refused before the commit.
     #[test]
-    fn set_config_leaves_the_state_alone() {
-        let (mut store, mut ledger) = setup(&init());
-        ledger
-            .apply(&mut store, &set(ledger.head(), "a", "1"))
-            .unwrap();
-        let before = state(&store, &ledger);
+    fn apply_rejects_an_invalid_min_keep_value() {
+        let invalid = [
+            Value::String("soon".into()),
+            Value::Int(0),
+            Value::Int(-1),
+            Value::Int(i64::from(u32::MAX) + 1),
+            map([]),
+        ];
+        for value in invalid {
+            let (mut store, mut ledger) = setup(&init());
+            let head = ledger.head();
 
-        ledger
-            .apply(&mut store, &set_config(ledger.head(), 42))
-            .unwrap();
+            let err = ledger
+                .apply(&mut store, &set_minutes(head, value))
+                .unwrap_err();
 
-        assert_eq!(state(&store, &ledger), before);
+            assert!(matches!(
+                err,
+                ApplyError::InvalidValue { key: k } if k == key(MIN_KEEP_MINUTES_KEY)
+            ));
+            assert_eq!(ledger.head(), head, "head must not move");
+            assert_eq!(
+                ledger.min_keep_minutes(&store).unwrap(),
+                DEFAULT_MIN_KEEP_MINUTES
+            );
+        }
+    }
+
+    /// The boundary covers genesis too: an `Init` checkpoint can't
+    /// smuggle in a reserved value an update would be refused for.
+    #[test]
+    fn init_rejects_an_invalid_reserved_value() {
+        let mut store = MemStorage::default();
+        let envelope = Envelope::new(Msg::Init(InitMsg {
+            state: FullCheckpoint {
+                namespaces: [(key(MIN_KEEP_MINUTES_KEY), ns("garbage"))]
+                    .into_iter()
+                    .collect(),
+            },
+        }));
+
+        assert!(matches!(
+            Ledger::init(&mut store, &envelope),
+            Err(Error::Apply(ApplyError::InvalidValue { .. }))
+        ));
     }
 
     /// A checkpoint built from a ledger's state reopens to exactly that

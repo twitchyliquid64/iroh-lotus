@@ -14,8 +14,8 @@
 //! [`children`](Storage::children). The log is what fork resolution walks
 //! and what a node gossips from; versions are merely what the log folds
 //! down to, and any pruned version can be re-derived from it. Versions
-//! hold namespaces alone — chain-level facts like the config are derived
-//! from the config-bearing envelopes the log already keeps.
+//! hold namespaces alone — even the ledger's own config is ordinary
+//! namespace data under a reserved key, not something stored beside it.
 //!
 //! The surface is namespace- and path-granular on purpose: a backend can
 //! keep state on disk and page in only what an envelope touches, so
@@ -141,15 +141,14 @@ pub trait Storage {
     ) -> impl Iterator<Item = Result<(NamespaceKey, Namespace), Self::Error>>;
 
     /// Derives the version at `head` by applying `op` to the version at
-    /// `parent` — or as an untouched copy when `op` is `None`, the commit
-    /// of a message that writes no namespace (a config change). Atomic: a
-    /// crash must never leave a half-written version. The parent version
-    /// is left intact; other ledgers may be standing on it.
+    /// `parent`, atomically — a crash must never leave a half-written
+    /// version. The parent version is left intact; other ledgers may be
+    /// standing on it.
     fn commit(
         &mut self,
         parent: EnvelopeDigest,
         head: EnvelopeDigest,
-        op: Option<NamespaceOp>,
+        op: NamespaceOp,
     ) -> Result<(), Self::Error>;
 
     /// Installs `namespaces` as the version at `head` — the `Init` that

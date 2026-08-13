@@ -66,6 +66,13 @@ pub enum ApplyError<E> {
         /// The path that was walked.
         path: SubkeyPath,
     },
+    /// The value the namespace would hold after the write violates the
+    /// rules for that namespace — today, the baked-in rules for the
+    /// reserved `_lotus_` keys.
+    InvalidValue {
+        /// The namespace whose rules refused the value.
+        key: NamespaceKey,
+    },
     /// The storage backend failed.
     Storage(E),
 }
@@ -105,6 +112,9 @@ impl<E> fmt::Display for ApplyError<E> {
             }
             ApplyError::PathTypeMismatch { key, path } => {
                 write!(f, "namespace {key} cannot be walked to {path}")
+            }
+            ApplyError::InvalidValue { key } => {
+                write!(f, "value not valid for namespace {key}")
             }
             ApplyError::Storage(_) => f.write_str("storage backend failed"),
         }

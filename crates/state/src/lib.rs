@@ -20,4 +20,4 @@ mod error;
 pub use error::{ApplyError, Error};
 
 mod ledger;
-pub use ledger::Ledger;
+pub use ledger::{DEFAULT_MIN_KEEP_MINUTES, Ledger, MIN_KEEP_MINUTES_KEY};

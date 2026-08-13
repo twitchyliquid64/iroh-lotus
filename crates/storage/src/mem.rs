@@ -83,26 +83,25 @@ impl Storage for MemStorage {
         &mut self,
         parent: EnvelopeDigest,
         head: EnvelopeDigest,
-        op: Option<NamespaceOp>,
+        op: NamespaceOp,
     ) -> Result<(), Infallible> {
         let mut version = self.version(parent).clone();
 
         match op {
-            Some(NamespaceOp::Put(key, namespace)) => {
+            NamespaceOp::Put(key, namespace) => {
                 version.insert(key, Arc::new(namespace));
             }
-            Some(NamespaceOp::Delete(key)) => {
+            NamespaceOp::Delete(key) => {
                 version
                     .remove(&key)
                     .expect("Delete is pre-validated: the namespace exists");
             }
-            Some(NamespaceOp::SetAt { key, path, value }) => {
+            NamespaceOp::SetAt { key, path, value } => {
                 let namespace = version
                     .get_mut(&key)
                     .expect("SetAt is pre-validated: the namespace exists");
                 value::set_at(&mut Arc::make_mut(namespace).value, &path, value);
             }
-            None => {}
         }
 
         self.versions.insert(head, version);

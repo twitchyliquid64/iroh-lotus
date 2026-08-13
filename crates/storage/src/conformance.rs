@@ -45,10 +45,6 @@ macro_rules! storage_conformance {
             $crate::conformance::commit_keeps_the_parent_intact($make);
         }
         #[test]
-        fn conformance_commit_without_an_op_copies_the_version() {
-            $crate::conformance::commit_without_an_op_copies_the_version($make);
-        }
-        #[test]
         fn conformance_put_creates_and_overwrites() {
             $crate::conformance::put_creates_and_overwrites($make);
         }
@@ -158,14 +154,13 @@ fn nested() -> Namespace {
     }
 }
 
-/// A `SetAt` against the `n` namespace the nested fixtures install,
-/// ready to hand to `commit`.
-fn set_at(p: SubkeyPath, value: Option<Value>) -> Option<NamespaceOp> {
-    Some(NamespaceOp::SetAt {
+/// A `SetAt` against the `n` namespace the nested fixtures install.
+fn set_at(p: SubkeyPath, value: Option<Value>) -> NamespaceOp {
+    NamespaceOp::SetAt {
         key: key("n"),
         path: p,
         value,
-    })
+    }
 }
 
 fn fetch<S: Storage>(store: &S, head: u8, k: &str) -> Option<Namespace> {
@@ -217,11 +212,7 @@ pub fn commit_keeps_the_parent_intact<S: Storage>(mut store: S) {
         .install(digest(1), namespaces([("a", leaf("1"))]))
         .expect("install");
     store
-        .commit(
-            digest(1),
-            digest(2),
-            Some(NamespaceOp::Put(key("a"), leaf("9"))),
-        )
+        .commit(digest(1), digest(2), NamespaceOp::Put(key("a"), leaf("9")))
         .expect("commit");
 
     assert_eq!(fetch(&store, 2, "a"), Some(leaf("9")));
@@ -232,36 +223,15 @@ pub fn commit_keeps_the_parent_intact<S: Storage>(mut store: S) {
     );
 }
 
-/// A `None` op is the commit of a message that writes no namespace (a
-/// config change): the new version is an untouched copy of its parent.
-pub fn commit_without_an_op_copies_the_version<S: Storage>(mut store: S) {
-    store
-        .install(digest(1), namespaces([("a", leaf("1"))]))
-        .expect("install");
-    store.commit(digest(1), digest(2), None).expect("commit");
-
-    assert!(store.contains_version(digest(2)).expect("contains_version"));
-    assert_eq!(fetch(&store, 2, "a"), Some(leaf("1")));
-    assert_eq!(fetch(&store, 1, "a"), Some(leaf("1")));
-}
-
 pub fn put_creates_and_overwrites<S: Storage>(mut store: S) {
     store
         .install(digest(1), namespaces([("a", leaf("1"))]))
         .expect("install");
     store
-        .commit(
-            digest(1),
-            digest(2),
-            Some(NamespaceOp::Put(key("b"), leaf("2"))),
-        )
+        .commit(digest(1), digest(2), NamespaceOp::Put(key("b"), leaf("2")))
         .expect("commit");
     store
-        .commit(
-            digest(2),
-            digest(3),
-            Some(NamespaceOp::Put(key("a"), leaf("9"))),
-        )
+        .commit(digest(2), digest(3), NamespaceOp::Put(key("a"), leaf("9")))
         .expect("commit");
 
     assert_eq!(fetch(&store, 3, "a"), Some(leaf("9")));
@@ -273,7 +243,7 @@ pub fn delete_removes_the_namespace<S: Storage>(mut store: S) {
         .install(digest(1), namespaces([("a", leaf("1")), ("b", leaf("2"))]))
         .expect("install");
     store
-        .commit(digest(1), digest(2), Some(NamespaceOp::Delete(key("a"))))
+        .commit(digest(1), digest(2), NamespaceOp::Delete(key("a")))
         .expect("commit");
 
     assert_eq!(fetch(&store, 2, "a"), None);
@@ -423,18 +393,10 @@ pub fn forks_diverge_independently<S: Storage>(mut store: S) {
         .install(digest(1), namespaces([("a", leaf("1"))]))
         .expect("install");
     store
-        .commit(
-            digest(1),
-            digest(2),
-            Some(NamespaceOp::Put(key("b"), leaf("2"))),
-        )
+        .commit(digest(1), digest(2), NamespaceOp::Put(key("b"), leaf("2")))
         .expect("commit");
     store
-        .commit(
-            digest(1),
-            digest(3),
-            Some(NamespaceOp::Put(key("c"), leaf("3"))),
-        )
+        .commit(digest(1), digest(3), NamespaceOp::Put(key("c"), leaf("3")))
         .expect("commit");
 
     assert_eq!(fetch(&store, 2, "a"), Some(leaf("1")));

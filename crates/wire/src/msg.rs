@@ -31,22 +31,6 @@ use crate::{EnvelopeDigest, subkey::SubkeyPath};
 )]
 pub struct NamespaceKey(String);
 
-/// A retention floor, in minutes.
-#[nutype(derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    Display,
-    Serialize,
-    Deserialize
-))]
-pub struct MinKeepMinutes(u32);
-
 /// A specific message in the ledger.
 ///
 /// Variants are renamed to single letters to shorten their wire encoding.
@@ -65,9 +49,6 @@ pub enum Msg {
     /// Deletes an entire namespace.
     #[serde(rename = "dn")]
     DeleteNamespace(DeleteNamespace),
-    /// Replaces the ledger's configuration.
-    #[serde(rename = "c")]
-    SetConfig(SetConfig),
 }
 
 impl Msg {
@@ -78,7 +59,6 @@ impl Msg {
             Msg::SetNamespace(s) => Some(&s.prev),
             Msg::SetNamespaceKey(s) => Some(&s.prev),
             Msg::DeleteNamespace(d) => Some(&d.prev),
-            Msg::SetConfig(s) => Some(&s.prev),
         }
     }
 
@@ -93,7 +73,6 @@ impl Msg {
             Msg::SetNamespace(s) => &s.prev,
             Msg::SetNamespaceKey(s) => &s.prev,
             Msg::DeleteNamespace(d) => &d.prev,
-            Msg::SetConfig(s) => &s.prev,
         }
     }
 }
@@ -110,28 +89,6 @@ pub struct InitMsg {
 pub struct FullCheckpoint {
     #[cbor(key = 1)]
     pub namespaces: BTreeMap<NamespaceKey, Namespace>,
-    #[cbor(key = 2)]
-    pub config: LedgerConfig,
-}
-
-/// The configuration of the ledger.
-#[derive(Debug, Clone, Cbor, Hash, PartialEq, Eq)]
-pub struct LedgerConfig {
-    /// The minimum number of minutes a message must be kept by all
-    /// nodes before it is eligible for compaction.
-    ///
-    /// The determination that enough time has passed MUST be relative
-    /// to a local time source, and/or using a signed timestamp.
-    #[cbor(key = 1)]
-    pub min_keep_minutes: MinKeepMinutes,
-}
-
-impl Default for LedgerConfig {
-    fn default() -> Self {
-        Self {
-            min_keep_minutes: MinKeepMinutes::new(5 * 24 * 60),
-        }
-    }
 }
 
 /// Sets / overwrites a namespace.
@@ -169,19 +126,6 @@ pub struct DeleteNamespace {
     pub prev: EnvelopeDigest,
     #[cbor(key = 2)]
     pub key: NamespaceKey,
-}
-
-/// Replaces the ledger's configuration, wholesale.
-///
-/// The config in force at any position is that of the nearest
-/// config-bearing envelope at or above it — a `SetConfig`, else the
-/// `Init` — derived from the messages, never stored beside the state.
-#[derive(Debug, Clone, Cbor, Hash, PartialEq, Eq)]
-pub struct SetConfig {
-    #[cbor(key = 1)]
-    pub prev: EnvelopeDigest,
-    #[cbor(key = 2)]
-    pub config: LedgerConfig,
 }
 
 /// A complete representation of the data & configuration of a namespace.
@@ -261,43 +205,16 @@ mod tests {
         assert_wire(&ns("hi"), "a101a16173626869");
     }
 
-    /// `min_keep_minutes` is a bare unsigned integer under key `01`, so its
-    /// width tracks the value: `00` at zero, `19 xxxx` once past 255.
-    #[test]
-    fn config_encodes_min_keep_minutes() {
-        assert_wire(
-            &LedgerConfig {
-                min_keep_minutes: MinKeepMinutes::new(0),
-            },
-            "a10100",
-        );
-        assert_wire(
-            &LedgerConfig {
-                min_keep_minutes: MinKeepMinutes::new(23),
-            },
-            "a10117",
-        );
-        assert_wire(
-            &LedgerConfig {
-                min_keep_minutes: MinKeepMinutes::new(24),
-            },
-            "a1011818",
-        );
-        assert_wire(&LedgerConfig::default(), "a101191c20");
-    }
-
     #[test]
     fn checkpoint_roundtrips() {
-        // a2          map(2)
+        // a1          map(1)
         //   01 a0     namespaces = {}
-        //   02 …      config = LedgerConfig::default()
-        assert_wire(&FullCheckpoint::default(), "a201a002a101191c20");
+        assert_wire(&FullCheckpoint::default(), "a101a0");
         assert_wire(
             &FullCheckpoint {
                 namespaces: BTreeMap::from([(key("a"), ns("1"))]),
-                ..Default::default()
             },
-            "a201a16161a101a16173613102a101191c20",
+            "a101a16161a101a161736131",
         );
     }
 
@@ -310,9 +227,8 @@ mod tests {
         assert_wire(
             &FullCheckpoint {
                 namespaces: BTreeMap::from([(key("z"), ns("1")), (key("aa"), ns("2"))]),
-                ..Default::default()
             },
-            "a201a2617aa101a161736131626161a101a16173613202a101191c20",
+            "a101a2617aa101a161736131626161a101a161736132",
         );
     }
 
@@ -321,11 +237,9 @@ mod tests {
     fn checkpoint_encoding_depends_only_on_content() {
         let forwards = FullCheckpoint {
             namespaces: BTreeMap::from([(key("z"), ns("1")), (key("aa"), ns("2"))]),
-            ..Default::default()
         };
         let backwards = FullCheckpoint {
             namespaces: BTreeMap::from([(key("aa"), ns("2")), (key("z"), ns("1"))]),
-            ..Default::default()
         };
 
         assert_eq!(
@@ -339,10 +253,9 @@ mod tests {
         let msg = Msg::Init(InitMsg {
             state: FullCheckpoint {
                 namespaces: BTreeMap::new(),
-                ..Default::default()
             },
         });
-        assert_wire(&msg, "a16169a101a201a002a101191c20");
+        assert_wire(&msg, "a16169a101a101a0");
     }
 
     /// `Value::Map` sorts its keys the same canonical way a checkpoint does.
@@ -379,23 +292,6 @@ mod tests {
                 "03a101a161736131"
             ),
         );
-    }
-
-    /// `a2` (map, 2 pairs): the digest under `01`, the whole config under
-    /// `02` — a replacement, not a patch.
-    #[test]
-    fn set_config_carries_prev_and_config() {
-        let msg = Msg::SetConfig(SetConfig {
-            prev: EnvelopeDigest::from_bytes([0xab; 32]),
-            config: LedgerConfig::default(),
-        });
-        assert_wire(
-            &msg,
-            &format!("a16163a2015820{}02a101191c20", "ab".repeat(32)),
-        );
-
-        let digest = EnvelopeDigest::from_bytes([0xab; 32]);
-        assert_eq!(msg.prev_digest(), Some(&digest));
     }
 
     /// Only `SetNamespace` chains; `Init` starts the ledger and has nothing
@@ -464,22 +360,6 @@ mod tests {
         // The same message with a one-character key (`02 6161`) decodes.
         let one_char = format!("a16173a3015820{}02616103a101a161736131", "ab".repeat(32));
         assert!(crate::decode::<Msg>(&unhex(&one_char)).is_ok());
-    }
-
-    /// `u32`, not `usize`: the wire width can't depend on the host that
-    /// decoded it, and an over-range value is rejected rather than
-    /// truncated.
-    #[test]
-    fn min_keep_minutes_is_bounded_at_u32() {
-        assert_wire(
-            &LedgerConfig {
-                min_keep_minutes: MinKeepMinutes::new(u32::MAX),
-            },
-            "a1011affffffff",
-        );
-
-        // u32::MAX + 1, encoded as a 64-bit CBOR integer.
-        assert!(crate::decode::<LedgerConfig>(&unhex("a1011b0000000100000000")).is_err());
     }
 
     #[test]

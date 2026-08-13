@@ -151,12 +151,10 @@ mod tests {
     //    01                   payload
     //      a1 61 69           Msg::Init
     //        a1 01            InitMsg.state
-    //          a2             FullCheckpoint, map(2)
-    //            01 a0        namespaces = {}
-    //            02 a1 01 …   config.min_keep_minutes = 7200
+    //          a1 01 a0       FullCheckpoint { namespaces: {} }
     //    02 80                signatures = []
     //    03 80                timestamps = []
-    const INIT_ENVELOPE: &str = "a301a16169a101a201a002a101191c2002800380";
+    const INIT_ENVELOPE: &str = "a301a16169a101a101a002800380";
 
     /// Round-trips the bytes rather than constructing a `Msg`, whose fields
     /// are private to its module.
@@ -184,13 +182,13 @@ mod tests {
             signatures: vec![EnvelopeSignature {}],
             ..init_envelope()
         };
-        assert_wire(&signed, "a301a16169a101a201a002a101191c200281a00380");
+        assert_wire(&signed, "a301a16169a101a101a00281a00380");
 
         let stamped = Envelope {
             timestamps: vec![SignedTimestamp {}],
             ..init_envelope()
         };
-        assert_wire(&stamped, "a301a16169a101a201a002a101191c2002800381a0");
+        assert_wire(&stamped, "a301a16169a101a101a002800381a0");
     }
 
     /// The digest is blake3 over the envelope's canonical encoding — not
@@ -210,7 +208,7 @@ mod tests {
         // reproducible by inspection.
         assert_eq!(
             envelope.digest().unwrap().to_hex().as_ref(),
-            "c4f9ab9d4e4d70d1166e3052a47eda262595cac54379dfad27d021793601c371",
+            "c3cac0124e2d1b64457f8879766d3b10b1fe468887587222819351048e5de3ca",
         );
     }
 
@@ -240,7 +238,7 @@ mod tests {
         assert_ne!(unsigned.digest().unwrap(), signed.digest().unwrap());
         assert_eq!(
             signed.digest().unwrap().to_hex().as_ref(),
-            "dc6c53028886f857b7dbe2bb6d3bb679c5e1814b1f091cd911e40cc1331d2e2b",
+            "f80ace62eb8d898403f3c3f06f107962099347dbedee78448478834a70220708",
         );
     }
 

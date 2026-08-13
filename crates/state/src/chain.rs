@@ -1,10 +1,7 @@
 //! Fork resolution over the envelopes a node has seen.
 
 use storage::Storage;
-use wire::{
-    Envelope, EnvelopeDigest, Msg,
-    msg::{FullCheckpoint, LedgerConfig},
-};
+use wire::{Envelope, EnvelopeDigest, Msg, msg::FullCheckpoint};
 
 use crate::{ApplyError, Error, Ledger};
 
@@ -50,10 +47,11 @@ impl Chain {
     /// envelope and installing its checkpoint.
     pub fn init<S: Storage>(storage: &mut S, envelope: Envelope) -> Result<Self, Error<S::Error>> {
         let ledger = Ledger::init(storage, &envelope)?;
-        Ok(Self {
-            root: ledger.head(),
-            ledger,
-        })
+        let root = ledger.head();
+        storage
+            .put_envelope(root, envelope)
+            .map_err(Error::Storage)?;
+        Ok(Self { root, ledger })
     }
 
     /// Reopens the chain rooted at `root`, re-deriving the canonical head
@@ -144,10 +142,11 @@ impl Chain {
         self.root
     }
 
-    /// The configuration in force at the canonical head, folded out of
-    /// the messages on the canonical path.
-    pub fn config(&self) -> &LedgerConfig {
-        self.ledger.config()
+    /// The compaction floor in force at the canonical head. Config is
+    /// namespace data, so it follows the canonical branch like the rest
+    /// of the state.
+    pub fn min_keep_minutes<S: Storage>(&self, storage: &S) -> Result<u32, S::Error> {
+        self.ledger.min_keep_minutes(storage)
     }
 
     /// The canonical state as a checkpoint, ready to open a rewritten
@@ -181,19 +180,16 @@ impl Chain {
             .map_err(Error::Storage)?;
 
         for child in children {
+            // A version at the child means it applied before — digests pin
+            // content, so it can only be this envelope's result.
+            if storage.contains_version(child).map_err(Error::Storage)? {
+                return Ok(Some(Ledger::open(storage, child)?));
+            }
             let envelope = storage
                 .envelope(child)
                 .map_err(Error::Storage)?
                 .expect("children indexes only filed envelopes");
-            // A version at the child means it applied before — digests pin
-            // content, so it can only be this envelope's result. The
-            // cursor still folds over the envelope for the config.
-            if storage.contains_version(child).map_err(Error::Storage)? {
-                let mut next = ledger.clone();
-                next.advance(&envelope)?;
-                return Ok(Some(next));
-            }
-            let mut candidate = ledger.clone();
+            let mut candidate = *ledger;
             match candidate.apply(storage, &envelope) {
                 Ok(()) => return Ok(Some(candidate)),
                 Err(ApplyError::Storage(err)) => return Err(Error::Storage(err)),
@@ -232,12 +228,12 @@ mod tests {
     use wire::{
         Msg,
         msg::{
-            DeleteNamespace, FullCheckpoint, InitMsg, MinKeepMinutes, Namespace, NamespaceKey,
-            SetNamespace, Value,
+            DeleteNamespace, FullCheckpoint, InitMsg, Namespace, NamespaceKey, SetNamespace, Value,
         },
     };
 
     use super::*;
+    use crate::MIN_KEEP_MINUTES_KEY;
 
     fn key(k: &str) -> NamespaceKey {
         NamespaceKey::try_new(k).unwrap()
@@ -484,7 +480,6 @@ mod tests {
         let foreign = Envelope::new(Msg::Init(InitMsg {
             state: FullCheckpoint {
                 namespaces: [(key("x"), ns("1"))].into_iter().collect(),
-                ..Default::default()
             },
         }));
 
@@ -494,32 +489,39 @@ mod tests {
         ));
     }
 
-    fn set_config(prev: EnvelopeDigest, minutes: u32) -> Envelope {
-        Envelope::new(Msg::SetConfig(wire::msg::SetConfig {
+    fn set_minutes(prev: EnvelopeDigest, minutes: i64) -> Envelope {
+        Envelope::new(Msg::SetNamespace(SetNamespace {
             prev,
-            config: LedgerConfig {
-                min_keep_minutes: MinKeepMinutes::new(minutes),
+            key: key(MIN_KEEP_MINUTES_KEY),
+            namespace: Namespace {
+                value: Value::Int(minutes),
             },
         }))
     }
 
-    /// Config is state like any other: it follows the canonical branch,
-    /// so a reorg can change what's in force.
+    /// Config is namespace data like any other: it follows the canonical
+    /// branch, so a reorg can change what's in force.
     #[test]
     fn config_follows_the_canonical_branch() {
         let (mut store, mut chain) = setup();
-        let (winner, loser) = ranked(set_config(chain.head(), 100), set_config(chain.head(), 200));
+        let (winner, loser) = ranked(
+            set_minutes(chain.head(), 100),
+            set_minutes(chain.head(), 200),
+        );
         let minutes = |envelope: &Envelope| match envelope.payload() {
-            Msg::SetConfig(set) => set.config.min_keep_minutes,
-            _ => unreachable!("both envelopes are SetConfig"),
+            Msg::SetNamespace(set) => match set.namespace.value {
+                Value::Int(minutes) => u32::try_from(minutes).unwrap(),
+                _ => unreachable!("both envelopes set an integer"),
+            },
+            _ => unreachable!("both envelopes are SetNamespace"),
         };
 
         chain.insert(&mut store, loser.clone()).unwrap();
-        assert_eq!(chain.config().min_keep_minutes, minutes(&loser));
+        assert_eq!(chain.min_keep_minutes(&store).unwrap(), minutes(&loser));
 
         chain.insert(&mut store, winner.clone()).unwrap();
         assert_eq!(chain.head(), digest(&winner));
-        assert_eq!(chain.config().min_keep_minutes, minutes(&winner));
+        assert_eq!(chain.min_keep_minutes(&store).unwrap(), minutes(&winner));
     }
 
     /// Everything durable lives in the store, so a chain reopened from
@@ -531,13 +533,13 @@ mod tests {
         chain.insert(&mut store, loser).unwrap();
         chain.insert(&mut store, winner).unwrap();
         chain
-            .insert(&mut store, set_config(chain.head(), 42))
+            .insert(&mut store, set_minutes(chain.head(), 42))
             .unwrap();
 
         let reopened = Chain::open(&mut store, chain.root()).unwrap();
         assert_eq!(reopened.head(), chain.head());
         assert_eq!(reopened.ledger(), chain.ledger());
-        assert_eq!(reopened.config().min_keep_minutes, MinKeepMinutes::new(42));
+        assert_eq!(reopened.min_keep_minutes(&store).unwrap(), 42);
     }
 
     /// Reopening survives pruned mid-chain versions: what `retain` drops
