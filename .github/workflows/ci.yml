@@ -1,0 +1,64 @@
+name: CI
+on:
+    push:
+        branches: ["main"]
+    pull_request:
+        branches: ["main"]
+    workflow_dispatch:
+
+env:
+    CARGO_TERM_COLOR: always
+
+# Cancel an in-progress run when a newer commit is pushed to the same ref.
+# main is excluded so a push to main never gets cancelled mid-flight.
+concurrency:
+    group: ci-${{ github.ref }}
+    cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+    changes:
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        outputs:
+            code: ${{ steps.filter.outputs.code }}
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - name: Detect non-docs changes
+              id: filter
+              if: github.event_name == 'pull_request'
+              uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d
+              with:
+                  filters: |
+                      code:
+                        - "**"
+                        - ".github/**"
+                        - "!*.md"
+                        - "!**/*.md"
+                        - "!docs/**"
+                        - "!LICENSE"
+
+    fmt:
+        needs: [changes]
+        if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - name: Run rustfmt
+              run: cargo fmt --all -- --check
+
+    clippy:
+        needs: [changes]
+        if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - name: Run Clippy
+              run: cargo clippy --workspace --all-targets --locked -- -D warnings
