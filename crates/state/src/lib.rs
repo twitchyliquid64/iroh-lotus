@@ -8,7 +8,7 @@
 //! ledgers can share one store and an apply touches only what its
 //! envelope addresses.
 //!
-//! A [`Chain`] sits above the cursor: it files every envelope a node has
+//! A [`Chain`] sits above the cursor: it stores every envelope a node has
 //! seen — competing forks included — into the store's log, and maintains
 //! the ledger on the canonical path through them, where at every fork the
 //! child with the lowest digest wins.

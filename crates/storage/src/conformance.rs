@@ -85,8 +85,8 @@ macro_rules! storage_conformance {
             $crate::conformance::retain_prunes_unkept_versions($make);
         }
         #[test]
-        fn conformance_envelopes_file_and_read_back() {
-            $crate::conformance::envelopes_file_and_read_back($make);
+        fn conformance_envelopes_store_and_read_back() {
+            $crate::conformance::envelopes_store_and_read_back($make);
         }
         #[test]
         fn conformance_children_come_back_in_digest_order() {
@@ -97,8 +97,8 @@ macro_rules! storage_conformance {
             $crate::conformance::retain_leaves_the_envelope_log_alone($make);
         }
         #[test]
-        fn conformance_remove_envelope_unfiles_and_unindexes() {
-            $crate::conformance::remove_envelope_unfiles_and_unindexes($make);
+        fn conformance_remove_envelope_unstores_and_unindexes() {
+            $crate::conformance::remove_envelope_unstores_and_unindexes($make);
         }
     };
 }
@@ -520,7 +520,7 @@ fn digest_of(envelope: &Envelope) -> EnvelopeDigest {
     envelope.digest().expect("suite envelopes encode")
 }
 
-fn file<S: Storage>(store: &mut S, envelope: &Envelope) -> EnvelopeDigest {
+fn put<S: Storage>(store: &mut S, envelope: &Envelope) -> EnvelopeDigest {
     let digest = digest_of(envelope);
     store
         .put_envelope(digest, envelope.clone())
@@ -535,27 +535,27 @@ fn children_of<S: Storage>(store: &S, parent: EnvelopeDigest) -> Vec<EnvelopeDig
         .expect("children")
 }
 
-pub fn envelopes_file_and_read_back<S: Storage>(mut store: S) {
-    let filed = envelope(digest(1), "1");
-    let d = digest_of(&filed);
+pub fn envelopes_store_and_read_back<S: Storage>(mut store: S) {
+    let stored = envelope(digest(1), "1");
+    let d = digest_of(&stored);
 
     assert_eq!(store.envelope(d).expect("envelope"), None);
-    file(&mut store, &filed);
-    assert_eq!(store.envelope(d).expect("envelope"), Some(filed.clone()));
+    put(&mut store, &stored);
+    assert_eq!(store.envelope(d).expect("envelope"), Some(stored.clone()));
 
-    // The log is content-addressed: refiling changes nothing, and the
+    // The log is content-addressed: re-storing changes nothing, and the
     // parent doesn't grow a second child.
-    file(&mut store, &filed);
-    assert_eq!(store.envelope(d).expect("envelope"), Some(filed));
+    put(&mut store, &stored);
+    assert_eq!(store.envelope(d).expect("envelope"), Some(stored));
     assert_eq!(children_of(&store, digest(1)), vec![d]);
 }
 
 pub fn children_come_back_in_digest_order<S: Storage>(mut store: S) {
     let siblings: Vec<_> = ["1", "2", "3", "4"]
         .iter()
-        .map(|v| file(&mut store, &envelope(digest(1), v)))
+        .map(|v| put(&mut store, &envelope(digest(1), v)))
         .collect();
-    let elsewhere = file(&mut store, &envelope(digest(2), "1"));
+    let elsewhere = put(&mut store, &envelope(digest(2), "1"));
 
     let expected = siblings
         .iter()
@@ -571,10 +571,10 @@ pub fn children_come_back_in_digest_order<S: Storage>(mut store: S) {
     assert_eq!(children_of(&store, digest(9)), Vec::new());
 }
 
-pub fn remove_envelope_unfiles_and_unindexes<S: Storage>(mut store: S) {
+pub fn remove_envelope_unstores_and_unindexes<S: Storage>(mut store: S) {
     let kept_envelope = envelope(digest(1), "1");
-    let kept = file(&mut store, &kept_envelope);
-    let removed = file(&mut store, &envelope(digest(1), "2"));
+    let kept = put(&mut store, &kept_envelope);
+    let removed = put(&mut store, &envelope(digest(1), "2"));
 
     store.remove_envelope(removed).expect("remove");
 
@@ -586,7 +586,7 @@ pub fn remove_envelope_unfiles_and_unindexes<S: Storage>(mut store: S) {
     );
     assert_eq!(children_of(&store, digest(1)), vec![kept]);
 
-    // Removing what isn't filed is a no-op.
+    // Removing what isn't stored is a no-op.
     store.remove_envelope(digest(9)).expect("remove");
     assert_eq!(children_of(&store, digest(1)), vec![kept]);
 }
@@ -597,13 +597,13 @@ pub fn retain_leaves_the_envelope_log_alone<S: Storage>(mut store: S) {
     store
         .install(digest(1), namespaces([("a", leaf("1"))]))
         .expect("install");
-    let filed = envelope(digest(1), "2");
-    let d = file(&mut store, &filed);
+    let stored = envelope(digest(1), "2");
+    let d = put(&mut store, &stored);
 
     store.retain(&[]).expect("retain");
 
     assert!(!store.contains_version(digest(1)).expect("contains_version"));
-    assert_eq!(store.envelope(d).expect("envelope"), Some(filed));
+    assert_eq!(store.envelope(d).expect("envelope"), Some(stored));
     assert_eq!(children_of(&store, digest(1)), vec![d]);
 }
 

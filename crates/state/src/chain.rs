@@ -39,14 +39,14 @@ pub enum Insert {
     /// adjudicated against.
     Unchanged,
     /// The envelope was already in the store's log *and* the head did
-    /// not move. A duplicate this cursor had not folded in yet — filed
+    /// not move. A duplicate this cursor had not folded in yet — stored
     /// through another chain sharing the store — reports the movement
     /// instead.
     Duplicate,
 }
 
 impl Chain {
-    /// Opens a chain from the `Init` envelope that starts it, filing the
+    /// Opens a chain from the `Init` envelope that starts it, storing the
     /// envelope and installing its checkpoint.
     pub fn init<S: Storage>(storage: &mut S, envelope: Envelope) -> Result<Self, Error<S::Error>> {
         let ledger = Ledger::init(storage, &envelope)?;
@@ -81,19 +81,18 @@ impl Chain {
         Ok(chain)
     }
 
-    /// Files `envelope` into the store's log and re-derives the canonical
-    /// head.
+    /// Stores `envelope` in the log and re-derives the canonical head.
     ///
     /// The parent's version must be in the store: sync transmits
     /// parent-first, so an unknown — or pruned — parent is refused as
     /// [`Error::UnknownParent`], not buffered. Validation happens at the
-    /// boundary: the envelope is applied on probation against its
-    /// parent's version, and a failure refuses it — never filed — with
+    /// boundary: the envelope is applied on a trial ledger against its
+    /// parent's version, and a failure refuses it — never stored — with
     /// the failure as the error. Losing a fork is no error, merely
     /// [`Insert::Unchanged`].
     ///
     /// Inserting always leaves the chain standing at the canonical head
-    /// of everything the log holds — an envelope already filed still
+    /// of everything the log holds — an envelope already stored still
     /// triggers the walk, so a cursor lagging behind a shared store
     /// catches up rather than reporting [`Insert::Duplicate`] forever.
     pub fn insert<S: Storage>(
@@ -101,32 +100,37 @@ impl Chain {
         storage: &mut S,
         envelope: Envelope,
     ) -> Result<Insert, Error<S::Error>> {
-        let Some(prev) = envelope.payload().prev_digest().copied() else {
-            return Err(Error::Apply(ApplyError::UnexpectedInit));
-        };
-        let digest = envelope.digest()?;
+        self.insert_batch(storage, [envelope])
+    }
 
-        // Already in the log — perhaps through another chain sharing the
-        // store. Nothing to file, but the walk below still runs: this
-        // cursor may not have folded it in yet.
-        let already_stored = storage.envelope(digest).map_err(Error::Storage)?.is_some();
-
-        if !already_stored {
-            if !storage.contains_version(prev).map_err(Error::Storage)? {
-                return Err(Error::UnknownParent(prev));
-            }
-
-            // Store the new envelope if it applies successfully.
-            let mut prev_state = Ledger::open(storage, prev)?;
-            prev_state.apply(storage, &envelope)?;
-
-            storage
-                .put_envelope(digest, envelope)
-                .map_err(Error::Storage)?;
-        }
+    /// Stores a parent-first linear run of envelopes in the log and
+    /// re-derives the canonical head once, at the end — one walk per
+    /// batch instead of one per envelope, which is what sync should use.
+    ///
+    /// The run must be continuous: each envelope chains onto the one
+    /// before it — a gap is refused as [`ApplyError::ChainMismatch`] —
+    /// and the first parent's version must be in the store, as
+    /// [`insert`](Self::insert). The run may start anywhere a version
+    /// stands, a losing branch included.
+    ///
+    /// Validation is one trial ledger advanced across the run, so a
+    /// refusal keeps the valid prefix: everything before the fault is
+    /// stored, nothing at or after it is, and the walk still runs before
+    /// the error returns — the head never lags what was stored. Envelopes
+    /// already in the log are folded in without re-judgment (what's
+    /// stored is the walk's to adjudicate); [`Insert::Duplicate`] means a
+    /// non-empty run of nothing but duplicates that moved nothing. An
+    /// empty run just re-walks.
+    pub fn insert_batch<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        envelopes: impl IntoIterator<Item = Envelope>,
+    ) -> Result<Insert, Error<S::Error>> {
+        let stored = self.store_batch(storage, envelopes);
 
         let from = self.ledger.head();
         self.ledger = self.canonicalize(storage)?;
+        let all_duplicates = stored?;
 
         let head = self.ledger.head();
         Ok(if head != from {
@@ -135,11 +139,91 @@ impl Chain {
             } else {
                 Insert::Reorged { from }
             }
-        } else if already_stored {
+        } else if all_duplicates {
             Insert::Duplicate
         } else {
             Insert::Unchanged
         })
+    }
+
+    /// Validates and stores a linear run of envelopes. Returns whether
+    /// the run was non-empty and every envelope was already in the log.
+    ///
+    /// `trial` drops to `None` at a stored envelope this run can't
+    /// stand on — its version pruned with no parent version to re-derive
+    /// it from, or one that no longer applies. That is the walk's
+    /// business, not a refusal; only a *new* envelope downstream turns
+    /// the missing footing into [`Error::UnknownParent`].
+    fn store_batch<S: Storage>(
+        &self,
+        storage: &mut S,
+        envelopes: impl IntoIterator<Item = Envelope>,
+    ) -> Result<bool, Error<S::Error>> {
+        let mut trial: Option<Ledger> = None;
+        let mut last: Option<EnvelopeDigest> = None;
+        let mut all_duplicates = true;
+
+        for envelope in envelopes {
+            let Some(prev) = envelope.payload().prev_digest().copied() else {
+                return Err(Error::Apply(ApplyError::UnexpectedInit));
+            };
+            if let Some(expected) = last.filter(|&expected| expected != prev) {
+                return Err(Error::Apply(ApplyError::ChainMismatch {
+                    expected,
+                    found: prev,
+                }));
+            }
+            let digest = envelope.digest()?;
+            last = Some(digest);
+
+            let stored = storage.envelope(digest).map_err(Error::Storage)?.is_some();
+            all_duplicates &= stored;
+
+            if storage.contains_version(digest).map_err(Error::Storage)? {
+                // A version at the digest means it applied before —
+                // digests pin content, so it can only be this envelope's
+                // result.
+                if !stored {
+                    storage
+                        .put_envelope(digest, envelope)
+                        .map_err(Error::Storage)?;
+                }
+                trial = Some(Ledger::open(storage, digest)?);
+                continue;
+            }
+
+            let base = match trial.take() {
+                Some(ledger) => Some(ledger),
+                None => storage
+                    .contains_version(prev)
+                    .map_err(Error::Storage)?
+                    .then(|| Ledger::open(storage, prev))
+                    .transpose()?,
+            };
+            let Some(mut ledger) = base else {
+                if stored {
+                    continue;
+                }
+                return Err(Error::UnknownParent(prev));
+            };
+            match ledger.apply(storage, &envelope) {
+                Ok(()) => {
+                    if !stored {
+                        storage
+                            .put_envelope(digest, envelope)
+                            .map_err(Error::Storage)?;
+                    }
+                    trial = Some(ledger);
+                }
+                Err(ApplyError::Storage(err)) => return Err(Error::Storage(err)),
+                Err(err) if !stored => return Err(err.into()),
+                // Swallowed on purpose: a stored envelope that no longer
+                // applies is the walk's to adjudicate and drop, exactly
+                // as if it had arrived through another chain.
+                Err(_) => {}
+            }
+        }
+        Ok(last.is_some() && all_duplicates)
     }
 
     /// The canonical head — the tip fork resolution currently agrees on.
@@ -203,7 +287,7 @@ impl Chain {
             let envelope = storage
                 .envelope(child)
                 .map_err(Error::Storage)?
-                .expect("children indexes only filed envelopes");
+                .expect("children indexes only stored envelopes");
             let mut candidate = *ledger;
             match candidate.apply(storage, &envelope) {
                 Ok(()) => return Ok(Some(candidate)),
@@ -406,7 +490,11 @@ mod tests {
 
         let err = chain.insert(&mut store, child.clone()).unwrap_err();
         assert!(matches!(err, Error::UnknownParent(p) if p == digest(&parent)));
-        assert_eq!(store.envelope(digest(&child)).unwrap(), None, "never filed");
+        assert_eq!(
+            store.envelope(digest(&child)).unwrap(),
+            None,
+            "never stored"
+        );
         assert_eq!(chain.head(), chain.root(), "head must not move");
 
         // Delivered in order, both land.
@@ -419,7 +507,7 @@ mod tests {
     }
 
     /// When the parent's state is at hand, an envelope that fails to apply
-    /// is refused with the failure itself — and never filed.
+    /// is refused with the failure itself — and never stored.
     #[test]
     fn an_invalid_envelope_is_refused_at_the_door() {
         let (mut store, mut chain) = setup();
@@ -432,12 +520,12 @@ mod tests {
             Error::Apply(ApplyError::UnknownNamespace(k)) if k == key("nope")
         ));
 
-        assert_eq!(store.envelope(digest(&bad)).unwrap(), None, "never filed");
+        assert_eq!(store.envelope(digest(&bad)).unwrap(), None, "never stored");
         assert_eq!(chain.head(), chain.root(), "head must not move");
     }
 
-    /// A parent whose version was pruned can't back a probation, so its
-    /// children are refused rather than filed unvalidated.
+    /// A parent whose version was pruned can't back a trial apply, so its
+    /// children are refused rather than stored unvalidated.
     #[test]
     fn a_pruned_parent_refuses_new_children() {
         let (mut store, mut chain) = setup();
@@ -453,11 +541,15 @@ mod tests {
             chain.insert(&mut store, child.clone()).unwrap_err(),
             Error::UnknownParent(p) if p == digest(&parent)
         ));
-        assert_eq!(store.envelope(digest(&child)).unwrap(), None, "never filed");
+        assert_eq!(
+            store.envelope(digest(&child)).unwrap(),
+            None,
+            "never stored"
+        );
         assert_eq!(chain.head(), digest(&parent), "head must not move");
     }
 
-    /// `insert` files only validated envelopes, but the walk stays
+    /// `insert` stores only validated envelopes, but the walk stays
     /// defensive: an invalid envelope that reached the log some other
     /// way is dropped the moment the walk finds it out.
     #[test]
@@ -498,7 +590,7 @@ mod tests {
         ));
     }
 
-    /// Chains share a store: an envelope filed by one is a duplicate to
+    /// Chains share a store: an envelope stored by one is a duplicate to
     /// the other's log, but a lagging cursor must still fold it in
     /// rather than staying stale behind [`Insert::Duplicate`].
     #[test]
@@ -539,6 +631,186 @@ mod tests {
             chain.insert(&mut store, foreign),
             Err(Error::Apply(ApplyError::UnexpectedInit))
         ));
+    }
+
+    #[test]
+    fn a_batch_extends_the_chain_in_one_call() {
+        let (mut store, mut chain) = setup();
+        let a = set(chain.head(), "a", "1");
+        let b = set(digest(&a), "b", "2");
+        let c = set(digest(&b), "c", "3");
+
+        assert_eq!(
+            chain.insert_batch(&mut store, [a, b, c.clone()]).unwrap(),
+            Insert::Extended
+        );
+        assert_eq!(chain.head(), digest(&c));
+        assert!(has(&store, &chain, &key("a")));
+        assert!(has(&store, &chain, &key("c")));
+    }
+
+    /// The batch contract is linearity: an envelope that doesn't chain
+    /// onto its predecessor is refused — even one that would have been a
+    /// legal fork on its own.
+    #[test]
+    fn a_batch_with_a_gap_is_refused() {
+        let (mut store, mut chain) = setup();
+        let a = set(chain.head(), "a", "1");
+        // Chains onto the root, not onto `a`.
+        let stray = set(chain.head(), "x", "9");
+
+        let err = chain
+            .insert_batch(&mut store, [a.clone(), stray.clone()])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Apply(ApplyError::ChainMismatch { expected, found })
+                if expected == digest(&a) && found == chain.root()
+        ));
+
+        assert_eq!(chain.head(), digest(&a), "prefix is kept and canonical");
+        assert_eq!(
+            store.envelope(digest(&stray)).unwrap(),
+            None,
+            "never stored"
+        );
+    }
+
+    /// A mid-batch refusal keeps the valid prefix: everything before the
+    /// fault is stored and canonical, the fault and its descendants never
+    /// land.
+    #[test]
+    fn a_refused_batch_keeps_its_valid_prefix() {
+        let (mut store, mut chain) = setup();
+        let a = set(chain.head(), "a", "1");
+        let bad = delete(digest(&a), "nope");
+        let tail = set(digest(&bad), "c", "3");
+
+        let err = chain
+            .insert_batch(&mut store, [a.clone(), bad.clone(), tail.clone()])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Apply(ApplyError::UnknownNamespace(k)) if k == key("nope")
+        ));
+
+        assert_eq!(chain.head(), digest(&a), "prefix is canonical");
+        assert_eq!(store.envelope(digest(&bad)).unwrap(), None, "never stored");
+        assert_eq!(store.envelope(digest(&tail)).unwrap(), None, "never stored");
+    }
+
+    /// A batch may grow a losing branch: everything is stored, nothing moves.
+    #[test]
+    fn a_losing_batch_leaves_the_head_alone() {
+        let (mut store, mut chain) = setup();
+        let (winner, loser) = ranked(set(chain.head(), "a", "1"), set(chain.head(), "b", "2"));
+        chain.insert(&mut store, winner.clone()).unwrap();
+
+        let tail = set(digest(&loser), "c", "3");
+        assert_eq!(
+            chain
+                .insert_batch(&mut store, [loser, tail.clone()])
+                .unwrap(),
+            Insert::Unchanged
+        );
+        assert_eq!(chain.head(), digest(&winner));
+        assert!(store.envelope(digest(&tail)).unwrap().is_some(), "stored");
+    }
+
+    #[test]
+    fn a_winning_batch_reorgs_the_head() {
+        let (mut store, mut chain) = setup();
+        let (winner, loser) = ranked(set(chain.head(), "a", "1"), set(chain.head(), "b", "2"));
+        chain.insert(&mut store, loser.clone()).unwrap();
+
+        let next = set(digest(&winner), "c", "3");
+        assert_eq!(
+            chain
+                .insert_batch(&mut store, [winner, next.clone()])
+                .unwrap(),
+            Insert::Reorged {
+                from: digest(&loser)
+            }
+        );
+        assert_eq!(chain.head(), digest(&next));
+    }
+
+    /// Duplicates mixed into a run are folded past silently; the new
+    /// tail decides the outcome. Only a run of nothing but duplicates
+    /// that moved nothing reports [`Insert::Duplicate`].
+    #[test]
+    fn a_batch_resumes_past_duplicates() {
+        let (mut store, mut chain) = setup();
+        let a = set(chain.head(), "a", "1");
+        chain.insert(&mut store, a.clone()).unwrap();
+        let b = set(digest(&a), "b", "2");
+
+        assert_eq!(
+            chain
+                .insert_batch(&mut store, [a.clone(), b.clone()])
+                .unwrap(),
+            Insert::Extended
+        );
+        assert_eq!(chain.head(), digest(&b));
+
+        assert_eq!(
+            chain.insert_batch(&mut store, [a, b]).unwrap(),
+            Insert::Duplicate
+        );
+    }
+
+    /// An empty batch is a bare re-walk: nothing to store, but a cursor
+    /// lagging a shared store still catches up.
+    #[test]
+    fn an_empty_batch_just_rewalks() {
+        let mut store = MemStorage::default();
+        let mut leader = Chain::init(&mut store, init()).unwrap();
+        let mut follower = Chain::init(&mut store, init()).unwrap();
+
+        assert_eq!(
+            follower
+                .insert_batch(&mut store, core::iter::empty())
+                .unwrap(),
+            Insert::Unchanged
+        );
+
+        leader
+            .insert(&mut store, set(leader.head(), "a", "1"))
+            .unwrap();
+        assert_eq!(
+            follower
+                .insert_batch(&mut store, core::iter::empty())
+                .unwrap(),
+            Insert::Extended
+        );
+        assert_eq!(follower.head(), leader.head());
+    }
+
+    /// One batch lands exactly where the same envelopes inserted one at
+    /// a time do — the batch is an optimization, not new semantics.
+    #[test]
+    fn a_batch_matches_one_at_a_time_insertion() {
+        let root = digest(&init());
+        let a = set(root, "a", "1");
+        let b = set(digest(&a), "b", "2");
+        let c = set(digest(&b), "c", "3");
+        let envelopes = [a, b, c];
+
+        let (mut batch_store, mut batched) = setup();
+        batched
+            .insert_batch(&mut batch_store, envelopes.clone())
+            .unwrap();
+
+        let (mut loop_store, mut stepwise) = setup();
+        envelopes.into_iter().for_each(|envelope| {
+            stepwise.insert(&mut loop_store, envelope).unwrap();
+        });
+
+        assert_eq!(batched.head(), stepwise.head());
+        assert_eq!(
+            batched.checkpoint(&batch_store).unwrap(),
+            stepwise.checkpoint(&loop_store).unwrap()
+        );
     }
 
     fn set_minutes(prev: EnvelopeDigest, minutes: i64) -> Envelope {

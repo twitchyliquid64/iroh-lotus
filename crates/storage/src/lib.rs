@@ -1,7 +1,7 @@
 //! Where ledger state lives.
 //!
 //! [`Storage`] is a content-addressed version store: every version of the
-//! state is filed under the digest of the envelope that produced it, and
+//! state is stored under the digest of the envelope that produced it, and
 //! the store has no notion of a *current* head — which chain matters is
 //! the caller's business. Any number of ledgers can therefore share one
 //! backend at once: a chain and the rewrite recovering from it, forks
@@ -10,7 +10,7 @@
 //! accumulate until [`retain`](Storage::retain) prunes them.
 //!
 //! Beside the versions sits the envelope log: the envelopes themselves,
-//! filed by digest and indexed by parent through
+//! stored by digest and indexed by parent through
 //! [`children`](Storage::children). The log is what fork resolution walks
 //! and what a node gossips from; versions are merely what the log folds
 //! down to, and any pruned version can be re-derived from it. Versions
@@ -107,7 +107,7 @@ pub trait Storage {
     /// Whether the store holds an envelope with the given digest.
     fn contains_version(&self, head: EnvelopeDigest) -> Result<bool, Self::Error>;
 
-    /// Walks `path` from the root of the namespace filed under `key` in
+    /// Walks `path` from the root of the namespace stored under `key` in
     /// the version at `head`, yielding `None` when that version holds no
     /// such namespace. The empty path resolves to the root itself.
     ///
@@ -125,7 +125,7 @@ pub trait Storage {
             .map(|namespace| value::resolve(&namespace.value, path)))
     }
 
-    /// Materializes the whole namespace filed under `key` in the version
+    /// Materializes the whole namespace stored under `key` in the version
     /// at `head`. O(namespace) — for reads and checkpoints, never needed
     /// to apply.
     fn namespace(
@@ -173,19 +173,19 @@ pub trait Storage {
         envelope: Envelope,
     ) -> Result<(), Self::Error>;
 
-    /// The envelope filed under `digest`, or `None` when the log holds no
+    /// The envelope stored under `digest`, or `None` when the log holds no
     /// such envelope.
     fn envelope(&self, digest: EnvelopeDigest) -> Result<Option<Envelope>, Self::Error>;
 
-    /// Removes the envelope filed under `digest` from the log, unindexing
+    /// Removes the envelope stored under `digest` from the log, unindexing
     /// it from its parent's [`children`](Storage::children). Removing what
-    /// isn't filed is a no-op.
+    /// isn't stored is a no-op.
     ///
     /// For envelopes proven unable to ever be canonical — rejection is
     /// deterministic, so the log needn't keep paying for them.
     fn remove_envelope(&mut self, digest: EnvelopeDigest) -> Result<(), Self::Error>;
 
-    /// The digests of every filed envelope whose `prev` is `parent`, in
+    /// The digests of every stored envelope whose `prev` is `parent`, in
     /// ascending digest order. Fork resolution leans on the order: the
     /// first child yielded is the fork's preferred winner.
     fn children(

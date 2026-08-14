@@ -29,7 +29,7 @@ pub const DEFAULT_MIN_KEEP_MINUTES: u32 = 5 * 24 * 60;
 /// head — so any number of ledgers can drive one store at once, and
 /// copying a ledger is how a chain forks in place. Applying an envelope
 /// touches only what the envelope addresses, never the whole state. Even
-/// the ledger's config is just state, filed under reserved `_lotus_`
+/// the ledger's config is just state, stored under reserved `_lotus_`
 /// namespaces.
 ///
 /// A ledger must only be used with the store it was opened from; a store
@@ -219,7 +219,7 @@ impl Ledger {
             .ok_or_else(|| ApplyError::InvalidValue { key: key.clone() })
     }
 
-    /// The namespace filed under `key`, if the ledger holds one.
+    /// The namespace stored under `key`, if the ledger holds one.
     ///
     /// Materializes the whole namespace.
     pub fn namespace<S: Storage>(

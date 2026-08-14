@@ -13,7 +13,7 @@ as long as compaction has not run on the oldest trustworthy message.
 | Crate  | Role |
 |--------|------|
 | `wire` | Types for serializing messages on the wire. CBOR2 canonical used so messages have hash stability and can be signed. |
-| `state` | The state a chain folds down to. `Ledger::apply` advances it one envelope at a time, like replaying a database log. `Chain` files every envelope seen — competing forks included — into the store's log and keeps a ledger on the canonical path: at every fork the lowest envelope digest wins. |
+| `state` | The state a chain folds down to. `Ledger::apply` advances it one envelope at a time, like replaying a database log. `Chain` stores every envelope seen — competing forks included — in the store's log and keeps a ledger on the canonical path: at every fork the lowest envelope digest wins. |
 | `storage` | Where ledger state lives: a content-addressed version store keyed by envelope digest, so many ledgers (forks, rewrites, old positions) share one backend, plus the envelope log those versions fold down from. Namespace/path-granular reads and writes, the in-memory backend, and the conformance suite every backend must pass. |
 
 ## Development conventions and hard rules

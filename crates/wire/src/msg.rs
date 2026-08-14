@@ -11,7 +11,7 @@ use nutype::nutype;
 
 use crate::{EnvelopeDigest, subkey::SubkeyPath};
 
-/// The name a namespace is filed under in the ledger.
+/// The name a namespace is stored under in the ledger.
 #[nutype(
     validate(not_empty),
     derive(
