@@ -10,7 +10,7 @@
 //! [`Storage::resolve`]: crate::Storage::resolve
 
 use wire::{
-    msg::Value,
+    msg::{AmendOp, Value},
     subkey::{Subkey, SubkeyPath},
 };
 
@@ -78,6 +78,64 @@ pub fn set_at(root: &mut Value, path: &SubkeyPath, value: Option<Value>) {
         }
         _ => unreachable!("SetAt is pre-validated: the parent's shape matches the segment"),
     }
+}
+
+/// Applies a pre-validated [`AmendAt`](crate::NamespaceOp::AmendAt) to a
+/// tree.
+///
+/// # Panics
+///
+/// The op's contract is that the caller [`resolve`]d the path and found it
+/// legal; a path that isn't is a broken invariant, not an error.
+pub fn amend_at(root: &mut Value, path: Option<&SubkeyPath>, op: AmendOp) {
+    let segments = path.map_or(&[][..], |path| path.as_ref());
+    match op {
+        AmendOp::AppendEntry(entry) => {
+            let target = match segments.split_last() {
+                // No path: the namespace's whole value is the array.
+                None => root,
+                Some((last, parents)) => {
+                    let parent = walk_mut(root, parents)
+                        .expect("AmendAt is pre-validated: every parent exists");
+                    match (parent, last) {
+                        (Value::Map(map), Subkey::Key(key)) => map
+                            .entry(key.clone())
+                            .or_insert_with(|| Value::Array(Vec::new())),
+                        (Value::Array(array), Subkey::Index(index)) => array
+                            .get_mut(*index as usize)
+                            .expect("AmendAt is pre-validated: the index is in bounds"),
+                        _ => unreachable!(
+                            "AmendAt is pre-validated: the parent's shape matches the segment"
+                        ),
+                    }
+                }
+            };
+            match target {
+                Value::Array(array) => array.push(entry),
+                _ => unreachable!("AmendAt is pre-validated: the append target is an array"),
+            }
+        }
+        AmendOp::IncrementDecrement(inc) => {
+            match walk_mut(root, segments).expect("AmendAt is pre-validated: the target exists") {
+                Value::Int(n) => {
+                    *n = inc
+                        .apply(*n)
+                        .expect("AmendAt is pre-validated: the sum fits an i64 or clamps");
+                }
+                _ => unreachable!("AmendAt is pre-validated: the target is an integer"),
+            }
+        }
+    }
+}
+
+/// Walks `path` from `root`, yielding the value it addresses.
+pub fn walk<'a>(root: &'a Value, path: &[Subkey]) -> Option<&'a Value> {
+    path.iter()
+        .try_fold(root, |value, segment| match (value, segment) {
+            (Value::Map(map), Subkey::Key(key)) => map.get(key),
+            (Value::Array(array), Subkey::Index(index)) => array.get(*index as usize),
+            _ => None,
+        })
 }
 
 /// Walks `path` from `root`, yielding the value it addresses.

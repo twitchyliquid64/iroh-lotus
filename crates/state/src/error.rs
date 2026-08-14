@@ -66,6 +66,32 @@ pub enum ApplyError<E> {
         /// The path that was walked.
         path: SubkeyPath,
     },
+    /// An amend addressed a value it cannot transform — an append onto
+    /// something that is not an array, or an increment of something that
+    /// is not an integer.
+    AmendTypeMismatch {
+        /// The namespace the path was walked from.
+        key: NamespaceKey,
+        /// The path that was walked, or `None` for the namespace's root.
+        path: Option<SubkeyPath>,
+    },
+    /// An increment would take the integer at the path outside `i64`,
+    /// with no bound on that side to clamp it back.
+    Overflow {
+        /// The namespace the path was walked from.
+        key: NamespaceKey,
+        /// The path to the integer that would overflow, or `None` for
+        /// the namespace's root.
+        path: Option<SubkeyPath>,
+    },
+    /// An increment's bounds are inverted: its min exceeds its max.
+    InvalidBounds {
+        /// The namespace the path was walked from.
+        key: NamespaceKey,
+        /// The path the increment addressed, or `None` for the
+        /// namespace's root.
+        path: Option<SubkeyPath>,
+    },
     /// The value the namespace would hold after the write violates the
     /// rules for that namespace — today, the baked-in rules for the
     /// reserved `_lotus_` keys.
@@ -113,10 +139,39 @@ impl<E> fmt::Display for ApplyError<E> {
             ApplyError::PathTypeMismatch { key, path } => {
                 write!(f, "namespace {key} cannot be walked to {path}")
             }
+            ApplyError::AmendTypeMismatch { key, path } => {
+                write!(f, "namespace {key} cannot be amended at {}", Target(path))
+            }
+            ApplyError::Overflow { key, path } => {
+                write!(
+                    f,
+                    "namespace {key} overflows an integer at {}",
+                    Target(path)
+                )
+            }
+            ApplyError::InvalidBounds { key, path } => {
+                write!(
+                    f,
+                    "namespace {key} clamps {} to an inverted range",
+                    Target(path)
+                )
+            }
             ApplyError::InvalidValue { key } => {
                 write!(f, "value not valid for namespace {key}")
             }
             ApplyError::Storage(_) => f.write_str("storage backend failed"),
+        }
+    }
+}
+
+/// Displays an amend's target: its path, or the namespace's root.
+struct Target<'a>(&'a Option<SubkeyPath>);
+
+impl fmt::Display for Target<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(path) => write!(f, "{path}"),
+            None => f.write_str("its root"),
         }
     }
 }

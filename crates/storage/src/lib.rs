@@ -21,15 +21,16 @@
 //! keep state on disk and page in only what an envelope touches, so
 //! applying a message costs O(path), not O(state).
 //!
-//! Validation lives above this crate. [`NamespaceOp::Delete`] and
-//! [`NamespaceOp::SetAt`] arrive pre-validated against
+//! Validation lives above this crate. [`NamespaceOp::Delete`],
+//! [`NamespaceOp::SetAt`], and [`NamespaceOp::AmendAt`] arrive
+//! pre-validated against
 //! [`Storage::resolve`], so backends apply them mechanically — and every
 //! backend must pass the [`conformance`] suite, so two backends can never
 //! disagree about what a commit does.
 
 use wire::{
     Envelope, EnvelopeDigest,
-    msg::{Namespace, NamespaceKey, Value},
+    msg::{AmendOp, Namespace, NamespaceKey, Value},
     subkey::{Subkey, SubkeyPath},
 };
 
@@ -84,6 +85,21 @@ pub enum NamespaceOp {
         /// Removing an array element shifts later indices down.
         value: Option<Value>,
     },
+    /// Amends one value nested inside a namespace in place, without
+    /// touching its siblings. Pre-validated via [`Storage::resolve`] and
+    /// [`Storage::value_at`]: the namespace exists, every parent
+    /// resolves, and the path addresses what the op amends — an array
+    /// (or, for an append only, a missing key under a map) for
+    /// [`AmendOp::AppendEntry`], and for
+    /// [`AmendOp::IncrementDecrement`] an integer whose sum clamps or
+    /// stays inside `i64`, under bounds that aren't inverted.
+    AmendAt {
+        key: NamespaceKey,
+        /// The path to the value being amended, or `None` to amend the
+        /// namespace's value as a whole.
+        path: Option<SubkeyPath>,
+        op: AmendOp,
+    },
 }
 
 /// A storage backend for the log of messages and the state at each of their
@@ -123,6 +139,27 @@ pub trait Storage {
         Ok(self
             .namespace(head, key)?
             .map(|namespace| value::resolve(&namespace.value, path)))
+    }
+
+    /// Materializes the value `path` addresses inside the namespace
+    /// stored under `key` in the version at `head` — `None` when that
+    /// version holds no such namespace or the path stops short. The
+    /// empty path materializes the namespace's whole value.
+    ///
+    /// This powers the apply path where [`resolve`](Storage::resolve)'s
+    /// kinds aren't enough — an increment must read the integer it
+    /// amends. The default materializes the namespace and walks it in
+    /// memory; a backend that stores the tree decomposed should override
+    /// it with an O(path + value) lookup.
+    fn value_at(
+        &self,
+        head: EnvelopeDigest,
+        key: &NamespaceKey,
+        path: &[Subkey],
+    ) -> Result<Option<Value>, Self::Error> {
+        Ok(self
+            .namespace(head, key)?
+            .and_then(|namespace| value::walk(&namespace.value, path).cloned()))
     }
 
     /// Materializes the whole namespace stored under `key` in the version

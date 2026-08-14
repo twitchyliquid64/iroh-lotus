@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 
 use wire::{
     Envelope, EnvelopeDigest, Msg, VerificationStatus,
-    msg::{Namespace, NamespaceKey, SetNamespace, Value},
+    msg::{AmendOp, IncrementDecrement, Namespace, NamespaceKey, SetNamespace, Value},
     subkey::{Subkey, SubkeyPath},
 };
 
@@ -63,6 +63,22 @@ macro_rules! storage_conformance {
         #[test]
         fn conformance_set_at_clears_values() {
             $crate::conformance::set_at_clears_values($make);
+        }
+        #[test]
+        fn conformance_amend_at_appends_and_creates_arrays() {
+            $crate::conformance::amend_at_appends_and_creates_arrays($make);
+        }
+        #[test]
+        fn conformance_amend_at_increments_integers() {
+            $crate::conformance::amend_at_increments_integers($make);
+        }
+        #[test]
+        fn conformance_amend_at_without_a_path_amends_the_root() {
+            $crate::conformance::amend_at_without_a_path_amends_the_root($make);
+        }
+        #[test]
+        fn conformance_value_at_reads_the_addressed_value() {
+            $crate::conformance::value_at_reads_the_addressed_value($make);
         }
         #[test]
         fn conformance_set_at_does_not_bleed_into_other_versions() {
@@ -354,6 +370,231 @@ pub fn set_at_clears_values<S: Storage>(mut store: S) {
         ("list", Value::Array(vec![Value::String("y".into())])),
     ]);
     assert_eq!(fetch(&store, 3, "n").expect("n exists").value, expected);
+}
+
+/// An `AmendAt` against the `n` namespace the nested fixtures install.
+fn amend_at(p: SubkeyPath, op: AmendOp) -> NamespaceOp {
+    NamespaceOp::AmendAt {
+        key: key("n"),
+        path: Some(p),
+        op,
+    }
+}
+
+/// An `AmendAt` of a namespace's whole value.
+fn amend_root(k: &'static str, op: AmendOp) -> NamespaceOp {
+    NamespaceOp::AmendAt {
+        key: key(k),
+        path: None,
+        op,
+    }
+}
+
+pub fn amend_at_appends_and_creates_arrays<S: Storage>(mut store: S) {
+    store
+        .install(digest(1), namespaces([("n", nested())]))
+        .expect("install");
+
+    // Append to the array that's there, then create a fresh one-entry
+    // array under the map.
+    store
+        .commit(
+            digest(1),
+            digest(2),
+            amend_at(
+                path([sub("list")]),
+                AmendOp::AppendEntry(Value::String("z".into())),
+            ),
+        )
+        .expect("commit");
+    store
+        .commit(
+            digest(2),
+            digest(3),
+            amend_at(
+                path([sub("a"), sub("fresh")]),
+                AmendOp::AppendEntry(Value::Int(1)),
+            ),
+        )
+        .expect("commit");
+
+    let expected = map([
+        (
+            "a",
+            map([
+                ("b", Value::String("1".into())),
+                ("fresh", Value::Array(vec![Value::Int(1)])),
+            ]),
+        ),
+        (
+            "list",
+            Value::Array(vec![
+                Value::String("x".into()),
+                Value::String("y".into()),
+                Value::String("z".into()),
+            ]),
+        ),
+    ]);
+    assert_eq!(fetch(&store, 3, "n").expect("n exists").value, expected);
+    assert_eq!(
+        fetch(&store, 1, "n"),
+        Some(nested()),
+        "the parent version must not move"
+    );
+}
+
+pub fn amend_at_increments_integers<S: Storage>(mut store: S) {
+    store
+        .install(
+            digest(1),
+            namespaces([(
+                "n",
+                Namespace {
+                    value: map([("count", Value::Int(5))]),
+                },
+            )]),
+        )
+        .expect("install");
+
+    let at_count = || path([sub("count")]);
+    store
+        .commit(
+            digest(1),
+            digest(2),
+            amend_at(
+                at_count(),
+                AmendOp::IncrementDecrement(IncrementDecrement::new(3)),
+            ),
+        )
+        .expect("commit");
+    store
+        .commit(
+            digest(2),
+            digest(3),
+            amend_at(
+                at_count(),
+                AmendOp::IncrementDecrement(IncrementDecrement::new(-10)),
+            ),
+        )
+        .expect("commit");
+    // Clamped on both sides: the ceiling catches this sum...
+    store
+        .commit(
+            digest(3),
+            digest(4),
+            amend_at(
+                at_count(),
+                AmendOp::IncrementDecrement(IncrementDecrement::new(100).with_min(0).with_max(10)),
+            ),
+        )
+        .expect("commit");
+    // ...the floor catches the next, even when the sum leaves i64.
+    store
+        .commit(
+            digest(4),
+            digest(5),
+            amend_at(
+                at_count(),
+                AmendOp::IncrementDecrement(IncrementDecrement::new(i64::MIN).with_min(-1)),
+            ),
+        )
+        .expect("commit");
+
+    let count_of = |head: u8| match fetch(&store, head, "n").expect("n exists").value {
+        Value::Map(top) => top.get("count").cloned(),
+        _ => None,
+    };
+    assert_eq!(count_of(1), Some(Value::Int(5)), "parent must not move");
+    assert_eq!(count_of(2), Some(Value::Int(8)));
+    assert_eq!(count_of(3), Some(Value::Int(-2)));
+    assert_eq!(count_of(4), Some(Value::Int(10)));
+    assert_eq!(count_of(5), Some(Value::Int(-1)));
+}
+
+/// A `path` of `None` amends the namespace's value itself — a namespace
+/// that is one bare array or one bare integer.
+pub fn amend_at_without_a_path_amends_the_root<S: Storage>(mut store: S) {
+    store
+        .install(
+            digest(1),
+            namespaces([
+                (
+                    "tags",
+                    Namespace {
+                        value: Value::Array(vec![Value::String("x".into())]),
+                    },
+                ),
+                (
+                    "total",
+                    Namespace {
+                        value: Value::Int(5),
+                    },
+                ),
+            ]),
+        )
+        .expect("install");
+
+    store
+        .commit(
+            digest(1),
+            digest(2),
+            amend_root("tags", AmendOp::AppendEntry(Value::String("y".into()))),
+        )
+        .expect("commit");
+    store
+        .commit(
+            digest(2),
+            digest(3),
+            amend_root(
+                "total",
+                AmendOp::IncrementDecrement(IncrementDecrement::new(-100).with_min(0)),
+            ),
+        )
+        .expect("commit");
+
+    assert_eq!(
+        fetch(&store, 3, "tags").expect("tags exists").value,
+        Value::Array(vec![Value::String("x".into()), Value::String("y".into())])
+    );
+    assert_eq!(
+        fetch(&store, 3, "total").expect("total exists").value,
+        Value::Int(0)
+    );
+    assert_eq!(
+        fetch(&store, 1, "total").expect("total exists").value,
+        Value::Int(5),
+        "the parent version must not move"
+    );
+}
+
+pub fn value_at_reads_the_addressed_value<S: Storage>(mut store: S) {
+    store
+        .install(digest(1), namespaces([("n", nested())]))
+        .expect("install");
+
+    let value_at = |p: &[Subkey]| store.value_at(digest(1), &key("n"), p).expect("value_at");
+
+    assert_eq!(value_at(&[]), Some(nested().value));
+    assert_eq!(
+        value_at(&[sub("a"), sub("b")]),
+        Some(Value::String("1".into()))
+    );
+    assert_eq!(
+        value_at(&[sub("list"), Subkey::Index(1)]),
+        Some(Value::String("y".into()))
+    );
+
+    // A path that stops short — absent, out of bounds, or the wrong
+    // shape — is `None`, like the namespace that isn't there at all.
+    assert_eq!(value_at(&[sub("nope")]), None);
+    assert_eq!(value_at(&[sub("list"), Subkey::Index(9)]), None);
+    assert_eq!(value_at(&[sub("a"), Subkey::Index(0)]), None);
+    assert_eq!(
+        store
+            .value_at(digest(1), &key("absent"), &[])
+            .expect("value_at"),
+        None
+    );
 }
 
 /// Two siblings write through the same shared parent; each must see only

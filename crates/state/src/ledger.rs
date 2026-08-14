@@ -3,7 +3,9 @@
 use storage::{NamespaceOp, NodeKind, Resolution, Storage};
 use wire::{
     Envelope, EnvelopeDigest, Msg,
-    msg::{FullCheckpoint, Namespace, NamespaceKey, SetNamespaceKey, Value},
+    msg::{
+        AmendNamespaceKey, AmendOp, FullCheckpoint, Namespace, NamespaceKey, SetNamespaceKey, Value,
+    },
     subkey::{Subkey, SubkeyPath},
 };
 
@@ -120,6 +122,7 @@ impl Ledger {
                 NamespaceOp::Put(set.key.clone(), set.namespace.clone())
             }
             Msg::SetNamespaceKey(set) => self.validate_set_key(storage, set)?,
+            Msg::AmendNamespaceKey(amend) => self.validate_amend_key(storage, amend)?,
             Msg::DeleteNamespace(del) => {
                 self.resolve(storage, &del.key, &[])?
                     .ok_or_else(|| ApplyError::UnknownNamespace(del.key.clone()))?;
@@ -171,6 +174,94 @@ impl Ledger {
             key: set.key.clone(),
             path: set.path.clone(),
             value: set.value.clone(),
+        })
+    }
+
+    /// Checks an `AmendNamespaceKey` against the store, yielding the op
+    /// that commits it. Nothing is written here.
+    ///
+    /// An append lands on an existing array, or creates a one-entry array
+    /// as a fresh key under an existing map — nothing else is conjured,
+    /// same as [`validate_set_key`](Ledger::validate_set_key). An
+    /// increment lands on an existing integer only, its bounds must not
+    /// be inverted, and the sum must clamp or stay inside `i64`. No path
+    /// at all amends the namespace's value itself.
+    fn validate_amend_key<S: Storage>(
+        &self,
+        storage: &S,
+        amend: &AmendNamespaceKey,
+    ) -> Result<NamespaceOp, ApplyError<S::Error>> {
+        let segments = amend.path.as_ref().map_or(&[][..], |path| path.as_ref());
+        // A pathless amend resolves the root, which always exists — so a
+        // Missing or Mismatch walked at least one segment.
+        let miss = |miss: Miss| {
+            let path = amend
+                .path
+                .as_ref()
+                .expect("Missing and Mismatch resolutions walk at least one segment");
+            miss.into_error(&amend.key, path)
+        };
+        let cannot_amend = || ApplyError::AmendTypeMismatch {
+            key: amend.key.clone(),
+            path: amend.path.clone(),
+        };
+        let last = segments.len().checked_sub(1);
+
+        let resolution = self
+            .resolve(storage, &amend.key, segments)?
+            .ok_or_else(|| ApplyError::UnknownNamespace(amend.key.clone()))?;
+
+        match (&amend.op, resolution) {
+            (AmendOp::AppendEntry(_), Resolution::Node(NodeKind::Array)) => {}
+            // The only legal absence: an append creating its array as a
+            // fresh key under an existing map.
+            (
+                AmendOp::AppendEntry(_),
+                Resolution::Missing {
+                    depth,
+                    at: NodeKind::Map,
+                },
+            ) if Some(depth) == last => {}
+            (AmendOp::AppendEntry(_), Resolution::Node(_)) => return Err(cannot_amend()),
+            (AmendOp::IncrementDecrement(inc), Resolution::Node(NodeKind::Leaf)) => {
+                if let (Some(min), Some(max)) = (inc.min, inc.max)
+                    && min > max
+                {
+                    return Err(ApplyError::InvalidBounds {
+                        key: amend.key.clone(),
+                        path: amend.path.clone(),
+                    });
+                }
+                // A leaf isn't enough — the resolution can't tell an
+                // integer from a string, so read the value itself.
+                let value = storage
+                    .value_at(self.head, &amend.key, segments)
+                    .map_err(ApplyError::Storage)?;
+                match value {
+                    Some(Value::Int(n)) => {
+                        let sum = inc.apply(n).ok_or_else(|| ApplyError::Overflow {
+                            key: amend.key.clone(),
+                            path: amend.path.clone(),
+                        })?;
+                        // Only a root increment can change the value a
+                        // namespace rule judges: today's rules all
+                        // constrain leaf-rooted namespaces.
+                        if segments.is_empty() {
+                            Self::validate_value(&amend.key, &Value::Int(sum))?;
+                        }
+                    }
+                    _ => return Err(cannot_amend()),
+                }
+            }
+            (AmendOp::IncrementDecrement(_), Resolution::Node(_)) => return Err(cannot_amend()),
+            (_, Resolution::Missing { .. }) => return Err(miss(Miss::NotFound)),
+            (_, Resolution::Mismatch { .. }) => return Err(miss(Miss::TypeMismatch)),
+        }
+
+        Ok(NamespaceOp::AmendAt {
+            key: amend.key.clone(),
+            path: amend.path.clone(),
+            op: amend.op.clone(),
         })
     }
 
@@ -279,7 +370,7 @@ mod tests {
     use std::convert::Infallible;
 
     use storage::MemStorage;
-    use wire::msg::{DeleteNamespace, InitMsg, SetNamespace};
+    use wire::msg::{DeleteNamespace, IncrementDecrement, InitMsg, SetNamespace};
 
     use super::*;
 
@@ -339,11 +430,13 @@ mod tests {
         Subkey::Key(k.to_string())
     }
 
-    /// A namespace whose value is `{"a": {"b": "1"}, "list": ["x", "y"]}`.
+    /// A namespace whose value is
+    /// `{"a": {"b": "1"}, "count": 5, "list": ["x", "y"]}`.
     fn nested() -> Namespace {
         Namespace {
             value: map([
                 ("a", map([("b", Value::String("1".into()))])),
+                ("count", Value::Int(5)),
                 (
                     "list",
                     Value::Array(vec![Value::String("x".into()), Value::String("y".into())]),
@@ -883,6 +976,473 @@ mod tests {
         assert!(matches!(
             Ledger::replay(&mut store, &[]),
             Err(Error::EmptyChain)
+        ));
+    }
+
+    fn amend(prev: EnvelopeDigest, p: SubkeyPath, op: AmendOp) -> Envelope {
+        Envelope::new(Msg::AmendNamespaceKey(AmendNamespaceKey {
+            prev,
+            key: key("n"),
+            path: Some(p),
+            op,
+        }))
+    }
+
+    /// An amend of namespace `k`'s whole value — no path.
+    fn amend_root(prev: EnvelopeDigest, k: &str, op: AmendOp) -> Envelope {
+        Envelope::new(Msg::AmendNamespaceKey(AmendNamespaceKey {
+            prev,
+            key: key(k),
+            path: None,
+            op,
+        }))
+    }
+
+    fn append(v: &str) -> AmendOp {
+        AmendOp::AppendEntry(Value::String(v.to_string()))
+    }
+
+    fn inc(delta: i64) -> AmendOp {
+        AmendOp::IncrementDecrement(IncrementDecrement::new(delta))
+    }
+
+    #[test]
+    fn amend_appends_to_an_existing_array() {
+        let (mut store, mut ledger) = nested_ledger();
+        let envelope = amend(ledger.head(), path([sub("list")]), append("z"));
+        ledger.apply(&mut store, &envelope).unwrap();
+
+        assert_eq!(
+            at(&store, &ledger, &[sub("list")]),
+            Some(Value::Array(vec![
+                Value::String("x".into()),
+                Value::String("y".into()),
+                Value::String("z".into()),
+            ]))
+        );
+        assert_eq!(ledger.head(), envelope.digest().unwrap());
+    }
+
+    /// An append where nothing is creates the array — a fresh key under an
+    /// existing map, same as `SetNamespaceKey`'s one legal absence.
+    #[test]
+    fn amend_append_creates_a_missing_array() {
+        let (mut store, mut ledger) = nested_ledger();
+        ledger
+            .apply(
+                &mut store,
+                &amend(ledger.head(), path([sub("a"), sub("fresh")]), append("z")),
+            )
+            .unwrap();
+
+        assert_eq!(
+            at(&store, &ledger, &[sub("a"), sub("fresh")]),
+            Some(Value::Array(vec![Value::String("z".into())]))
+        );
+    }
+
+    #[test]
+    fn amend_append_rejects_a_non_array_target() {
+        // A leaf, and a map.
+        for p in [path([sub("a"), sub("b")]), path([sub("a")])] {
+            let (mut store, mut ledger) = nested_ledger();
+            let head = ledger.head();
+
+            let err = ledger
+                .apply(&mut store, &amend(head, p.clone(), append("z")))
+                .unwrap_err();
+
+            assert!(
+                matches!(err, ApplyError::AmendTypeMismatch { key: k, path: pp }
+                if k == key("n") && pp.as_ref() == Some(&p))
+            );
+            assert_eq!(ledger.head(), head, "head must not move");
+        }
+    }
+
+    /// Only a fresh map key is created; a missing intermediate or a
+    /// missing array index is refused like any other absence.
+    #[test]
+    fn amend_append_rejects_other_absences() {
+        for p in [
+            path([sub("nope"), sub("deeper")]),
+            path([sub("list"), Subkey::Index(9)]),
+        ] {
+            let (mut store, mut ledger) = nested_ledger();
+            let head = ledger.head();
+
+            let err = ledger
+                .apply(&mut store, &amend(head, p.clone(), append("z")))
+                .unwrap_err();
+
+            assert!(matches!(err, ApplyError::UnknownPath { key: k, path: pp }
+                if k == key("n") && pp == p));
+            assert_eq!(ledger.head(), head, "head must not move");
+        }
+    }
+
+    #[test]
+    fn amend_increments_and_decrements_an_integer() {
+        let (mut store, mut ledger) = nested_ledger();
+
+        ledger
+            .apply(
+                &mut store,
+                &amend(ledger.head(), path([sub("count")]), inc(3)),
+            )
+            .unwrap();
+        assert_eq!(at(&store, &ledger, &[sub("count")]), Some(Value::Int(8)));
+
+        ledger
+            .apply(
+                &mut store,
+                &amend(ledger.head(), path([sub("count")]), inc(-10)),
+            )
+            .unwrap();
+        assert_eq!(at(&store, &ledger, &[sub("count")]), Some(Value::Int(-2)));
+    }
+
+    /// A store and ledger holding a root-array namespace `tags` and a
+    /// root-integer namespace `total` — namespaces that are nothing but
+    /// their one value.
+    fn root_ledger() -> (MemStorage, Ledger) {
+        setup(&Envelope::new(Msg::Init(InitMsg {
+            state: FullCheckpoint {
+                namespaces: [
+                    (
+                        key("tags"),
+                        Namespace {
+                            value: Value::Array(vec![Value::String("x".into())]),
+                        },
+                    ),
+                    (
+                        key("total"),
+                        Namespace {
+                            value: Value::Int(5),
+                        },
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            },
+        })))
+    }
+
+    /// No path: the namespace's whole value is the array appended to.
+    #[test]
+    fn amend_append_extends_a_root_array() {
+        let (mut store, mut ledger) = root_ledger();
+        let envelope = amend_root(ledger.head(), "tags", append("y"));
+        ledger.apply(&mut store, &envelope).unwrap();
+
+        assert_eq!(
+            ledger.namespace(&store, &key("tags")).unwrap(),
+            Some(Namespace {
+                value: Value::Array(vec![Value::String("x".into()), Value::String("y".into())]),
+            })
+        );
+        assert_eq!(ledger.head(), envelope.digest().unwrap());
+    }
+
+    /// No path: the namespace's whole value is the integer incremented.
+    #[test]
+    fn amend_increment_amends_a_root_integer() {
+        let (mut store, mut ledger) = root_ledger();
+        ledger
+            .apply(&mut store, &amend_root(ledger.head(), "total", inc(3)))
+            .unwrap();
+
+        assert_eq!(
+            ledger.namespace(&store, &key("total")).unwrap(),
+            Some(Namespace {
+                value: Value::Int(8)
+            })
+        );
+    }
+
+    /// The root always exists, so the only refusal left is its shape:
+    /// appends need the root array, increments the root integer.
+    #[test]
+    fn amend_root_rejects_the_wrong_shape() {
+        let cases = [
+            ("total", append("y")),
+            ("tags", inc(1)),
+            ("n", append("y")),
+            ("n", inc(1)),
+        ];
+        for (k, op) in cases {
+            let (mut store, mut ledger) = match k {
+                "n" => nested_ledger(),
+                _ => root_ledger(),
+            };
+            let head = ledger.head();
+
+            let err = ledger
+                .apply(&mut store, &amend_root(head, k, op))
+                .unwrap_err();
+
+            assert!(
+                matches!(err, ApplyError::AmendTypeMismatch { key: kk, path: None }
+                if kk == key(k))
+            );
+            assert_eq!(ledger.head(), head, "head must not move");
+        }
+    }
+
+    /// A root increment reaches the reserved floor, so the namespace's
+    /// rules must judge the sum like they judge any other write.
+    #[test]
+    fn amend_increment_validates_the_reserved_floor() {
+        let (mut store, mut ledger) = setup(&init());
+        ledger
+            .apply(&mut store, &set_minutes(ledger.head(), Value::Int(42)))
+            .unwrap();
+
+        let bump = amend_root(ledger.head(), MIN_KEEP_MINUTES_KEY, inc(10));
+        ledger.apply(&mut store, &bump).unwrap();
+        assert_eq!(ledger.min_keep_minutes(&store).unwrap(), 52);
+
+        // A sum the rules refuse — zero or below — never applies.
+        let head = ledger.head();
+        let err = ledger
+            .apply(
+                &mut store,
+                &amend_root(head, MIN_KEEP_MINUTES_KEY, inc(-52)),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ApplyError::InvalidValue { key: k } if k == key(MIN_KEEP_MINUTES_KEY)
+        ));
+        assert_eq!(ledger.head(), head, "head must not move");
+        assert_eq!(ledger.min_keep_minutes(&store).unwrap(), 52);
+
+        // Clamped back inside the rules, the same delta applies.
+        ledger
+            .apply(
+                &mut store,
+                &amend_root(
+                    ledger.head(),
+                    MIN_KEEP_MINUTES_KEY,
+                    AmendOp::IncrementDecrement(IncrementDecrement::new(-52).with_min(1)),
+                ),
+            )
+            .unwrap();
+        assert_eq!(ledger.min_keep_minutes(&store).unwrap(), 1);
+    }
+
+    /// A bound only binds when the sum crosses it; count starts at 5.
+    #[test]
+    fn amend_increment_clamps_to_the_bounds() {
+        let cases = [
+            (IncrementDecrement::new(3).with_min(0).with_max(10), 8),
+            (IncrementDecrement::new(100).with_max(10), 10),
+            (IncrementDecrement::new(-100).with_min(0), 0),
+            (IncrementDecrement::new(-100).with_max(10), -95),
+        ];
+        for (inc, expected) in cases {
+            let (mut store, mut ledger) = nested_ledger();
+            ledger
+                .apply(
+                    &mut store,
+                    &amend(
+                        ledger.head(),
+                        path([sub("count")]),
+                        AmendOp::IncrementDecrement(inc),
+                    ),
+                )
+                .unwrap();
+
+            assert_eq!(
+                at(&store, &ledger, &[sub("count")]),
+                Some(Value::Int(expected))
+            );
+        }
+    }
+
+    /// A sum that leaves `i64` still applies when a bound on that side
+    /// clamps it back — only the unclamped overflow is refused.
+    #[test]
+    fn amend_increment_clamps_an_overflowing_sum() {
+        let cases = [
+            (IncrementDecrement::new(i64::MAX).with_max(10), 10),
+            (IncrementDecrement::new(i64::MIN).with_min(0), 0),
+        ];
+        for (inc, expected) in cases {
+            let (mut store, mut ledger) = nested_ledger();
+            ledger
+                .apply(
+                    &mut store,
+                    &amend(
+                        ledger.head(),
+                        path([sub("count")]),
+                        AmendOp::IncrementDecrement(inc),
+                    ),
+                )
+                .unwrap();
+
+            assert_eq!(
+                at(&store, &ledger, &[sub("count")]),
+                Some(Value::Int(expected))
+            );
+        }
+    }
+
+    /// A bound on the side the sum doesn't leave can't catch it: the
+    /// overflow is still refused.
+    #[test]
+    fn amend_increment_rejects_overflow_the_bounds_cannot_catch() {
+        let (mut store, mut ledger) = nested_ledger();
+        let head = ledger.head();
+
+        let err = ledger
+            .apply(
+                &mut store,
+                &amend(
+                    head,
+                    path([sub("count")]),
+                    AmendOp::IncrementDecrement(IncrementDecrement::new(i64::MAX).with_min(0)),
+                ),
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, ApplyError::Overflow { .. }));
+        assert_eq!(ledger.head(), head, "head must not move");
+    }
+
+    /// Inverted bounds are a malformed message, refused before the store
+    /// is asked anything.
+    #[test]
+    fn amend_increment_rejects_inverted_bounds() {
+        let (mut store, mut ledger) = nested_ledger();
+        let head = ledger.head();
+
+        let err = ledger
+            .apply(
+                &mut store,
+                &amend(
+                    head,
+                    path([sub("count")]),
+                    AmendOp::IncrementDecrement(
+                        IncrementDecrement::new(1).with_min(10).with_max(0),
+                    ),
+                ),
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, ApplyError::InvalidBounds { key: k, path: p }
+            if k == key("n") && p == Some(path([sub("count")]))));
+        assert_eq!(ledger.head(), head, "head must not move");
+        assert_eq!(at(&store, &ledger, &[sub("count")]), Some(Value::Int(5)));
+    }
+
+    /// Incrementing what isn't there is refused, never conjured from zero.
+    #[test]
+    fn amend_increment_rejects_a_missing_path() {
+        let (mut store, mut ledger) = nested_ledger();
+        let head = ledger.head();
+
+        let err = ledger
+            .apply(
+                &mut store,
+                &amend(head, path([sub("a"), sub("gone")]), inc(1)),
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, ApplyError::UnknownPath { .. }));
+        assert_eq!(ledger.head(), head, "head must not move");
+    }
+
+    #[test]
+    fn amend_increment_rejects_a_non_integer_target() {
+        // A string leaf, a map, and an array.
+        for p in [
+            path([sub("a"), sub("b")]),
+            path([sub("a")]),
+            path([sub("list")]),
+        ] {
+            let (mut store, mut ledger) = nested_ledger();
+            let head = ledger.head();
+
+            let err = ledger
+                .apply(&mut store, &amend(head, p.clone(), inc(1)))
+                .unwrap_err();
+
+            assert!(
+                matches!(err, ApplyError::AmendTypeMismatch { key: k, path: pp }
+                if k == key("n") && pp.as_ref() == Some(&p))
+            );
+            assert_eq!(ledger.head(), head, "head must not move");
+        }
+    }
+
+    /// A delta that would leave `i64` is refused before the commit, so
+    /// every node agrees the envelope never applied.
+    #[test]
+    fn amend_increment_rejects_overflow() {
+        for delta in [i64::MAX, i64::MIN] {
+            let (mut store, mut ledger) = nested_ledger();
+            let head = ledger.head();
+
+            // count is 5: +MAX overflows; two +MIN halves underflow.
+            if delta == i64::MIN {
+                ledger
+                    .apply(&mut store, &amend(head, path([sub("count")]), inc(-6)))
+                    .unwrap();
+            }
+            let head = ledger.head();
+
+            let err = ledger
+                .apply(&mut store, &amend(head, path([sub("count")]), inc(delta)))
+                .unwrap_err();
+
+            assert!(matches!(err, ApplyError::Overflow { key: k, path: p }
+                if k == key("n") && p == Some(path([sub("count")]))));
+            assert_eq!(ledger.head(), head, "head must not move");
+        }
+    }
+
+    #[test]
+    fn amend_rejects_a_path_of_the_wrong_shape() {
+        let (mut store, mut ledger) = nested_ledger();
+        let head = ledger.head();
+
+        // A key into an array, walked through mid-path.
+        let err = ledger
+            .apply(
+                &mut store,
+                &amend(
+                    head,
+                    path([sub("list"), sub("x"), sub("deeper")]),
+                    append("z"),
+                ),
+            )
+            .unwrap_err();
+        assert!(matches!(err, ApplyError::PathTypeMismatch { .. }));
+
+        // An index into a map.
+        let err = ledger
+            .apply(
+                &mut store,
+                &amend(head, path([sub("a"), Subkey::Index(0)]), inc(1)),
+            )
+            .unwrap_err();
+        assert!(matches!(err, ApplyError::PathTypeMismatch { .. }));
+    }
+
+    #[test]
+    fn amend_rejects_an_unknown_namespace() {
+        let (mut store, mut ledger) = nested_ledger();
+        let envelope = Envelope::new(Msg::AmendNamespaceKey(AmendNamespaceKey {
+            prev: ledger.head(),
+            key: key("absent"),
+            path: Some(path([sub("a")])),
+            op: inc(1),
+        }));
+
+        assert!(matches!(
+            ledger.apply(&mut store, &envelope),
+            Err(ApplyError::UnknownNamespace(k)) if k == key("absent")
         ));
     }
 

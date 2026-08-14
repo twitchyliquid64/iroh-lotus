@@ -46,6 +46,9 @@ pub enum Msg {
     /// Sets or clears a single value nested inside a namespace.
     #[serde(rename = "sk")]
     SetNamespaceKey(SetNamespaceKey),
+    /// Amends a single value nested inside a namespace in place.
+    #[serde(rename = "ak")]
+    AmendNamespaceKey(AmendNamespaceKey),
     /// Deletes an entire namespace.
     #[serde(rename = "dn")]
     DeleteNamespace(DeleteNamespace),
@@ -58,6 +61,7 @@ impl Msg {
             Msg::Init(_) => None,
             Msg::SetNamespace(s) => Some(&s.prev),
             Msg::SetNamespaceKey(s) => Some(&s.prev),
+            Msg::AmendNamespaceKey(a) => Some(&a.prev),
             Msg::DeleteNamespace(d) => Some(&d.prev),
         }
     }
@@ -72,6 +76,7 @@ impl Msg {
             Msg::Init(_) => panic!("must_prev_digest called on Msg::Init"),
             Msg::SetNamespace(s) => &s.prev,
             Msg::SetNamespaceKey(s) => &s.prev,
+            Msg::AmendNamespaceKey(a) => &a.prev,
             Msg::DeleteNamespace(d) => &d.prev,
         }
     }
@@ -117,6 +122,98 @@ pub struct SetNamespaceKey {
     /// The value to write, or `None` to clear what the path addresses.
     #[cbor(key = 4)]
     pub value: Option<Value>,
+}
+
+/// Amends a single value nested inside a namespace in place.
+///
+/// Where [`SetNamespaceKey`] replaces what a path addresses, this derives
+/// the new value from the old one — the message carries only the change,
+/// however large the value it amends.
+#[derive(Debug, Clone, Cbor, Hash, PartialEq, Eq)]
+pub struct AmendNamespaceKey {
+    #[cbor(key = 1)]
+    pub prev: EnvelopeDigest,
+    #[cbor(key = 2)]
+    pub key: NamespaceKey,
+    /// The path to walk from the namespace's value to the value being
+    /// amended, or `None` to amend the namespace's value as a whole —
+    /// a namespace that is one array or one integer.
+    #[cbor(key = 3)]
+    pub path: Option<SubkeyPath>,
+    #[cbor(key = 4)]
+    pub op: AmendOp,
+}
+
+/// How an [`AmendNamespaceKey`] transforms the value its path addresses.
+///
+/// Variants are renamed to single letters to shorten their wire encoding.
+#[derive(Debug, Clone, Cbor, Hash, PartialEq, Eq)]
+pub enum AmendOp {
+    /// Appends the entry to the array at the path. A path addressing
+    /// nothing creates a one-entry array — as a fresh key under an
+    /// existing map only.
+    #[serde(rename = "a")]
+    AppendEntry(Value),
+    /// Adds a delta to the integer at the path, which must exist,
+    /// clamping the sum to the bounds that are set.
+    #[serde(rename = "d")]
+    IncrementDecrement(IncrementDecrement),
+}
+
+/// Adds a delta — possibly negative — to an integer, then clamps the sum
+/// to whichever of `min` and `max` are set.
+#[derive(Debug, Clone, Cbor, Hash, PartialEq, Eq)]
+pub struct IncrementDecrement {
+    #[cbor(key = 1)]
+    pub delta: i64,
+    /// The floor the sum is clamped up to, when set.
+    #[cbor(key = 2)]
+    pub min: Option<i64>,
+    /// The ceiling the sum is clamped down to, when set.
+    #[cbor(key = 3)]
+    pub max: Option<i64>,
+}
+
+impl IncrementDecrement {
+    /// An unclamped increment of `delta`.
+    pub fn new(delta: i64) -> Self {
+        Self {
+            delta,
+            min: None,
+            max: None,
+        }
+    }
+
+    /// Clamps the sum up to `min`.
+    pub fn with_min(mut self, min: i64) -> Self {
+        self.min = Some(min);
+        self
+    }
+
+    /// Clamps the sum down to `max`.
+    pub fn with_max(mut self, max: i64) -> Self {
+        self.max = Some(max);
+        self
+    }
+
+    /// The integer `n` becomes: the delta added, then clamped to the
+    /// bounds that are set. `None` when the sum leaves `i64` with no
+    /// bound on that side to pull it back.
+    ///
+    /// Callers must have refused a `min` above `max`; on such bounds the
+    /// max wins, deterministically, rather than panicking.
+    pub fn apply(&self, n: i64) -> Option<i64> {
+        match n.checked_add(self.delta) {
+            Some(sum) => {
+                let floored = self.min.map_or(sum, |min| sum.max(min));
+                Some(self.max.map_or(floored, |max| floored.min(max)))
+            }
+            // The true sum is beyond i64 on the delta's side; only a
+            // bound on that side can represent the clamped result.
+            None if self.delta > 0 => self.max,
+            None => self.min,
+        }
+    }
 }
 
 /// Deletes a namespace.
@@ -311,6 +408,15 @@ mod tests {
         });
         assert_eq!(set.prev_digest(), Some(&digest));
         assert_eq!(set.must_prev_digest(), &digest);
+
+        let amend = Msg::AmendNamespaceKey(AmendNamespaceKey {
+            prev: digest,
+            key: key("a"),
+            path: Some(path([Subkey::Key("b".into())])),
+            op: AmendOp::IncrementDecrement(IncrementDecrement::new(1)),
+        });
+        assert_eq!(amend.prev_digest(), Some(&digest));
+        assert_eq!(amend.must_prev_digest(), &digest);
     }
 
     fn path(segments: impl IntoIterator<Item = Subkey>) -> SubkeyPath {
@@ -341,6 +447,112 @@ mod tests {
             &set(None),
             &format!(
                 "a162736ba4015820{}0261610381a1616b616204f6",
+                "ab".repeat(32)
+            ),
+        );
+    }
+
+    /// Same one-entry-map shape as `Value`: `a1` (map, 1 pair), `61 xx`
+    /// (1-char text key), then the payload. An increment's payload is an
+    /// `a3` (map, 3 pairs) of delta, min, max — the unset bounds encode
+    /// as `f6` (null), not omitted.
+    #[test]
+    fn amend_op_variants() {
+        assert_wire(&AmendOp::AppendEntry(Value::Int(7)), "a16161a1616907");
+        assert_wire(&AmendOp::AppendEntry(val("1")), "a16161a161736131");
+        assert_wire(
+            &AmendOp::IncrementDecrement(IncrementDecrement::new(0)),
+            "a16164a3010002f603f6",
+        );
+        assert_wire(
+            &AmendOp::IncrementDecrement(IncrementDecrement::new(-1)),
+            "a16164a3012002f603f6",
+        );
+        assert_wire(
+            &AmendOp::IncrementDecrement(IncrementDecrement::new(i64::MAX)),
+            "a16164a3011b7fffffffffffffff02f603f6",
+        );
+        assert_wire(
+            &AmendOp::IncrementDecrement(IncrementDecrement::new(i64::MIN)),
+            "a16164a3013b7fffffffffffffff02f603f6",
+        );
+        assert_wire(
+            &AmendOp::IncrementDecrement(IncrementDecrement::new(5).with_min(0).with_max(10)),
+            "a16164a301050200030a",
+        );
+        assert_wire(
+            &AmendOp::IncrementDecrement(IncrementDecrement::new(-2).with_min(-3)),
+            "a16164a30121022203f6",
+        );
+    }
+
+    #[test]
+    fn increment_decrement_adds_then_clamps() {
+        // Unclamped: plain addition, overflow on either side is None.
+        assert_eq!(IncrementDecrement::new(3).apply(5), Some(8));
+        assert_eq!(IncrementDecrement::new(-10).apply(5), Some(-5));
+        assert_eq!(IncrementDecrement::new(i64::MAX).apply(5), None);
+        assert_eq!(IncrementDecrement::new(i64::MIN).apply(-5), None);
+
+        // Bounds only bind when the sum crosses them.
+        let clamped = IncrementDecrement::new(7).with_min(0).with_max(10);
+        assert_eq!(clamped.apply(1), Some(8));
+        assert_eq!(clamped.apply(9), Some(10));
+        assert_eq!(IncrementDecrement::new(-9).with_min(0).apply(5), Some(0));
+        assert_eq!(IncrementDecrement::new(-9).with_max(10).apply(5), Some(-4));
+
+        // A bound on the overflowing side catches the sum; a bound on
+        // the other side does not.
+        assert_eq!(
+            IncrementDecrement::new(i64::MAX).with_max(10).apply(5),
+            Some(10)
+        );
+        assert_eq!(
+            IncrementDecrement::new(i64::MIN).with_min(0).apply(-5),
+            Some(0)
+        );
+        assert_eq!(IncrementDecrement::new(i64::MAX).with_min(0).apply(5), None);
+        assert_eq!(
+            IncrementDecrement::new(i64::MIN).with_max(10).apply(-5),
+            None
+        );
+    }
+
+    /// `a4` (map, 4 pairs): prev, namespace key, path, then the amend op.
+    #[test]
+    fn amend_namespace_key_carries_a_path_and_op() {
+        let amend = |path, op| {
+            Msg::AmendNamespaceKey(AmendNamespaceKey {
+                prev: EnvelopeDigest::from_bytes([0xab; 32]),
+                key: key("a"),
+                path,
+                op,
+            })
+        };
+        let at_b = || Some(path([Subkey::Key("b".into())]));
+
+        assert_wire(
+            &amend(at_b(), AmendOp::AppendEntry(val("1"))),
+            &format!(
+                "a162616ba4015820{}0261610381a1616b616204a16161a161736131",
+                "ab".repeat(32)
+            ),
+        );
+        assert_wire(
+            &amend(
+                at_b(),
+                AmendOp::IncrementDecrement(IncrementDecrement::new(5)),
+            ),
+            &format!(
+                "a162616ba4015820{}0261610381a1616b616204a16164a3010502f603f6",
+                "ab".repeat(32)
+            ),
+        );
+        // No path — the namespace's whole value — is `f6` (null).
+        assert_wire(
+            &amend(None, AmendOp::AppendEntry(val("1"))),
+            &format!(
+                "a162616ba4015820{}02616103f604a16161a161736131",
                 "ab".repeat(32)
             ),
         );

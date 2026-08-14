@@ -8,7 +8,7 @@ use std::{
 
 use wire::{
     Envelope, EnvelopeDigest,
-    msg::{Namespace, NamespaceKey},
+    msg::{Namespace, NamespaceKey, Value},
     subkey::Subkey,
 };
 
@@ -59,6 +59,18 @@ impl Storage for MemStorage {
             .map(|namespace| value::resolve(&namespace.value, path)))
     }
 
+    fn value_at(
+        &self,
+        head: EnvelopeDigest,
+        key: &NamespaceKey,
+        path: &[Subkey],
+    ) -> Result<Option<Value>, Infallible> {
+        Ok(self
+            .version(head)
+            .get(key)
+            .and_then(|namespace| value::walk(&namespace.value, path).cloned()))
+    }
+
     fn namespace(
         &self,
         head: EnvelopeDigest,
@@ -101,6 +113,12 @@ impl Storage for MemStorage {
                     .get_mut(&key)
                     .expect("SetAt is pre-validated: the namespace exists");
                 value::set_at(&mut Arc::make_mut(namespace).value, &path, value);
+            }
+            NamespaceOp::AmendAt { key, path, op } => {
+                let namespace = version
+                    .get_mut(&key)
+                    .expect("AmendAt is pre-validated: the namespace exists");
+                value::amend_at(&mut Arc::make_mut(namespace).value, path.as_ref(), op);
             }
         }
 
