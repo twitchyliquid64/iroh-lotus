@@ -20,9 +20,9 @@ pub enum Error<E> {
     /// A ledger was opened at a head the store holds no version for, or
     /// a chain at a root the log holds no envelope for.
     UnknownHead(EnvelopeDigest),
-    /// An envelope chains onto an envelope the store's log does not hold.
-    /// Sync delivers parent-first, so this is a protocol breach, not a
-    /// gap to buffer around.
+    /// An envelope chains onto a parent whose version the store does not
+    /// hold — never seen, or pruned. Sync delivers parent-first, so this
+    /// is a protocol breach, not a gap to buffer around.
     UnknownParent(EnvelopeDigest),
     /// An envelope could not be applied.
     Apply(ApplyError<E>),

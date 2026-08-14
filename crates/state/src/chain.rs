@@ -38,7 +38,10 @@ pub enum Insert {
     /// The head did not move: a losing fork, or an envelope the walk
     /// adjudicated against.
     Unchanged,
-    /// The envelope was already in the store's log.
+    /// The envelope was already in the store's log *and* the head did
+    /// not move. A duplicate this cursor had not folded in yet — filed
+    /// through another chain sharing the store — reports the movement
+    /// instead.
     Duplicate,
 }
 
@@ -81,49 +84,61 @@ impl Chain {
     /// Files `envelope` into the store's log and re-derives the canonical
     /// head.
     ///
-    /// The parent must already be in the log — sync transmits parent-first
-    /// from the intersection point, so an unknown parent is refused as
+    /// The parent's version must be in the store: sync transmits
+    /// parent-first, so an unknown — or pruned — parent is refused as
     /// [`Error::UnknownParent`], not buffered. Validation happens at the
     /// boundary: the envelope is applied on probation against its
     /// parent's version, and a failure refuses it — never filed — with
-    /// the failure as the error. (A parent whose version was pruned can't
-    /// back a probation; then the envelope is filed as-is and checked
-    /// when the walk re-derives that branch.) Losing a fork is no error,
-    /// merely [`Insert::Unchanged`].
+    /// the failure as the error. Losing a fork is no error, merely
+    /// [`Insert::Unchanged`].
+    ///
+    /// Inserting always leaves the chain standing at the canonical head
+    /// of everything the log holds — an envelope already filed still
+    /// triggers the walk, so a cursor lagging behind a shared store
+    /// catches up rather than reporting [`Insert::Duplicate`] forever.
     pub fn insert<S: Storage>(
         &mut self,
         storage: &mut S,
         envelope: Envelope,
     ) -> Result<Insert, Error<S::Error>> {
-        let digest = envelope.digest()?;
-        if storage.envelope(digest).map_err(Error::Storage)?.is_some() {
-            return Ok(Insert::Duplicate);
-        }
         let Some(prev) = envelope.payload().prev_digest().copied() else {
             return Err(Error::Apply(ApplyError::UnexpectedInit));
         };
+        let digest = envelope.digest()?;
 
-        if storage.contains_version(prev).map_err(Error::Storage)? {
-            // Probation: commits the child version on success, which the
-            // walk below picks up instead of re-applying.
-            Ledger::open(storage, prev)?.apply(storage, &envelope)?;
-        } else if storage.envelope(prev).map_err(Error::Storage)?.is_none() {
-            return Err(Error::UnknownParent(prev));
+        // Already in the log — perhaps through another chain sharing the
+        // store. Nothing to file, but the walk below still runs: this
+        // cursor may not have folded it in yet.
+        let already_stored = storage.envelope(digest).map_err(Error::Storage)?.is_some();
+
+        if !already_stored {
+            if !storage.contains_version(prev).map_err(Error::Storage)? {
+                return Err(Error::UnknownParent(prev));
+            }
+
+            // Store the new envelope if it applies successfully.
+            let mut prev_state = Ledger::open(storage, prev)?;
+            prev_state.apply(storage, &envelope)?;
+
+            storage
+                .put_envelope(digest, envelope)
+                .map_err(Error::Storage)?;
         }
-        storage
-            .put_envelope(digest, envelope)
-            .map_err(Error::Storage)?;
 
         let from = self.ledger.head();
         self.ledger = self.canonicalize(storage)?;
 
         let head = self.ledger.head();
-        Ok(if head == from {
-            Insert::Unchanged
-        } else if descends(storage, head, from)? {
-            Insert::Extended
+        Ok(if head != from {
+            if descends(storage, head, from)? {
+                Insert::Extended
+            } else {
+                Insert::Reorged { from }
+            }
+        } else if already_stored {
+            Insert::Duplicate
         } else {
-            Insert::Reorged { from }
+            Insert::Unchanged
         })
     }
 
@@ -421,12 +436,10 @@ mod tests {
         assert_eq!(chain.head(), chain.root(), "head must not move");
     }
 
-    /// A filed parent whose version was pruned can't back a probation;
-    /// the envelope is filed as-is and adjudicated when the walk
-    /// re-derives that branch — where an invalid one is dropped from
-    /// the log.
+    /// A parent whose version was pruned can't back a probation, so its
+    /// children are refused rather than filed unvalidated.
     #[test]
-    fn a_pruned_parent_defers_validation_to_the_walk() {
+    fn a_pruned_parent_refuses_new_children() {
         let (mut store, mut chain) = setup();
         let parent = set(chain.head(), "a", "1");
         chain.insert(&mut store, parent.clone()).unwrap();
@@ -435,25 +448,34 @@ mod tests {
         // the log.
         store.retain(&[chain.root()]).unwrap();
 
-        let bad = delete(digest(&parent), "nope");
-        assert_eq!(
-            chain.insert(&mut store, bad.clone()).unwrap(),
-            Insert::Unchanged
-        );
-
-        assert_eq!(chain.head(), digest(&parent));
-        assert!(has(&store, &chain, &key("a")), "the branch was re-derived");
-        assert_eq!(
-            store.envelope(digest(&bad)).unwrap(),
-            None,
-            "dropped when the walk rejected it"
-        );
-
-        // Refiling it is now checkable directly — refused at the door.
+        let child = set(digest(&parent), "b", "2");
         assert!(matches!(
-            chain.insert(&mut store, bad),
-            Err(Error::Apply(ApplyError::UnknownNamespace(k))) if k == key("nope")
+            chain.insert(&mut store, child.clone()).unwrap_err(),
+            Error::UnknownParent(p) if p == digest(&parent)
         ));
+        assert_eq!(store.envelope(digest(&child)).unwrap(), None, "never filed");
+        assert_eq!(chain.head(), digest(&parent), "head must not move");
+    }
+
+    /// `insert` files only validated envelopes, but the walk stays
+    /// defensive: an invalid envelope that reached the log some other
+    /// way is dropped the moment the walk finds it out.
+    #[test]
+    fn the_walk_drops_an_invalid_envelope_from_the_log() {
+        let (mut store, mut chain) = setup();
+        let bad = delete(chain.head(), "nope");
+        store.put_envelope(digest(&bad), bad.clone()).unwrap();
+
+        // Grind until the valid sibling loses the digest race, so the
+        // walk must adjudicate `bad` before reaching it.
+        let good = (0..)
+            .map(|i| set(chain.head(), "a", &format!("v{i}")))
+            .find(|e| digest(e) > digest(&bad))
+            .expect("some value hashes above bad");
+        chain.insert(&mut store, good.clone()).unwrap();
+
+        assert_eq!(chain.head(), digest(&good));
+        assert_eq!(store.envelope(digest(&bad)).unwrap(), None, "dropped");
     }
 
     #[test]
@@ -468,8 +490,38 @@ mod tests {
         );
         assert_eq!(chain.head(), digest(&envelope));
 
-        // The chain's own Init counts as already present.
-        assert_eq!(chain.insert(&mut store, init()).unwrap(), Insert::Duplicate);
+        // Even the chain's own Init is refused rather than deduped —
+        // Init envelopes never travel through insert.
+        assert!(matches!(
+            chain.insert(&mut store, init()),
+            Err(Error::Apply(ApplyError::UnexpectedInit))
+        ));
+    }
+
+    /// Chains share a store: an envelope filed by one is a duplicate to
+    /// the other's log, but a lagging cursor must still fold it in
+    /// rather than staying stale behind [`Insert::Duplicate`].
+    #[test]
+    fn a_duplicate_still_advances_a_lagging_chain() {
+        let mut store = MemStorage::default();
+        let mut leader = Chain::init(&mut store, init()).unwrap();
+        let mut follower = Chain::init(&mut store, init()).unwrap();
+
+        let envelope = set(leader.head(), "a", "1");
+        leader.insert(&mut store, envelope.clone()).unwrap();
+        assert_eq!(follower.head(), follower.root(), "not folded in yet");
+
+        assert_eq!(
+            follower.insert(&mut store, envelope.clone()).unwrap(),
+            Insert::Extended
+        );
+        assert_eq!(follower.head(), leader.head());
+
+        // Caught up, the same envelope is a true duplicate.
+        assert_eq!(
+            follower.insert(&mut store, envelope).unwrap(),
+            Insert::Duplicate
+        );
     }
 
     /// A *different* `Init` starts a different chain; it cannot be folded
