@@ -17,7 +17,7 @@
 use std::collections::BTreeMap;
 
 use wire::{
-    Envelope, EnvelopeDigest, Msg,
+    Envelope, EnvelopeDigest, Msg, VerificationStatus,
     msg::{Namespace, NamespaceKey, SetNamespace, Value},
     subkey::{Subkey, SubkeyPath},
 };
@@ -69,6 +69,10 @@ macro_rules! storage_conformance {
             $crate::conformance::set_at_does_not_bleed_into_other_versions($make);
         }
         #[test]
+        fn conformance_reads_at_a_head_are_stable_across_updates() {
+            $crate::conformance::reads_at_a_head_are_stable_across_updates($make);
+        }
+        #[test]
         fn conformance_forks_diverge_independently() {
             $crate::conformance::forks_diverge_independently($make);
         }
@@ -87,6 +91,10 @@ macro_rules! storage_conformance {
         #[test]
         fn conformance_envelopes_store_and_read_back() {
             $crate::conformance::envelopes_store_and_read_back($make);
+        }
+        #[test]
+        fn conformance_envelopes_round_trip_the_verification_status() {
+            $crate::conformance::envelopes_round_trip_the_verification_status($make);
         }
         #[test]
         fn conformance_children_come_back_in_digest_order() {
@@ -388,6 +396,61 @@ pub fn set_at_does_not_bleed_into_other_versions<S: Storage>(mut store: S) {
     assert_eq!(b_of(3), Some(Value::String("3".into())));
 }
 
+/// Reads are snapshots, not handles: everything read at a head must read
+/// back identically after later commits touch the same keys and paths.
+/// Returned values are owned and cannot change in the caller's hands —
+/// what this pins is the store itself, where structural sharing or a
+/// path-indexed `resolve` override could serve a newer version's write
+/// through an old head.
+pub fn reads_at_a_head_are_stable_across_updates<S: Storage>(mut store: S) {
+    store
+        .install(digest(1), namespaces([("a", leaf("1")), ("n", nested())]))
+        .expect("install");
+
+    let before_n = fetch(&store, 1, "n").expect("n exists");
+    let before_all: Vec<_> = store
+        .namespaces(digest(1))
+        .collect::<Result<_, _>>()
+        .expect("namespaces");
+    let at_b = || [sub("a"), sub("b")];
+    let before_resolved = store
+        .resolve(digest(1), &key("n"), &at_b())
+        .expect("resolve");
+
+    // Touch everything the snapshot read: a nested write, a wholesale
+    // overwrite, and a delete of the sibling.
+    store
+        .commit(
+            digest(1),
+            digest(2),
+            set_at(path(at_b()), Some(Value::String("9".into()))),
+        )
+        .expect("commit");
+    store
+        .commit(digest(2), digest(3), NamespaceOp::Put(key("n"), leaf("x")))
+        .expect("commit");
+    store
+        .commit(digest(3), digest(4), NamespaceOp::Delete(key("a")))
+        .expect("commit");
+
+    assert_eq!(fetch(&store, 1, "n"), Some(before_n));
+    assert_eq!(fetch(&store, 1, "a"), Some(leaf("1")));
+    assert_eq!(
+        store
+            .namespaces(digest(1))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("namespaces"),
+        before_all
+    );
+    assert_eq!(
+        store
+            .resolve(digest(1), &key("n"), &at_b())
+            .expect("resolve"),
+        before_resolved,
+        "resolve must walk the addressed version, not the newest"
+    );
+}
+
 pub fn forks_diverge_independently<S: Storage>(mut store: S) {
     store
         .install(digest(1), namespaces([("a", leaf("1"))]))
@@ -548,6 +611,35 @@ pub fn envelopes_store_and_read_back<S: Storage>(mut store: S) {
     put(&mut store, &stored);
     assert_eq!(store.envelope(d).expect("envelope"), Some(stored));
     assert_eq!(children_of(&store, digest(1)), vec![d]);
+}
+
+/// The verification status rides outside the envelope's canonical CBOR:
+/// a backend keeping envelopes as encoded bytes must persist the status
+/// beside them, or fork resolution forgets every verification on restart.
+pub fn envelopes_round_trip_the_verification_status<S: Storage>(mut store: S) {
+    let unverified = envelope(digest(1), "1");
+    let mut verified = unverified.clone();
+    verified.set_verification_status(VerificationStatus::AllMatched { total_weight: 7 });
+    assert_eq!(
+        digest_of(&verified),
+        digest_of(&unverified),
+        "the status must not change the digest"
+    );
+
+    let d = put(&mut store, &verified);
+    assert_eq!(
+        store.envelope(d).expect("envelope").expect("stored"),
+        verified,
+        "the status is not in the encoding and must be stored beside it"
+    );
+
+    // Verification usually lands after the envelope did: re-storing under
+    // the same digest replaces the record, status included.
+    put(&mut store, &unverified);
+    assert_eq!(
+        store.envelope(d).expect("envelope").expect("stored"),
+        unverified
+    );
 }
 
 pub fn children_come_back_in_digest_order<S: Storage>(mut store: S) {

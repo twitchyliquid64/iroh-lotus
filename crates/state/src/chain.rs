@@ -12,8 +12,11 @@ use crate::{ApplyError, Error, Ledger};
 /// are multiple descendant envelopes for a parent envelope, AKA a fork
 /// in the chain.
 ///
-/// The winner is decided per fork, by applying some deterministic rules.
-/// An envelope that fails to apply is discarded, along with its children.
+/// The winner is decided per fork, by applying some deterministic rules:
+/// highest verified signature weight first, then highest digest. A winning
+/// envelope that fails to apply is discarded — along with its children —
+/// and the failure surfaces as the walk's error; the losing siblings are
+/// never adopted in its place until the next walk.
 ///
 /// Switching branches is cheap because the store keeps the versions of
 /// both: the ledger reopens at the fork point and only envelopes never
@@ -35,8 +38,7 @@ pub enum Insert {
         /// The head that was abandoned.
         from: EnvelopeDigest,
     },
-    /// The head did not move: a losing fork, or an envelope the walk
-    /// adjudicated against.
+    /// The head did not move: a losing fork.
     Unchanged,
     /// The envelope was already in the store's log *and* the head did
     /// not move. A duplicate this cursor had not folded in yet — stored
@@ -116,7 +118,10 @@ impl Chain {
     /// Validation is one trial ledger advanced across the run, so a
     /// refusal keeps the valid prefix: everything before the fault is
     /// stored, nothing at or after it is, and the walk still runs before
-    /// the error returns — the head never lags what was stored. Envelopes
+    /// the error returns — the head never lags what was stored. The walk
+    /// itself can also refuse: a stored envelope that wins its fork but
+    /// fails to apply is dropped from the log and its failure is the
+    /// error, leaving the head where it stood until the next walk. Envelopes
     /// already in the log are folded in without re-judgment (what's
     /// stored is the walk's to adjudicate); [`Insert::Duplicate`] means a
     /// non-empty run of nothing but duplicates that moved nothing. An
@@ -265,40 +270,60 @@ impl Chain {
         Ok(ledger)
     }
 
-    /// One canonical step down from `ledger`: the lowest-digest child that
-    /// is valid, or `None` at a tip.
+    /// One canonical step down from `ledger`: the winning child, or `None`
+    /// at a tip.
+    ///
+    /// The winner is the child with the highest verified signature weight,
+    /// ties broken by the numerically higher digest. Siblings are never
+    /// consulted: a winner that fails to apply is dropped from the log and
+    /// the failure is the walk's error.
     fn step<S: Storage>(
         &self,
         storage: &mut S,
         ledger: &Ledger,
     ) -> Result<Option<Ledger>, Error<S::Error>> {
-        // Collected because applying below needs the store mutably.
+        // Collected because the envelope reads below need the store again.
         let children: Vec<EnvelopeDigest> = storage
             .children(ledger.head())
             .collect::<Result<_, _>>()
             .map_err(Error::Storage)?;
 
-        for child in children {
-            // A version at the child means it applied before — digests pin
-            // content, so it can only be this envelope's result.
-            if storage.contains_version(child).map_err(Error::Storage)? {
-                return Ok(Some(Ledger::open(storage, child)?));
-            }
-            let envelope = storage
-                .envelope(child)
-                .map_err(Error::Storage)?
-                .expect("children indexes only stored envelopes");
-            let mut candidate = *ledger;
-            match candidate.apply(storage, &envelope) {
-                Ok(()) => return Ok(Some(candidate)),
-                Err(ApplyError::Storage(err)) => return Err(Error::Storage(err)),
-                // Deterministic rejection: this envelope can never be
-                // canonical, so drop it rather than re-refuse it on every
-                // future walk. The fork falls to the next sibling.
-                Err(_) => storage.remove_envelope(child).map_err(Error::Storage)?,
+        let candidates: Vec<(u32, EnvelopeDigest, Envelope)> = children
+            .into_iter()
+            .map(|child| {
+                storage.envelope(child).map_err(Error::Storage).map(|env| {
+                    let envelope = env.expect("children indexes only stored envelopes");
+                    let weight = envelope.verification_status().signature_weight();
+                    (weight, child, envelope)
+                })
+            })
+            .collect::<Result<_, _>>()?;
+
+        let Some((_, child, envelope)) = candidates
+            .into_iter()
+            .max_by_key(|(weight, digest, _)| (*weight, *digest))
+        else {
+            return Ok(None);
+        };
+
+        // A version at the child means it applied before — digests pin
+        // content, so it can only be this envelope's result.
+        if storage.contains_version(child).map_err(Error::Storage)? {
+            return Ok(Some(Ledger::open(storage, child)?));
+        }
+
+        let mut candidate = *ledger;
+        match candidate.apply(storage, &envelope) {
+            Ok(()) => Ok(Some(candidate)),
+            Err(ApplyError::Storage(err)) => Err(Error::Storage(err)),
+            // Deterministic rejection: this envelope can never be canonical.
+            // Drop it before erroring, or every future walk would wedge on
+            // re-refusing it.
+            Err(err) => {
+                storage.remove_envelope(child).map_err(Error::Storage)?;
+                Err(err.into())
             }
         }
-        Ok(None)
     }
 }
 
@@ -372,9 +397,10 @@ mod tests {
         envelope.digest().unwrap()
     }
 
-    /// Splits two sibling envelopes into (winner, loser) by the fork rule.
+    /// Splits two sibling envelopes into (winner, loser) by the fork rule:
+    /// equal (zero) signature weight, so the higher digest wins.
     fn ranked(a: Envelope, b: Envelope) -> (Envelope, Envelope) {
-        if digest(&a) < digest(&b) {
+        if digest(&a) > digest(&b) {
             (a, b)
         } else {
             (b, a)
@@ -406,7 +432,7 @@ mod tests {
         assert!(has(&store, &chain, &key("a")));
     }
 
-    /// Of two children contesting one parent, the lower digest wins; the
+    /// Of two children contesting one parent, the higher digest wins; the
     /// loser arriving second changes nothing.
     #[test]
     fn a_losing_fork_leaves_the_head_alone() {
@@ -444,8 +470,8 @@ mod tests {
         assert!(!has(&store, &chain, &key_of(&loser)));
     }
 
-    /// One low digest at the fork beats any number of descendants on the
-    /// other side — there is no notion of chain length or weight.
+    /// One winning digest at the fork beats any number of descendants on
+    /// the other side — there is no notion of chain length.
     #[test]
     fn a_longer_losing_branch_stays_losing() {
         let (mut store, mut chain) = setup();
@@ -550,8 +576,9 @@ mod tests {
     }
 
     /// `insert` stores only validated envelopes, but the walk stays
-    /// defensive: an invalid envelope that reached the log some other
-    /// way is dropped the moment the walk finds it out.
+    /// defensive: an invalid envelope that reached the log some other way
+    /// and wins its fork is dropped, its failure surfaces as the error,
+    /// and only the next walk adopts the surviving sibling.
     #[test]
     fn the_walk_drops_an_invalid_envelope_from_the_log() {
         let (mut store, mut chain) = setup();
@@ -562,12 +589,23 @@ mod tests {
         // walk must adjudicate `bad` before reaching it.
         let good = (0..)
             .map(|i| set(chain.head(), "a", &format!("v{i}")))
-            .find(|e| digest(e) > digest(&bad))
-            .expect("some value hashes above bad");
-        chain.insert(&mut store, good.clone()).unwrap();
+            .find(|e| digest(e) < digest(&bad))
+            .expect("some value hashes below bad");
 
-        assert_eq!(chain.head(), digest(&good));
+        let err = chain.insert(&mut store, good.clone()).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Apply(ApplyError::UnknownNamespace(k)) if k == key("nope")
+        ));
         assert_eq!(store.envelope(digest(&bad)).unwrap(), None, "dropped");
+        assert_eq!(chain.head(), chain.root(), "walk aborted at the fault");
+
+        // `good` was stored before the fault; the next walk reaches it.
+        assert_eq!(
+            chain.insert_batch(&mut store, core::iter::empty()).unwrap(),
+            Insert::Extended
+        );
+        assert_eq!(chain.head(), digest(&good));
     }
 
     #[test]

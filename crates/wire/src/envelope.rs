@@ -2,6 +2,28 @@ use cbor2::Cbor;
 
 use crate::Error;
 
+/// The cached state of signature verification for an envelope.
+#[derive(Debug, Default, Clone, Hash, PartialEq, Eq)]
+pub enum VerificationStatus {
+    #[default]
+    Unchecked,
+    Failed,
+    AllMatched {
+        total_weight: u32,
+    },
+}
+
+impl VerificationStatus {
+    /// The verified signature weight of this envelope; zero until
+    /// verification has succeeded.
+    pub fn signature_weight(&self) -> u32 {
+        match self {
+            Self::Unchecked | Self::Failed => 0,
+            Self::AllMatched { total_weight } => *total_weight,
+        }
+    }
+}
+
 /// Container type for a message in the ledger.
 #[derive(Debug, Clone, Cbor, Hash, PartialEq, Eq)]
 pub struct Envelope {
@@ -17,6 +39,12 @@ pub struct Envelope {
     /// a TSA.
     #[cbor(key = 3)]
     timestamps: Vec<SignedTimestamp>,
+
+    /// Never on the wire and excluded from the digest, but storage
+    /// backends must persist it — see `Storage::put_envelope`'s contract
+    /// in the storage crate.
+    #[serde(skip)]
+    verification_status: VerificationStatus,
 }
 
 impl Envelope {
@@ -26,6 +54,7 @@ impl Envelope {
             payload,
             signatures: Vec::new(),
             timestamps: Vec::new(),
+            verification_status: VerificationStatus::Unchecked,
         }
     }
 
@@ -42,6 +71,18 @@ impl Envelope {
     /// The timestamps attested over this envelope.
     pub fn timestamps(&self) -> &[SignedTimestamp] {
         &self.timestamps
+    }
+
+    /// The verification status of this envelope.
+    pub fn verification_status(&self) -> &VerificationStatus {
+        &self.verification_status
+    }
+
+    /// Records the outcome of signature verification. The status lives
+    /// outside the canonical encoding, so this never changes the
+    /// envelope's digest.
+    pub fn set_verification_status(&mut self, status: VerificationStatus) {
+        self.verification_status = status;
     }
 
     /// The digest of this envelope, taken over its canonical CBOR encoding.

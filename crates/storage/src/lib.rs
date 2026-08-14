@@ -167,13 +167,23 @@ pub trait Storage {
 
     /// Stores `envelope` in the log under `digest`, indexing it under its
     /// `prev` for [`children`](Storage::children).
+    ///
+    /// The whole [`Envelope`] must be persisted — its verification status
+    /// included, even though the status is *not* part of the envelope's
+    /// canonical CBOR encoding (nor its digest). A backend that keeps
+    /// envelopes as encoded bytes must store the status beside them and
+    /// reattach it on read: fork resolution weighs it, so a status that
+    /// resets to `Unchecked` on a round-trip changes which fork wins
+    /// after a restart. Re-storing under the same digest replaces the
+    /// record — how a caller upgrades the status after verifying.
     fn put_envelope(
         &mut self,
         digest: EnvelopeDigest,
         envelope: Envelope,
     ) -> Result<(), Self::Error>;
 
-    /// The envelope stored under `digest`, or `None` when the log holds no
+    /// The envelope stored under `digest` — exactly as stored,
+    /// verification status included — or `None` when the log holds no
     /// such envelope.
     fn envelope(&self, digest: EnvelopeDigest) -> Result<Option<Envelope>, Self::Error>;
 

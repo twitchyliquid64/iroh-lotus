@@ -7,7 +7,9 @@ mod error;
 pub use error::Error;
 
 mod envelope;
-pub use envelope::{Envelope, EnvelopeDigest, EnvelopeSignature, SignedTimestamp};
+pub use envelope::{
+    Envelope, EnvelopeDigest, EnvelopeSignature, SignedTimestamp, VerificationStatus,
+};
 
 pub mod msg;
 pub use msg::Msg;
