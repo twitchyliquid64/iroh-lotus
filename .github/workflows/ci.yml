@@ -61,4 +61,4 @@ jobs:
               with:
                   persist-credentials: false
             - name: Run Clippy
-              run: cargo clippy --workspace --all-targets --locked -- -D warnings
+              run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings

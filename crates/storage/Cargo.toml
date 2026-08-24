@@ -6,5 +6,15 @@ license.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[features]
+default = ["sqlite"]
+sqlite = ["dep:rand", "dep:rusqlite", "dep:thiserror"]
+
 [dependencies]
+rand = { workspace = true, optional = true }
+rusqlite = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
 wire.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

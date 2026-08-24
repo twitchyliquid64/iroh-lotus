@@ -36,9 +36,13 @@ use wire::{
 
 pub mod conformance;
 mod mem;
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
 pub mod value;
 
 pub use mem::MemStorage;
+#[cfg(feature = "sqlite")]
+pub use sqlite::SqliteStorage;
 
 /// What a node in a namespace's value tree holds, without its contents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
