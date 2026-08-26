@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/lotusd",
     "crates/state",
     "crates/storage",
     "crates/wire",
@@ -22,6 +23,9 @@ codegen-units = 1
 blake3 = { version = "1", features = ["serde"] }
 cbor2 = { version = "1.1", features = ["std", "alloc", "derive", "futures", "tokio"] }
 chrono = {version = "0.4", features = ["serde", "std"]}
+clap = { version = "4.6", features = ["derive", "env", "string"] }
+clap_complete = { version = "4.6" }
+dirs = "6"
 
 nutype = { version = "0.7", features = ["serde"] }
 rand = "0.10"
@@ -31,6 +35,9 @@ serde = { version = "1.0", features = ["derive", "rc"] }
 sha2 = "0.11"
 tempfile = "3.27"
 thiserror = "2"
+tokio = { version = "1.53", features = ["full"] }
+tokio-stream = "0.1"
+tokio-util = "0.7"
 
 uuid = { version = "1.24", features = ["v4", "v7", "serde"] }
 
