@@ -4,10 +4,14 @@
 use std::{fs::DirEntry, path::Path};
 
 use lotusd::{Core, IfInitialized, InitError};
-use state::Ledger;
+use state::{Chain, Insert, Ledger};
 use storage::{SqliteStorage, Storage};
 use tempfile::TempDir;
-use wire::VerificationStatus;
+use wire::{
+    Envelope, Msg, Signature, VerificationStatus,
+    keys::{Ed25519PublicKey, Ed25519Signature, PublicKey},
+    msg::{Namespace, NamespaceKey, SetNamespace, Value},
+};
 
 async fn create(dir: &TempDir, if_initialized: IfInitialized) -> Result<Core, InitError> {
     Core::create_in_state_dir(dir.path().to_path_buf(), if_initialized).await
@@ -205,4 +209,73 @@ async fn genesis_reverifies_against_the_state_at_head() {
             total_weight: expected
         },
     );
+}
+
+/// A fresh cluster's chain is exactly its genesis.
+#[tokio::test]
+async fn a_fresh_chain_holds_only_genesis() {
+    let dir = TempDir::new().unwrap();
+    let core = create(&dir, IfInitialized::Fail).await.unwrap();
+
+    let chain = core.canonical_chain().unwrap();
+    assert_eq!(chain.len(), 1);
+    assert_eq!(chain[0].0, core.root());
+    assert_eq!(chain[0].0, core.head());
+}
+
+/// Ordering is oldest-first, which a one-envelope chain cannot tell apart
+/// from newest-first.
+#[tokio::test]
+async fn the_chain_is_walked_back_to_the_root_and_returned_oldest_first() {
+    let dir = TempDir::new().unwrap();
+    let core = create(&dir, IfInitialized::Fail).await.unwrap();
+    let (root, signing_key) = (
+        core.root(),
+        *core.signing_keys().values().next().expect("a founding key"),
+    );
+    drop(core);
+
+    // Appended behind lotusd's back: nothing but `init` writes envelopes yet.
+    let mut storage = SqliteStorage::open(dir.path().join(lotusd::SQLITE_DB_FILENAME)).unwrap();
+    let mut chain = Chain::open(&mut storage, root).unwrap();
+
+    let envelope = Envelope::new(Msg::SetNamespace(SetNamespace {
+        prev: chain.head(),
+        key: NamespaceKey::try_new("greeting").unwrap(),
+        namespace: Namespace {
+            value: Value::String("hello".to_string()),
+        },
+    }));
+    let signature = Signature::Ed25519(Ed25519Signature::from_bytes(
+        signing_key
+            .sign(envelope.signature_digest().unwrap().as_bytes())
+            .to_bytes(),
+    ));
+    let envelope = envelope.with_signature(
+        PublicKey::Ed25519(Ed25519PublicKey::from_bytes(
+            signing_key.verification_key().into(),
+        ))
+        .id(),
+        signature,
+    );
+
+    let appended = envelope.digest().unwrap();
+    assert_eq!(
+        chain.insert(&mut storage, envelope).unwrap(),
+        Insert::Extended
+    );
+    drop(storage);
+
+    let core = Core::init_with_state_dir(dir.path().to_path_buf())
+        .await
+        .unwrap();
+
+    let walked: Vec<_> = core
+        .canonical_chain()
+        .unwrap()
+        .into_iter()
+        .map(|(digest, _)| digest)
+        .collect();
+    assert_eq!(walked, vec![root, appended]);
+    assert_eq!(core.head(), appended);
 }

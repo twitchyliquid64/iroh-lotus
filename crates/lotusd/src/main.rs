@@ -5,6 +5,10 @@ use clap_complete::Shell;
 use lotusd::{Core, IfInitialized};
 use tokio::runtime::Builder;
 
+use crate::print::print_chain;
+
+mod print;
+
 #[derive(Parser)]
 #[command(name = "lotusd", version = "0.0.1")]
 #[command(about = "The iroh-lotus daemon")]
@@ -27,6 +31,16 @@ enum Command {
     Run,
     /// Initializes a new cluster
     Init(InitArgs),
+    /// Inspects what this node has on disk
+    #[command(subcommand)]
+    Debug(DebugCommand),
+}
+
+/// The inspection subcommands. Read-only: none of these touch the ledger.
+#[derive(Debug, Subcommand)]
+enum DebugCommand {
+    /// Prints the canonical chain, from the oldest envelope still held to head
+    Chain,
 }
 
 /// The arguments for the completions subcommand.
@@ -127,6 +141,13 @@ async fn async_main() -> Result<(), MainError> {
 
             println!("Initialized cluster {core}");
         }
+        Command::Debug(DebugCommand::Chain) => {
+            let core = Core::init_with_state_dir(cli.global_args.state_dir()?)
+                .await
+                .map_err(MainError::Init)?;
+
+            print_chain(&core, &core.canonical_chain().map_err(MainError::Storage)?);
+        }
     }
 
     Ok(())
@@ -136,5 +157,7 @@ async fn async_main() -> Result<(), MainError> {
 #[derive(Debug)]
 pub enum MainError {
     Init(lotusd::InitError),
+    /// The envelope log could not be read.
+    Storage(storage::sqlite::Error),
     Other(String),
 }

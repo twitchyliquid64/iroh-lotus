@@ -7,7 +7,7 @@ use std::{
 use ed25519_zebra::SigningKey;
 use rand::{TryRng, rngs::SysRng};
 use state::{Chain, TRUSTED_KEYS_KEY};
-use storage::SqliteStorage;
+use storage::{SqliteStorage, Storage};
 use tokio::{fs, io::AsyncWriteExt};
 use wire::{
     Envelope, EnvelopeDigest, Key, KeyId, Msg, Signature,
@@ -152,6 +152,31 @@ impl Core {
     /// The oldest stored envelope.
     pub fn root(&self) -> EnvelopeDigest {
         self.oldest
+    }
+
+    /// The canonical chain, oldest envelope first.
+    ///
+    /// Walks back from head by `prev` and stops where the log does, so the
+    /// first entry is as far back as this node can still see — the chain's
+    /// root, until compaction has moved it.
+    pub fn canonical_chain(
+        &self,
+    ) -> Result<Vec<(EnvelopeDigest, Envelope)>, storage::sqlite::Error> {
+        let mut chain = Vec::new();
+        let mut next = Some(self.chain.head());
+
+        // Terminates without a seen-set: a digest covers its parent's, so a
+        // cycle would need a hash collision to exist.
+        while let Some(digest) = next {
+            let Some(envelope) = self.storage.envelope(digest)? else {
+                break;
+            };
+            next = envelope.payload().prev_digest().copied();
+            chain.push((digest, envelope));
+        }
+
+        chain.reverse();
+        Ok(chain)
     }
 
     /// Every key this node can sign with, by id.
