@@ -17,7 +17,10 @@ mod chain;
 pub use chain::{Chain, Insert};
 
 mod error;
-pub use error::{ApplyError, Error};
+pub use error::{ApplyError, Error, TrustedKeysError, ValueError};
 
 mod ledger;
-pub use ledger::{DEFAULT_MIN_KEEP_MINUTES, Ledger, MIN_KEEP_MINUTES_KEY};
+pub use ledger::{
+    DEFAULT_MIN_KEEP_MINUTES, Ledger, MIN_ENVELOPE_SIGNATURES_KEY, MIN_ENVELOPE_WEIGHT_KEY,
+    MIN_KEEP_MINUTES_KEY, TRUSTED_KEYS_KEY,
+};

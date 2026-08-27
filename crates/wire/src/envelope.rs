@@ -1,9 +1,11 @@
+use std::collections::BTreeMap;
+
 use cbor2::Cbor;
 
 use crate::{
     Error,
     codec::byte_array,
-    keys::{Key, KeyId, Signature, SignatureError},
+    keys::{KeyId, Signature},
 };
 
 /// The cached state of signature verification for an envelope.
@@ -35,10 +37,14 @@ pub struct Envelope {
     #[cbor(key = 1)]
     payload: super::Msg,
 
-    /// Signatures over the entire envelope. Digest which is signed
-    /// is computed with an empty signatures vector.
+    /// Signatures over this envelope's [`EnvelopeSignatureDigest`], filed
+    /// under the id of the key that produced each.
+    ///
+    /// A map, so the set has exactly one canonical encoding however the
+    /// signatures were collected, and one key cannot sign twice. The
+    /// digest that is signed is computed with this map empty.
     #[cbor(key = 2)]
-    signatures: Vec<EnvelopeSignature>,
+    signatures: BTreeMap<KeyId, Signature>,
     /// Assertions of the time this envelope was created, signed by
     /// a TSA.
     #[cbor(key = 3)]
@@ -56,7 +62,7 @@ impl Envelope {
     pub fn new(payload: super::Msg) -> Self {
         Self {
             payload,
-            signatures: Vec::new(),
+            signatures: BTreeMap::new(),
             timestamps: Vec::new(),
             verification_status: VerificationStatus::Unchecked,
         }
@@ -67,8 +73,9 @@ impl Envelope {
         &self.payload
     }
 
-    /// The signatures attached to this envelope.
-    pub fn signatures(&self) -> &[EnvelopeSignature] {
+    /// The signatures attached to this envelope, by the id of the key
+    /// that produced each.
+    pub fn signatures(&self) -> &BTreeMap<KeyId, Signature> {
         &self.signatures
     }
 
@@ -80,6 +87,22 @@ impl Envelope {
     /// The verification status of this envelope.
     pub fn verification_status(&self) -> &VerificationStatus {
         &self.verification_status
+    }
+
+    /// How many distinct keys have verifiably signed this envelope.
+    ///
+    /// Zero until verification has succeeded — [`VerificationStatus::AllMatched`]
+    /// is what makes the attached signatures countable, since it says
+    /// every one of them matched. Counted per key, so a key that signed
+    /// twice counts once and a padded list cannot clear a threshold the
+    /// signers themselves do not.
+    pub fn verified_signers(&self) -> u32 {
+        match self.verification_status {
+            VerificationStatus::AllMatched { .. } => {
+                self.signatures.len().try_into().unwrap_or(u32::MAX)
+            }
+            VerificationStatus::Unchecked | VerificationStatus::Failed => 0,
+        }
     }
 
     /// Records the outcome of signature verification. The status lives
@@ -110,7 +133,7 @@ impl Envelope {
         crate::encode_into(
             &SignedPortion {
                 payload: &self.payload,
-                signatures: [],
+                signatures: BTreeMap::new(),
                 timestamps: &self.timestamps,
             },
             &mut hasher,
@@ -118,9 +141,10 @@ impl Envelope {
         Ok(EnvelopeSignatureDigest(hasher.finalize()))
     }
 
-    /// This envelope with `signature` attached.
-    pub fn with_signature(mut self, signature: EnvelopeSignature) -> Self {
-        self.signatures.push(signature);
+    /// This envelope with `signature` attached under `key_id`, replacing
+    /// whatever that key had signed before.
+    pub fn with_signature(mut self, key_id: KeyId, signature: Signature) -> Self {
+        self.signatures.insert(key_id, signature);
         self
     }
 }
@@ -134,63 +158,9 @@ struct SignedPortion<P, T> {
     #[cbor(key = 1)]
     payload: P,
     #[cbor(key = 2)]
-    signatures: [EnvelopeSignature; 0],
+    signatures: BTreeMap<KeyId, Signature>,
     #[cbor(key = 3)]
     timestamps: T,
-}
-
-/// A signature over an envelope, naming the key that produced it.
-///
-/// The key is named by [`KeyId`], not carried: resolving it is the
-/// ledger's business, and a verifier must consult the key set for the
-/// key's weight regardless.
-#[derive(Debug, Clone, Cbor, Hash, PartialEq, Eq)]
-pub struct EnvelopeSignature {
-    /// The key the signature is weighed under.
-    #[cbor(key = 1)]
-    key_id: KeyId,
-    /// The signature over the envelope's [`EnvelopeSignatureDigest`].
-    #[cbor(key = 2)]
-    signature: Signature,
-}
-
-impl EnvelopeSignature {
-    /// A signature naming the key that produced it. Nothing is checked
-    /// here; [`verify`](Self::verify) is the only thing that decides.
-    pub fn new(key_id: KeyId, signature: Signature) -> Self {
-        Self { key_id, signature }
-    }
-
-    /// The id of the key the signature is weighed under.
-    pub fn key_id(&self) -> &KeyId {
-        &self.key_id
-    }
-
-    /// The signature itself.
-    pub fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    /// Verifies this signature against `digest`, which must come from
-    /// [`Envelope::signature_digest`] on the envelope carrying it.
-    ///
-    /// `key` is the resolved [`Self::key_id`]; handing over a different
-    /// key is a [`SignatureError::KeyMismatch`] rather than a silent
-    /// verification failure.
-    pub fn verify(
-        &self,
-        key: &Key,
-        digest: &EnvelopeSignatureDigest,
-    ) -> Result<(), SignatureError> {
-        let given = key.id();
-        if given != self.key_id {
-            return Err(SignatureError::KeyMismatch {
-                named: self.key_id,
-                given,
-            });
-        }
-        key.verify(&self.signature, digest)
-    }
 }
 
 /// A timestamp over an envelope, attested by a signature.
@@ -287,7 +257,7 @@ impl EnvelopeDigest {
 mod tests {
     use super::*;
     use crate::{
-        keys::{Ed25519PublicKey, Ed25519Signature, PublicKey, SignatureError},
+        keys::{Ed25519PublicKey, Ed25519Signature, Key, PublicKey},
         testutil::{assert_wire, hex, unhex},
     };
 
@@ -298,9 +268,9 @@ mod tests {
     //      a1 61 69           Msg::Init
     //        a1 01            InitMsg.state
     //          a1 01 a0       FullCheckpoint { namespaces: {} }
-    //    02 80                signatures = []
+    //    02 a0                signatures = {}
     //    03 80                timestamps = []
-    const INIT_ENVELOPE: &str = "a301a16169a101a101a002800380";
+    const INIT_ENVELOPE: &str = "a301a16169a101a101a002a00380";
 
     /// Round-trips the bytes rather than constructing a `Msg`, whose fields
     /// are private to its module.
@@ -316,38 +286,74 @@ mod tests {
         );
     }
 
-    /// A signature: the key id under `01` as a bare byte string, the
-    /// signature under `02` as a one-pair map naming its scheme.
-    fn signature() -> EnvelopeSignature {
-        EnvelopeSignature::new(
-            KeyId::from_bytes([0xef; 32]),
+    fn signature(byte: u8) -> (KeyId, Signature) {
+        (
+            KeyId::from_bytes([byte; 32]),
             Signature::Ed25519(Ed25519Signature::from_bytes([0xcd; 64])),
         )
     }
 
-    fn signature_hex() -> String {
-        format!("a2015820{}02a161655840{}", "ef".repeat(32), "cd".repeat(64))
+    /// One entry: the key id as a bare byte string, the signature as a
+    /// one-pair map naming its scheme.
+    fn entry_hex(byte: u8) -> String {
+        format!(
+            "5820{}a161655840{}",
+            format!("{byte:02x}").repeat(32),
+            "cd".repeat(64)
+        )
     }
 
-    /// `SignedTimestamp` is still an empty map (`a0`), so a populated list
-    /// is `81 a0`. Adding fields to it grows that map rather than changing
-    /// its major type.
+    /// Signatures are a map (`a1` for one pair), timestamps still an
+    /// array. `SignedTimestamp` is an empty map (`a0`), so a populated
+    /// list is `81 a0`.
     #[test]
-    fn signatures_and_timestamps_encode_as_arrays() {
-        assert_wire(&signature(), &signature_hex());
+    fn signatures_encode_as_a_map_and_timestamps_as_an_array() {
         assert_wire(&SignedTimestamp {}, "a0");
 
-        let signed = init_envelope().with_signature(signature());
+        let (id, sig) = signature(0xef);
+        let signed = init_envelope().with_signature(id, sig);
         assert_wire(
             &signed,
-            &format!("a301a16169a101a101a00281{}0380", signature_hex()),
+            &format!("a301a16169a101a101a002a1{}0380", entry_hex(0xef)),
         );
 
         let stamped = Envelope {
             timestamps: vec![SignedTimestamp {}],
             ..init_envelope()
         };
-        assert_wire(&stamped, "a301a16169a101a101a002800381a0");
+        assert_wire(&stamped, "a301a16169a101a101a002a00381a0");
+    }
+
+    /// The map has one canonical encoding: signatures come back in key-id
+    /// order however they were attached, and one key cannot sign twice.
+    #[test]
+    fn signatures_encode_in_key_id_order_however_they_are_attached() {
+        let (low, low_sig) = signature(0x11);
+        let (high, high_sig) = signature(0xee);
+
+        let ascending = init_envelope()
+            .with_signature(low, low_sig)
+            .with_signature(high, high_sig);
+        let descending = init_envelope()
+            .with_signature(high, high_sig)
+            .with_signature(low, low_sig);
+
+        assert_eq!(ascending, descending);
+        assert_eq!(ascending.digest().unwrap(), descending.digest().unwrap());
+        assert_wire(
+            &ascending,
+            &format!(
+                "a301a16169a101a101a002a2{}{}0380",
+                entry_hex(0x11),
+                entry_hex(0xee)
+            ),
+        );
+
+        // The same key signing again replaces, never accumulates.
+        let repeated = init_envelope()
+            .with_signature(low, low_sig)
+            .with_signature(low, low_sig);
+        assert_eq!(repeated.signatures().len(), 1);
     }
 
     /// The whole point of the second digest: a signer signs what the next
@@ -357,9 +363,9 @@ mod tests {
         let envelope = init_envelope();
         let unsigned = envelope.signature_digest().unwrap();
 
-        let signed = envelope
-            .with_signature(signature())
-            .with_signature(signature());
+        let (a, a_sig) = signature(0x11);
+        let (b, b_sig) = signature(0xee);
+        let signed = envelope.with_signature(a, a_sig).with_signature(b, b_sig);
         assert_eq!(signed.signature_digest().unwrap(), unsigned);
         assert_ne!(signed.digest().unwrap(), init_envelope().digest().unwrap());
     }
@@ -376,11 +382,10 @@ mod tests {
         );
     }
 
-    /// End to end: sign an envelope's signature digest, name the key by
-    /// id, and verify against the resolved key. A different key is refused
-    /// outright rather than failing as a bad signature.
+    /// End to end: sign an envelope's signature digest, file it under the
+    /// signer's key id, and verify it against the key filed there.
     #[test]
-    fn a_signature_verifies_against_the_key_it_names() {
+    fn a_signature_verifies_against_the_key_it_is_filed_under() {
         let signing = ed25519_zebra::SigningKey::from([7u8; 32]);
         let key = Key::new(
             PublicKey::Ed25519(Ed25519PublicKey::from_bytes(
@@ -391,26 +396,21 @@ mod tests {
 
         let envelope = init_envelope();
         let digest = envelope.signature_digest().unwrap();
-        let attached = EnvelopeSignature::new(
+        let signed = envelope.with_signature(
             key.id(),
             Signature::Ed25519(Ed25519Signature::from_bytes(
                 signing.sign(digest.as_bytes()).to_bytes(),
             )),
         );
 
-        assert_eq!(attached.verify(&key, &digest), Ok(()));
+        let attached = signed.signatures().get(&key.id()).unwrap();
+        assert_eq!(key.verify(attached, &digest), Ok(()));
 
         let other = Key::new(
             PublicKey::Ed25519(Ed25519PublicKey::from_bytes([0x01; 32])),
             1,
         );
-        assert_eq!(
-            attached.verify(&other, &digest),
-            Err(SignatureError::KeyMismatch {
-                named: key.id(),
-                given: other.id(),
-            })
-        );
+        assert!(other.verify(attached, &digest).is_err());
     }
 
     /// Only signatures are stripped, so a timestamp attached after signing
@@ -444,7 +444,7 @@ mod tests {
         // reproducible by inspection.
         assert_eq!(
             envelope.digest().unwrap().to_hex().as_ref(),
-            "c3cac0124e2d1b64457f8879766d3b10b1fe468887587222819351048e5de3ca",
+            "035fb73b4c287865dcf63e66a28abe1036ed6f8a346135eca14dd65be4cc1a32",
         );
     }
 
@@ -465,7 +465,8 @@ mod tests {
     #[test]
     fn digest_covers_signatures() {
         let unsigned = init_envelope();
-        let signed = init_envelope().with_signature(signature());
+        let (id, sig) = signature(0xef);
+        let signed = init_envelope().with_signature(id, sig);
 
         assert_eq!(unsigned.digest().unwrap(), unsigned.digest().unwrap());
         assert_ne!(unsigned.digest().unwrap(), signed.digest().unwrap());
@@ -474,8 +475,8 @@ mod tests {
         assert_eq!(
             signed.digest().unwrap().as_bytes(),
             blake3::hash(&unhex(&format!(
-                "a301a16169a101a101a00281{}0380",
-                signature_hex()
+                "a301a16169a101a101a002a1{}0380",
+                entry_hex(0xef)
             )))
             .as_bytes(),
         );

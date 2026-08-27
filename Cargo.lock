@@ -954,6 +954,7 @@ dependencies = [
 name = "state"
 version = "0.0.1"
 dependencies = [
+ "ed25519-zebra",
  "storage",
  "wire",
 ]

@@ -221,7 +221,7 @@ impl fmt::Display for Signature {
 ///
 /// Decoding does not check the bytes against the curve. Under ZIP 215 a
 /// key that fails to decompress makes the *signature* invalid, so
-/// rejecting it here would turn an envelope every node can weigh at zero
+/// rejecting it here would turn an envelope every node scores at zero
 /// into one some nodes cannot decode at all — the same disagreement the
 /// rule set exists to prevent.
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -320,8 +320,6 @@ impl<'de> Deserialize<'de> for Ed25519Signature {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SignatureError {
-    /// The key handed to verification is not the one the signature names.
-    KeyMismatch { named: KeyId, given: KeyId },
     /// Ed25519 verification failed under the ZIP 215 rules — a malformed
     /// key and a signature that simply doesn't match are both this.
     Ed25519(ed25519_zebra::Error),
@@ -330,9 +328,6 @@ pub enum SignatureError {
 impl fmt::Display for SignatureError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SignatureError::KeyMismatch { named, given } => {
-                write!(f, "signature names key {named}, verified against {given}")
-            }
             SignatureError::Ed25519(_) => f.write_str("ed25519 signature did not verify"),
         }
     }
@@ -341,7 +336,6 @@ impl fmt::Display for SignatureError {
 impl core::error::Error for SignatureError {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
-            SignatureError::KeyMismatch { .. } => None,
             SignatureError::Ed25519(err) => Some(err),
         }
     }

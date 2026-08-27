@@ -1,15 +1,18 @@
 //! The state a chain of envelopes folds down to.
 
+use std::collections::BTreeMap;
+
 use storage::{NamespaceOp, NodeKind, Resolution, Storage};
 use wire::{
-    Envelope, EnvelopeDigest, Msg,
+    Envelope, EnvelopeDigest, Msg, VerificationStatus,
+    keys::{Key, KeyId},
     msg::{
         AmendNamespaceKey, AmendOp, FullCheckpoint, Namespace, NamespaceKey, SetNamespaceKey, Value,
     },
     subkey::{Subkey, SubkeyPath},
 };
 
-use crate::{ApplyError, Error};
+use crate::{ApplyError, Error, TrustedKeysError, ValueError};
 
 /// The reserved namespace holding the minimum number of minutes every
 /// node must keep a message before it is eligible for compaction. Writes
@@ -23,6 +26,40 @@ pub const MIN_KEEP_MINUTES_KEY: &str = "_lotus_min_keep_minutes";
 /// The compaction floor in force when a chain never set
 /// [`MIN_KEEP_MINUTES_KEY`]: five days.
 pub const DEFAULT_MIN_KEEP_MINUTES: u32 = 5 * 24 * 60;
+
+/// The reserved namespace holding the least verified signature weight an
+/// envelope must carry to apply. Writes are validated: the value must be
+/// a [`Value::Int`] that is non-negative and fits a `u32`. Absent — or
+/// zero — nothing is required.
+///
+/// The threshold in force is the one at an envelope's *parent*, so
+/// raising it only binds what comes after. Raise it beyond what the
+/// trusted key set can produce and the chain accepts nothing further:
+/// the ledger will not second-guess an operator here.
+pub const MIN_ENVELOPE_WEIGHT_KEY: &str = "_lotus_min_envelope_weight";
+
+/// The reserved namespace holding the fewest distinct keys that must have
+/// verifiably signed an envelope for it to apply. Writes are validated:
+/// the value must be a [`Value::Int`] that is non-negative and fits a
+/// `u32`. Absent — or zero — nothing is required.
+///
+/// Distinct keys, not signatures: a key signing twice does not clear a
+/// threshold of two. Weight and count are separate knobs — one heavy
+/// signer can outweigh two light ones, but cannot stand in for them.
+pub const MIN_ENVELOPE_SIGNATURES_KEY: &str = "_lotus_min_envelope_signatures";
+
+/// The reserved namespace holding the keys whose signatures the ledger
+/// verifies signatures against: a [`Value::Map`] from a key's id, in
+/// [`Value::Key`] it names. Writes are validated — every entry must be a
+/// key filed under its own id. Absent, nothing is trusted.
+///
+/// A map rather than an array so a signature's key is one O(path) lookup
+/// and a single key can be added or revoked without rewriting the set.
+///
+/// A signer's weight is read from the set standing at an envelope's
+/// *parent*, which is fixed by its `prev` — so an envelope's weight is
+/// the same on every node and can never go stale.
+pub const TRUSTED_KEYS_KEY: &str = "_lotus_trusted_keys";
 
 /// The ledger, as of some position in the chain.
 ///
@@ -87,7 +124,12 @@ impl Ledger {
             .ok_or(Error::EmptyChain)
             .and_then(|envelope| Self::init(storage, envelope))?;
 
-        envelopes.try_for_each(|envelope| ledger.apply(storage, envelope))?;
+        envelopes.try_for_each(|envelope| {
+            let status = ledger.verify_envelope(storage, envelope)?;
+            let mut envelope = envelope.clone();
+            envelope.set_verification_status(status);
+            ledger.apply(storage, &envelope)
+        })?;
         Ok(ledger)
     }
 
@@ -97,6 +139,9 @@ impl Ledger {
     /// Everything is validated before the one commit, so a rejected
     /// envelope cannot half-apply. The version at the previous head is
     /// kept — other ledgers may be standing on it.
+    ///
+    /// The envelope must already have been validated and carry a validation
+    /// status, such as via an earlier call to verify_envelope.
     pub fn apply<S: Storage>(
         &mut self,
         storage: &mut S,
@@ -112,6 +157,8 @@ impl Ledger {
             });
         }
         let head = envelope.digest()?;
+
+        self.check_sig_thresholds(storage, envelope)?;
 
         let op = match msg {
             // Unreachable: Init is the only variant without a prev digest,
@@ -129,6 +176,8 @@ impl Ledger {
                 NamespaceOp::Delete(del.key.clone())
             }
         };
+
+        self.validate_nested(storage, &op)?;
 
         storage
             .commit(self.head, head, op)
@@ -294,20 +343,253 @@ impl Ledger {
             .unwrap_or(DEFAULT_MIN_KEEP_MINUTES))
     }
 
-    /// Validates the value `key` would hold after a write.
+    /// Returns the set of trusted keys at this state, under the reserved
+    /// [`TRUSTED_KEYS_KEY`] namespace. Absent, the set is empty.
     ///
-    /// The rules are looked up by key and judge the resulting value.
-    /// Today the lookup has one baked-in arm, for
-    /// [`MIN_KEEP_MINUTES_KEY`]; a schema published under a reserved key
-    /// can become another arm without the callers moving.
-    fn validate_value<E>(key: &NamespaceKey, value: &Value) -> Result<(), ApplyError<E>> {
-        let valid = match key.as_ref() {
-            MIN_KEEP_MINUTES_KEY => parse_min_keep(value).is_some(),
-            _ => true,
+    /// A set that is present but unreadable is an error, not an empty
+    /// set — unlike [`min_keep_minutes`](Self::min_keep_minutes), whose
+    /// fallback is a safe default. Falling back here would leave every
+    /// envelope at zero weight, silently disarming verification just
+    /// where the config says to arm it. Validation refuses malformed sets
+    /// at the boundary, so this fires only on one written by something
+    /// that did not enforce those rules.
+    pub fn trusted_keys<S: Storage>(
+        &self,
+        storage: &S,
+    ) -> Result<BTreeMap<KeyId, Key>, ApplyError<S::Error>> {
+        let key = NamespaceKey::try_new(TRUSTED_KEYS_KEY).expect("the reserved key is static");
+        self.namespace(storage, &key)
+            .map_err(ApplyError::Storage)?
+            .map_or_else(
+                || Ok(BTreeMap::new()),
+                |namespace| {
+                    parse_trusted_keys(&namespace.value).map_err(|reason| {
+                        ApplyError::InvalidValue {
+                            key: key.clone(),
+                            reason: ValueError::TrustedKeys(reason),
+                        }
+                    })
+                },
+            )
+    }
+
+    /// The least verified signature weight an envelope must carry to
+    /// apply at this position — the reserved [`MIN_ENVELOPE_WEIGHT_KEY`]
+    /// namespace. Absent, nothing is required.
+    pub fn min_envelope_weight<S: Storage>(
+        &self,
+        storage: &S,
+    ) -> Result<u32, ApplyError<S::Error>> {
+        self.threshold(
+            storage,
+            MIN_ENVELOPE_WEIGHT_KEY,
+            ValueError::MinEnvelopeWeight,
+        )
+    }
+
+    /// The fewest distinct keys that must have verifiably signed an
+    /// envelope for it to apply at this position — the reserved
+    /// [`MIN_ENVELOPE_SIGNATURES_KEY`] namespace. Absent, nothing is
+    /// required.
+    pub fn min_envelope_signatures<S: Storage>(
+        &self,
+        storage: &S,
+    ) -> Result<u32, ApplyError<S::Error>> {
+        self.threshold(
+            storage,
+            MIN_ENVELOPE_SIGNATURES_KEY,
+            ValueError::MinEnvelopeSignatures,
+        )
+    }
+
+    /// Reads a `u32` threshold out of a reserved namespace.
+    ///
+    /// Absent is no threshold; present but unreadable is an error, never
+    /// a silent zero. A guard that disarms itself when its own value is
+    /// corrupt is not a guard — the same reasoning as
+    /// [`trusted_keys`](Self::trusted_keys).
+    fn threshold<S: Storage>(
+        &self,
+        storage: &S,
+        namespace: &'static str,
+        reason: ValueError,
+    ) -> Result<u32, ApplyError<S::Error>> {
+        let key = NamespaceKey::try_new(namespace).expect("the reserved key is static");
+        self.namespace(storage, &key)
+            .map_err(ApplyError::Storage)?
+            .map_or(Ok(0), |namespace| {
+                parse_threshold(&namespace.value).ok_or(ApplyError::InvalidValue {
+                    key: key.clone(),
+                    reason,
+                })
+            })
+    }
+
+    /// Refuses an envelope that clears neither threshold in force here.
+    ///
+    /// Both are read from this ledger — the envelope's parent — so they
+    /// are the thresholds that were in force when it was written, not
+    /// whatever a node happens to hold now.
+    fn check_sig_thresholds<S: Storage>(
+        &self,
+        storage: &S,
+        envelope: &Envelope,
+    ) -> Result<(), ApplyError<S::Error>> {
+        let found = envelope.verification_status().signature_weight();
+        let required = self.min_envelope_weight(storage)?;
+        if found < required {
+            return Err(ApplyError::InsufficientWeight { required, found });
+        }
+
+        let found = envelope.verified_signers();
+        let required = self.min_envelope_signatures(storage)?;
+        if found < required {
+            return Err(ApplyError::InsufficientSignatures { required, found });
+        }
+
+        Ok(())
+    }
+
+    /// Verifies `envelope`'s signatures against the trusted key set,
+    /// yielding the verification result that can be used during fork
+    /// resolution.
+    ///
+    /// The set of valid keys is read from the state at the parent envelope.
+    ///
+    /// One signature that does not verify, or names a key the set does
+    /// not hold, fails the envelope outright — [`VerificationStatus::AllMatched`]
+    /// claims all of them matched. An envelope carrying no signatures is
+    /// checked and worth nothing, which is not the same as unchecked.
+    pub fn verify_envelope<S: Storage>(
+        &self,
+        storage: &S,
+        envelope: &Envelope,
+    ) -> Result<VerificationStatus, ApplyError<S::Error>> {
+        // Genesis has no parent: its signatures are verified against the
+        // key set it installs itself, so the ledger stands at the
+        // envelope itself.
+        let parent = match envelope.payload().prev_digest() {
+            Some(prev) => *prev,
+            None => envelope.digest()?,
         };
-        valid
-            .then_some(())
-            .ok_or_else(|| ApplyError::InvalidValue { key: key.clone() })
+        if parent != self.head {
+            return Err(ApplyError::ChainMismatch {
+                expected: self.head,
+                found: parent,
+            });
+        }
+
+        let signatures = envelope.signatures();
+        if signatures.is_empty() {
+            return Ok(VerificationStatus::AllMatched { total_weight: 0 });
+        }
+
+        let keys = self.trusted_keys(storage)?;
+        let digest = envelope.signature_digest()?;
+
+        // One signature per key by construction, so a key cannot pad the
+        // total by signing twice.
+        let total = signatures
+            .iter()
+            .try_fold(0u64, |total, (key_id, signature)| {
+                keys.get(key_id)
+                    .filter(|key| key.verify(signature, &digest).is_ok())
+                    .map(|key| total + u64::from(key.weight()))
+            });
+
+        Ok(match total {
+            // Saturating: weights are set by the ledger's own config, but
+            // a wrapped total would decide forks differently in a release
+            // build than a debug one.
+            Some(total) => VerificationStatus::AllMatched {
+                total_weight: u32::try_from(total).unwrap_or(u32::MAX),
+            },
+            None => VerificationStatus::Failed,
+        })
+    }
+
+    /// The rule judging what `key`'s namespace may hold, if it has one.
+    ///
+    /// Today the lookup has two baked-in arms; a schema published under a
+    /// reserved key can become another without the callers moving.
+    fn rule(key: &NamespaceKey) -> Option<Rule> {
+        match key.as_ref() {
+            MIN_KEEP_MINUTES_KEY => Some(|value| {
+                parse_min_keep(value)
+                    .map(|_| ())
+                    .ok_or(ValueError::MinKeepMinutes)
+            }),
+            MIN_ENVELOPE_WEIGHT_KEY => Some(|value| {
+                parse_threshold(value)
+                    .map(|_| ())
+                    .ok_or(ValueError::MinEnvelopeWeight)
+            }),
+            MIN_ENVELOPE_SIGNATURES_KEY => Some(|value| {
+                parse_threshold(value)
+                    .map(|_| ())
+                    .ok_or(ValueError::MinEnvelopeSignatures)
+            }),
+            TRUSTED_KEYS_KEY => Some(|value| {
+                parse_trusted_keys(value)
+                    .map(|_| ())
+                    .map_err(ValueError::TrustedKeys)
+            }),
+            _ => None,
+        }
+    }
+
+    /// Validates the whole value `key` would hold after a write.
+    fn validate_value<E>(key: &NamespaceKey, value: &Value) -> Result<(), ApplyError<E>> {
+        Self::rule(key)
+            .map_or(Ok(()), |rule| rule(value))
+            .map_err(|reason| ApplyError::InvalidValue {
+                key: key.clone(),
+                reason,
+            })
+    }
+
+    /// Re-judges a nested write against its namespace's rule.
+    ///
+    /// [`validate_value`](Self::validate_value) judges whole values, and
+    /// the `SetAt`/`AmendAt` paths check only the shape of the path they
+    /// walk — so a nested write could otherwise leave a reserved
+    /// namespace holding something a whole-value write would have been
+    /// refused for. Only namespaces with a rule are materialized; every
+    /// other write stays O(path).
+    fn validate_nested<S: Storage>(
+        &self,
+        storage: &S,
+        op: &NamespaceOp,
+    ) -> Result<(), ApplyError<S::Error>> {
+        match op {
+            NamespaceOp::SetAt { key, path, value } if Self::rule(key).is_some() => {
+                let mut result = self.ruled_value(storage, key)?;
+                storage::value::set_at(&mut result, path, value.clone());
+                Self::validate_value(key, &result)
+            }
+            NamespaceOp::AmendAt { key, path, op } if Self::rule(key).is_some() => {
+                let mut result = self.ruled_value(storage, key)?;
+                storage::value::amend_at(&mut result, path.as_ref(), op.clone());
+                Self::validate_value(key, &result)
+            }
+            // A whole-value write is judged where it is built; a delete
+            // leaves the namespace absent, which every rule allows.
+            _ => Ok(()),
+        }
+    }
+
+    /// The value a nested write is about to change. O(namespace), which
+    /// is why only ruled namespaces reach it.
+    fn ruled_value<S: Storage>(
+        &self,
+        storage: &S,
+        key: &NamespaceKey,
+    ) -> Result<Value, ApplyError<S::Error>> {
+        Ok(self
+            .namespace(storage, key)
+            .map_err(ApplyError::Storage)?
+            .expect("a nested write is pre-validated: the namespace exists")
+            .value)
     }
 
     /// The namespace stored under `key`, if the ledger holds one.
@@ -348,6 +630,47 @@ fn parse_min_keep(value: &Value) -> Option<u32> {
     }
 }
 
+/// Reads a threshold: a non-negative integer that fits a `u32`. Zero is
+/// legal and means the threshold is not in force.
+fn parse_threshold(value: &Value) -> Option<u32> {
+    match value {
+        Value::Int(n) => u32::try_from(*n).ok(),
+        _ => None,
+    }
+}
+
+/// Reads the trusted key set: a map from a key's hex id to the key.
+///
+/// `None` for anything else — a value that isn't a map, an entry that
+/// isn't a key, or a key filed under an id it doesn't derive to. That
+/// last check is what makes the map key trustworthy: a key filed under
+/// someone else's id would be unreachable by the signatures naming it,
+/// and reachable by ones that never signed under it.
+fn parse_trusted_keys(value: &Value) -> Result<BTreeMap<KeyId, Key>, TrustedKeysError> {
+    let Value::Map(entries) = value else {
+        return Err(TrustedKeysError::NotAMap);
+    };
+    entries
+        .iter()
+        .map(|(id, entry)| {
+            let Value::Key(key) = entry else {
+                return Err(TrustedKeysError::NotAKey { id: id.clone() });
+            };
+            let derived = key.id();
+            (id.as_str() == derived.to_hex().as_ref())
+                .then(|| (derived, key.clone()))
+                .ok_or_else(|| TrustedKeysError::IdMismatch {
+                    id: id.clone(),
+                    derived,
+                })
+        })
+        .collect()
+}
+
+/// A reserved namespace's rule: what its value must satisfy, and why it
+/// doesn't when it doesn't.
+type Rule = fn(&Value) -> Result<(), ValueError>;
+
 /// Why a path stopped short. Carries no context of its own; the caller
 /// pins the namespace and path onto it.
 enum Miss {
@@ -369,8 +692,12 @@ impl Miss {
 mod tests {
     use std::convert::Infallible;
 
+    use ed25519_zebra::SigningKey;
     use storage::MemStorage;
-    use wire::msg::{DeleteNamespace, IncrementDecrement, InitMsg, SetNamespace};
+    use wire::{
+        keys::{Ed25519PublicKey, Ed25519Signature, PublicKey, Signature},
+        msg::{DeleteNamespace, IncrementDecrement, InitMsg, SetNamespace},
+    };
 
     use super::*;
 
@@ -1013,7 +1340,7 @@ mod tests {
         let (mut store, mut ledger) = nested_ledger();
 
         let signer = Value::Key(wire::keys::Key::new(
-            wire::keys::PublicKey::Ed25519(wire::keys::Ed25519PublicKey::from_bytes([0xab; 32])),
+            PublicKey::Ed25519(Ed25519PublicKey::from_bytes([0xab; 32])),
             1,
         ));
         let envelope = set_key(ledger.head(), path([sub("signer")]), Some(signer.clone()));
@@ -1247,7 +1574,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            ApplyError::InvalidValue { key: k } if k == key(MIN_KEEP_MINUTES_KEY)
+            ApplyError::InvalidValue { key: k, .. } if k == key(MIN_KEEP_MINUTES_KEY)
         ));
         assert_eq!(ledger.head(), head, "head must not move");
         assert_eq!(ledger.min_keep_minutes(&store).unwrap(), 52);
@@ -1481,6 +1808,800 @@ mod tests {
         ));
     }
 
+    fn trusted_key(byte: u8, weight: u32) -> Key {
+        Key::new(
+            PublicKey::Ed25519(Ed25519PublicKey::from_bytes([byte; 32])),
+            weight,
+        )
+    }
+
+    fn set_keys(prev: EnvelopeDigest, value: Value) -> Envelope {
+        Envelope::new(Msg::SetNamespace(SetNamespace {
+            prev,
+            key: key(TRUSTED_KEYS_KEY),
+            namespace: Namespace { value },
+        }))
+    }
+
+    fn hex_id(key: &Key) -> String {
+        key.id().to_hex().as_ref().to_string()
+    }
+
+    /// The key set as it is stored: each key filed under its own hex id.
+    fn keys_map(keys: impl IntoIterator<Item = Key>) -> Value {
+        Value::Map(
+            keys.into_iter()
+                .map(|key| (hex_id(&key), Value::Key(key)))
+                .collect(),
+        )
+    }
+
+    /// The key set is namespace data under a reserved key, versioned per
+    /// position — which is what lets an envelope be verified against the
+    /// set standing at its parent rather than the node's current head.
+    #[test]
+    fn trusted_keys_read_the_reserved_namespace() {
+        let (mut store, mut ledger) = setup(&init());
+        let before = ledger.head();
+        assert!(ledger.trusted_keys(&store).unwrap().is_empty());
+
+        let alice = trusted_key(0xaa, 3);
+        let bob = trusted_key(0xbb, 1);
+        ledger
+            .apply(
+                &mut store,
+                &set_keys(ledger.head(), keys_map([alice.clone(), bob.clone()])),
+            )
+            .unwrap();
+
+        let keys = ledger.trusted_keys(&store).unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys.get(&alice.id()), Some(&alice));
+        assert_eq!(keys.get(&bob.id()).map(Key::weight), Some(1));
+
+        // The old head still sees the set that was in force there.
+        let past = Ledger::open(&store, before).unwrap();
+        assert!(past.trusted_keys(&store).unwrap().is_empty());
+
+        // Deleting the namespace trusts nothing again.
+        ledger
+            .apply(&mut store, &delete(ledger.head(), TRUSTED_KEYS_KEY))
+            .unwrap();
+        assert!(ledger.trusted_keys(&store).unwrap().is_empty());
+    }
+
+    /// Updates to the reserved key set are validated at apply: anything
+    /// but a map of keys filed under their own ids is refused before the
+    /// commit.
+    #[test]
+    fn apply_rejects_an_invalid_trusted_key_set() {
+        let alice = trusted_key(0xaa, 1);
+        let bob_id = hex_id(&trusted_key(0xbb, 1));
+        let mismatch = |id: &str| TrustedKeysError::IdMismatch {
+            id: id.to_string(),
+            derived: alice.id(),
+        };
+        let upper = hex_id(&alice).to_uppercase();
+        let truncated = hex_id(&alice)[..32].to_string();
+
+        // Each case names the reason it must be refused with, so a rule
+        // that refuses everything for the wrong reason still fails.
+        let invalid = [
+            (Value::String("alice".into()), TrustedKeysError::NotAMap),
+            (
+                Value::Array(vec![Value::Key(alice.clone())]),
+                TrustedKeysError::NotAMap,
+            ),
+            (Value::Key(alice.clone()), TrustedKeysError::NotAMap),
+            // An entry that isn't a key.
+            (
+                map([("id", Value::Int(1))]),
+                TrustedKeysError::NotAKey {
+                    id: "id".to_string(),
+                },
+            ),
+            // A key filed under someone else's id.
+            (
+                Value::Map([(bob_id.clone(), Value::Key(alice.clone()))].into()),
+                mismatch(&bob_id),
+            ),
+            // A key filed under an id that isn't hex at all.
+            (
+                Value::Map([("alice".to_string(), Value::Key(alice.clone()))].into()),
+                mismatch("alice"),
+            ),
+            // The right id, but not in the lowercase-hex canonical form:
+            // two spellings of one id would be two entries in the map.
+            (
+                Value::Map([(upper.clone(), Value::Key(alice.clone()))].into()),
+                mismatch(&upper),
+            ),
+            // The right id, truncated.
+            (
+                Value::Map([(truncated.clone(), Value::Key(alice.clone()))].into()),
+                mismatch(&truncated),
+            ),
+        ];
+
+        for (value, reason) in invalid {
+            let (mut store, mut ledger) = setup(&init());
+            let head = ledger.head();
+
+            let err = ledger
+                .apply(&mut store, &set_keys(head, value))
+                .unwrap_err();
+
+            assert!(
+                matches!(
+                    &err,
+                    ApplyError::InvalidValue { key: k, reason: r }
+                        if *k == key(TRUSTED_KEYS_KEY)
+                            && *r == ValueError::TrustedKeys(reason.clone())
+                ),
+                "expected {reason:?}, got {err:?}"
+            );
+            assert_eq!(ledger.head(), head, "head must not move");
+            assert!(ledger.trusted_keys(&store).unwrap().is_empty());
+        }
+    }
+
+    fn signing_key(seed: u8) -> SigningKey {
+        SigningKey::from([seed; 32])
+    }
+
+    fn public_key(signing: &SigningKey) -> PublicKey {
+        PublicKey::Ed25519(Ed25519PublicKey::from_bytes(
+            signing.verification_key().into(),
+        ))
+    }
+
+    /// Signs `envelope`'s signature digest with `signing`, naming the key
+    /// by the id the trusted set files it under.
+    /// Signs `envelope`'s signature digest and files it under the signer's
+    /// key id. Attaching a signature never changes that digest, so this
+    /// composes however many times.
+    fn sign(envelope: Envelope, signing: &SigningKey) -> Envelope {
+        let digest = envelope.signature_digest().unwrap();
+        let signature = Signature::Ed25519(Ed25519Signature::from_bytes(
+            signing.sign(digest.as_bytes()).to_bytes(),
+        ));
+        envelope.with_signature(public_key(signing).id(), signature)
+    }
+
+    /// A ledger whose trusted set holds `keys`, and an envelope chaining
+    /// onto it ready to be signed.
+    fn verifying_ledger(keys: impl IntoIterator<Item = Key>) -> (MemStorage, Ledger) {
+        let (mut store, mut ledger) = setup(&init());
+        ledger
+            .apply(&mut store, &set_keys(ledger.head(), keys_map(keys)))
+            .unwrap();
+        (store, ledger)
+    }
+
+    fn unsigned(prev: EnvelopeDigest) -> Envelope {
+        set(prev, "n", "1")
+    }
+
+    /// An envelope carrying nothing is checked and worth nothing — which
+    /// is not the same as never having been checked.
+    #[test]
+    fn an_unsigned_envelope_verifies_at_zero_weight() {
+        let (store, ledger) = verifying_ledger([]);
+        assert_eq!(
+            ledger
+                .verify_envelope(&store, &unsigned(ledger.head()))
+                .unwrap(),
+            VerificationStatus::AllMatched { total_weight: 0 }
+        );
+    }
+
+    /// The weights come from the key set standing at the parent.
+    #[test]
+    fn signatures_are_weighted_by_their_keys() {
+        let alice = signing_key(1);
+        let bob = signing_key(2);
+        let (store, ledger) = verifying_ledger([
+            Key::new(public_key(&alice), 3),
+            Key::new(public_key(&bob), 4),
+        ]);
+
+        let envelope = unsigned(ledger.head());
+        let one = sign(envelope.clone(), &alice);
+        assert_eq!(
+            ledger.verify_envelope(&store, &one).unwrap(),
+            VerificationStatus::AllMatched { total_weight: 3 }
+        );
+
+        let both = sign(one, &bob);
+        assert_eq!(
+            ledger.verify_envelope(&store, &both).unwrap(),
+            VerificationStatus::AllMatched { total_weight: 7 }
+        );
+    }
+
+    /// The same key signing again replaces its signature rather than
+    /// adding one, so a padded list cannot multiply what a key is worth.
+    #[test]
+    fn a_key_signing_twice_counts_once() {
+        let alice = signing_key(1);
+        let (store, ledger) = verifying_ledger([Key::new(public_key(&alice), 3)]);
+
+        let envelope = unsigned(ledger.head());
+        let padded = sign(sign(envelope, &alice), &alice);
+
+        assert_eq!(padded.signatures().len(), 1);
+        assert_eq!(
+            ledger.verify_envelope(&store, &padded).unwrap(),
+            VerificationStatus::AllMatched { total_weight: 3 }
+        );
+    }
+
+    /// `AllMatched` claims every signature matched, so one that does not
+    /// fails the envelope rather than merely contributing nothing.
+    #[test]
+    fn one_bad_signature_fails_the_envelope() {
+        let alice = signing_key(1);
+        let mallory = signing_key(9);
+        let (store, ledger) = verifying_ledger([Key::new(public_key(&alice), 3)]);
+        let envelope = unsigned(ledger.head());
+
+        // A key the set does not hold.
+        let unknown = sign(envelope.clone(), &mallory);
+        assert_eq!(
+            ledger.verify_envelope(&store, &unknown).unwrap(),
+            VerificationStatus::Failed
+        );
+
+        // A trusted key, but a signature over something else.
+        let elsewhere = sign(set(ledger.head(), "other", "1"), &alice);
+        let forged = envelope.clone().with_signature(
+            public_key(&alice).id(),
+            *elsewhere.signatures().values().next().unwrap(),
+        );
+        assert_eq!(
+            ledger.verify_envelope(&store, &forged).unwrap(),
+            VerificationStatus::Failed
+        );
+
+        // One good signature does not rescue one bad one.
+        let mixed = sign(sign(envelope.clone(), &alice), &mallory);
+        assert_eq!(
+            ledger.verify_envelope(&store, &mixed).unwrap(),
+            VerificationStatus::Failed
+        );
+    }
+
+    /// Weights come from the ledger's own config, so a total that
+    /// overflows is possible — and must clamp rather than wrap, or the
+    /// same fork would resolve differently in a release build.
+    #[test]
+    fn an_overflowing_total_weight_saturates() {
+        let alice = signing_key(1);
+        let bob = signing_key(2);
+        let (store, ledger) = verifying_ledger([
+            Key::new(public_key(&alice), u32::MAX),
+            Key::new(public_key(&bob), u32::MAX),
+        ]);
+
+        let envelope = unsigned(ledger.head());
+        let both = sign(sign(envelope.clone(), &alice), &bob);
+
+        assert_eq!(
+            ledger.verify_envelope(&store, &both).unwrap(),
+            VerificationStatus::AllMatched {
+                total_weight: u32::MAX
+            }
+        );
+    }
+
+    /// An unreadable key set is an error, not a silent zero: verification
+    /// refuses to guess at what a corrupt set meant to say.
+    #[test]
+    fn verifying_against_an_unreadable_key_set_errors() {
+        let alice = signing_key(1);
+        let (mut store, ledger) = verifying_ledger([Key::new(public_key(&alice), 3)]);
+
+        let envelope = unsigned(ledger.head());
+        let signed = sign(envelope.clone(), &alice);
+
+        // Installed straight into the store, the way an implementation
+        // that did not enforce the rules would leave it.
+        store
+            .install(
+                ledger.head(),
+                [(
+                    key(TRUSTED_KEYS_KEY),
+                    Namespace {
+                        value: Value::String("alice".into()),
+                    },
+                )],
+            )
+            .unwrap();
+
+        let err = ledger.verify_envelope(&store, &signed).unwrap_err();
+        assert!(matches!(
+            err,
+            ApplyError::InvalidValue {
+                reason: ValueError::TrustedKeys(TrustedKeysError::NotAMap),
+                ..
+            }
+        ));
+    }
+
+    /// Revoking a key takes effect for what comes after it, and cannot
+    /// reach back: an envelope is always verified at its own parent.
+    #[test]
+    fn revoking_a_key_only_affects_envelopes_after_it() {
+        let alice = signing_key(1);
+        let (mut store, mut ledger) = verifying_ledger([Key::new(public_key(&alice), 3)]);
+
+        let before = unsigned(ledger.head());
+        let signed_before = sign(before.clone(), &alice);
+        assert_eq!(
+            ledger.verify_envelope(&store, &signed_before).unwrap(),
+            VerificationStatus::AllMatched { total_weight: 3 }
+        );
+
+        ledger
+            .apply(&mut store, &set_keys(ledger.head(), keys_map([])))
+            .unwrap();
+
+        // Signed by the same key, but chaining onto the revocation.
+        let after = unsigned(ledger.head());
+        let signed_after = sign(after.clone(), &alice);
+        assert_eq!(
+            ledger.verify_envelope(&store, &signed_after).unwrap(),
+            VerificationStatus::Failed
+        );
+    }
+
+    /// Standing anywhere but the envelope's parent is refused outright —
+    /// a ledger that has moved on holds a key set that was never in force
+    /// for the envelope, and a weight taken from it would be fiction.
+    #[test]
+    fn verifying_from_the_wrong_position_is_refused() {
+        let alice = signing_key(1);
+        let (mut store, mut ledger) = verifying_ledger([Key::new(public_key(&alice), 3)]);
+
+        let parent = ledger.head();
+        let envelope = unsigned(parent);
+        let signed = sign(envelope.clone(), &alice);
+
+        ledger
+            .apply(&mut store, &set(parent, "elsewhere", "1"))
+            .unwrap();
+        let moved_on = ledger.head();
+
+        let err = ledger.verify_envelope(&store, &signed).unwrap_err();
+        assert!(matches!(
+            err,
+            ApplyError::ChainMismatch { expected, found }
+                if expected == moved_on && found == parent
+        ));
+    }
+
+    /// A set that reaches a reader unreadable — written by something that
+    /// did not enforce the rules — is an error, not an empty set. Falling
+    /// back to empty would leave every envelope at zero weight.
+    #[test]
+    fn reading_an_unreadable_key_set_is_an_error() {
+        let alice = trusted_key(0xaa, 3);
+        let (mut store, ledger) = setup(&Envelope::new(Msg::Init(InitMsg {
+            state: FullCheckpoint {
+                namespaces: [(key("n"), ns("1"))].into_iter().collect(),
+            },
+        })));
+
+        // Installed straight into the store, bypassing the boundary the
+        // way a foreign implementation with laxer rules would.
+        store
+            .install(
+                ledger.head(),
+                [(
+                    key(TRUSTED_KEYS_KEY),
+                    Namespace {
+                        value: Value::Map(
+                            [(hex_id(&trusted_key(0xbb, 1)), Value::Key(alice.clone()))].into(),
+                        ),
+                    },
+                )],
+            )
+            .unwrap();
+
+        let err = ledger.trusted_keys(&store).unwrap_err();
+        assert!(matches!(
+            err,
+            ApplyError::InvalidValue {
+                reason: ValueError::TrustedKeys(TrustedKeysError::IdMismatch { .. }),
+                ..
+            }
+        ));
+    }
+
+    /// An empty set is legal — a chain can revoke every key without
+    /// deleting the namespace.
+    #[test]
+    fn an_empty_trusted_key_set_is_valid() {
+        let (mut store, mut ledger) = setup(&init());
+        ledger
+            .apply(&mut store, &set_keys(ledger.head(), keys_map([])))
+            .unwrap();
+        assert!(ledger.trusted_keys(&store).unwrap().is_empty());
+    }
+
+    /// The id a key is filed under must be exactly what the key derives
+    /// to, in lowercase hex — the form [`KeyId::to_hex`] produces.
+    #[test]
+    fn a_key_is_filed_under_its_own_lowercase_hex_id() {
+        let alice = trusted_key(0xaa, 3);
+        let id = hex_id(&alice);
+
+        assert_eq!(id.len(), 64);
+        assert!(
+            id.chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        );
+
+        let (mut store, mut ledger) = setup(&init());
+        ledger
+            .apply(
+                &mut store,
+                &set_keys(
+                    ledger.head(),
+                    Value::Map([(id, Value::Key(alice.clone()))].into()),
+                ),
+            )
+            .unwrap();
+
+        assert_eq!(
+            ledger.trusted_keys(&store).unwrap().get(&alice.id()),
+            Some(&alice)
+        );
+    }
+
+    /// The point of the map form: rotate one key by path, leaving the
+    /// rest of the set untouched.
+    #[test]
+    fn a_key_can_be_added_and_revoked_by_path() {
+        let (mut store, mut ledger) = setup(&init());
+        let alice = trusted_key(0xaa, 3);
+        let bob = trusted_key(0xbb, 1);
+        ledger
+            .apply(
+                &mut store,
+                &set_keys(ledger.head(), keys_map([alice.clone()])),
+            )
+            .unwrap();
+
+        ledger
+            .apply(
+                &mut store,
+                &set_key_in(
+                    ledger.head(),
+                    TRUSTED_KEYS_KEY,
+                    path([sub(&hex_id(&bob))]),
+                    Some(Value::Key(bob.clone())),
+                ),
+            )
+            .unwrap();
+        assert_eq!(ledger.trusted_keys(&store).unwrap().len(), 2);
+
+        ledger
+            .apply(
+                &mut store,
+                &set_key_in(
+                    ledger.head(),
+                    TRUSTED_KEYS_KEY,
+                    path([sub(&hex_id(&alice))]),
+                    None,
+                ),
+            )
+            .unwrap();
+        let keys = ledger.trusted_keys(&store).unwrap();
+        assert_eq!(keys.keys().copied().collect::<Vec<_>>(), vec![bob.id()]);
+    }
+
+    /// A nested write is judged by the same rule as a whole-value write:
+    /// without that, a path could quietly leave the set unreadable, and
+    /// an unreadable set leaves every envelope at zero weight.
+    #[test]
+    fn a_nested_write_cannot_corrupt_the_trusted_key_set() {
+        let alice = trusted_key(0xaa, 3);
+        let bob_id = hex_id(&trusted_key(0xbb, 1));
+        let upper = hex_id(&alice).to_uppercase();
+        let mismatch = |id: &str| TrustedKeysError::IdMismatch {
+            id: id.to_string(),
+            derived: alice.id(),
+        };
+
+        let corrupting = [
+            // Garbage in place of a key.
+            (
+                path([sub(&hex_id(&alice))]),
+                Some(Value::Int(1)),
+                TrustedKeysError::NotAKey { id: hex_id(&alice) },
+            ),
+            // A key filed under an id it doesn't derive to.
+            (
+                path([sub(&bob_id)]),
+                Some(Value::Key(alice.clone())),
+                mismatch(&bob_id),
+            ),
+            // Its own id, uppercased — the id is right, the spelling isn't.
+            (
+                path([sub(&upper)]),
+                Some(Value::Key(alice.clone())),
+                mismatch(&upper),
+            ),
+        ];
+
+        for (p, value, reason) in corrupting {
+            let (mut store, mut ledger) = setup(&init());
+            ledger
+                .apply(
+                    &mut store,
+                    &set_keys(ledger.head(), keys_map([alice.clone()])),
+                )
+                .unwrap();
+            let head = ledger.head();
+
+            let err = ledger
+                .apply(&mut store, &set_key_in(head, TRUSTED_KEYS_KEY, p, value))
+                .unwrap_err();
+
+            assert!(
+                matches!(
+                    &err,
+                    ApplyError::InvalidValue { key: k, reason: r }
+                        if *k == key(TRUSTED_KEYS_KEY)
+                            && *r == ValueError::TrustedKeys(reason.clone())
+                ),
+                "expected {reason:?}, got {err:?}"
+            );
+            assert_eq!(ledger.head(), head, "head must not move");
+            assert_eq!(ledger.trusted_keys(&store).unwrap().len(), 1);
+        }
+    }
+
+    /// The same guard on the amend path. Appending onto a key is already
+    /// refused as a shape error, but appending under a *fresh* id is a
+    /// legal shape — it conjures a one-entry array where a key belongs,
+    /// and only the namespace's rule catches that.
+    #[test]
+    fn a_nested_amend_cannot_corrupt_the_trusted_key_set() {
+        let alice = trusted_key(0xaa, 3);
+        let amend_keys = |prev, p| {
+            Envelope::new(Msg::AmendNamespaceKey(AmendNamespaceKey {
+                prev,
+                key: key(TRUSTED_KEYS_KEY),
+                path: Some(p),
+                op: append("x"),
+            }))
+        };
+
+        let (mut store, mut ledger) = setup(&init());
+        ledger
+            .apply(
+                &mut store,
+                &set_keys(ledger.head(), keys_map([alice.clone()])),
+            )
+            .unwrap();
+        let head = ledger.head();
+
+        // Onto the key itself: a leaf is not an array.
+        let err = ledger
+            .apply(&mut store, &amend_keys(head, path([sub(&hex_id(&alice))])))
+            .unwrap_err();
+        assert!(matches!(err, ApplyError::AmendTypeMismatch { .. }));
+
+        // Under an id holding nothing: shapes fine, rule refuses.
+        let err = ledger
+            .apply(
+                &mut store,
+                &amend_keys(head, path([sub(&hex_id(&trusted_key(0xbb, 1)))])),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ApplyError::InvalidValue { key: k, .. } if k == key(TRUSTED_KEYS_KEY)
+        ));
+
+        assert_eq!(ledger.head(), head, "head must not move");
+        assert_eq!(ledger.trusted_keys(&store).unwrap().len(), 1);
+    }
+
+    fn set_key_in(prev: EnvelopeDigest, k: &str, p: SubkeyPath, value: Option<Value>) -> Envelope {
+        Envelope::new(Msg::SetNamespaceKey(SetNamespaceKey {
+            prev,
+            key: key(k),
+            path: p,
+            value,
+        }))
+    }
+
+    fn set_reserved(prev: EnvelopeDigest, k: &str, value: Value) -> Envelope {
+        Envelope::new(Msg::SetNamespace(SetNamespace {
+            prev,
+            key: key(k),
+            namespace: Namespace { value },
+        }))
+    }
+
+    /// Both thresholds read the reserved namespace, default to nothing
+    /// required, and are versioned per position like any other config.
+    #[test]
+    fn thresholds_read_their_reserved_namespaces() {
+        let alice = signing_key(1);
+        let bob = signing_key(2);
+
+        for namespace in [MIN_ENVELOPE_WEIGHT_KEY, MIN_ENVELOPE_SIGNATURES_KEY] {
+            let read = |store: &MemStorage, ledger: &Ledger| {
+                if namespace == MIN_ENVELOPE_WEIGHT_KEY {
+                    ledger.min_envelope_weight(store).unwrap()
+                } else {
+                    ledger.min_envelope_signatures(store).unwrap()
+                }
+            };
+
+            let (mut store, mut ledger) = verifying_ledger([
+                Key::new(public_key(&alice), 3),
+                Key::new(public_key(&bob), 1),
+            ]);
+            let before = ledger.head();
+            assert_eq!(read(&store, &ledger), 0, "{namespace} defaults to nothing");
+
+            ledger
+                .apply(
+                    &mut store,
+                    &set_reserved(ledger.head(), namespace, Value::Int(2)),
+                )
+                .unwrap();
+            assert_eq!(read(&store, &ledger), 2);
+
+            // The old head still sees what was in force there.
+            let past = Ledger::open(&store, before).unwrap();
+            assert_eq!(read(&store, &past), 0);
+
+            // Deleting the namespace has to clear the threshold it
+            // installed — the floor binds the envelope that lifts it.
+            let removal = delete(ledger.head(), namespace);
+            let signed = verified(&store, &ledger, sign(sign(removal.clone(), &alice), &bob));
+            ledger.apply(&mut store, &signed).unwrap();
+            assert_eq!(read(&store, &ledger), 0);
+        }
+    }
+
+    /// Zero is legal — the threshold present but not in force — while
+    /// anything that isn't a non-negative `u32` is refused at apply.
+    #[test]
+    fn apply_rejects_an_invalid_threshold() {
+        let cases = [
+            (MIN_ENVELOPE_WEIGHT_KEY, ValueError::MinEnvelopeWeight),
+            (
+                MIN_ENVELOPE_SIGNATURES_KEY,
+                ValueError::MinEnvelopeSignatures,
+            ),
+        ];
+        let invalid = [
+            Value::String("two".into()),
+            Value::Int(-1),
+            Value::Int(i64::from(u32::MAX) + 1),
+            Value::Bool(true),
+            map([]),
+        ];
+
+        for (namespace, reason) in cases {
+            // Zero is a legal threshold, unlike the compaction floor.
+            let (mut store, mut ledger) = setup(&init());
+            ledger
+                .apply(
+                    &mut store,
+                    &set_reserved(ledger.head(), namespace, Value::Int(0)),
+                )
+                .unwrap();
+
+            for value in invalid.clone() {
+                let (mut store, mut ledger) = setup(&init());
+                let head = ledger.head();
+
+                let err = ledger
+                    .apply(&mut store, &set_reserved(head, namespace, value))
+                    .unwrap_err();
+
+                assert!(
+                    matches!(
+                        &err,
+                        ApplyError::InvalidValue { key: k, reason: r }
+                            if *k == key(namespace) && *r == reason
+                    ),
+                    "expected {reason:?}, got {err:?}"
+                );
+                assert_eq!(ledger.head(), head, "head must not move");
+            }
+        }
+    }
+
+    /// An envelope worth less than the floor in force does not apply.
+    #[test]
+    fn apply_refuses_an_envelope_below_the_weight_floor() {
+        let alice = signing_key(1);
+        let (mut store, mut ledger) = verifying_ledger([Key::new(public_key(&alice), 3)]);
+        ledger
+            .apply(
+                &mut store,
+                &set_reserved(ledger.head(), MIN_ENVELOPE_WEIGHT_KEY, Value::Int(3)),
+            )
+            .unwrap();
+        let head = ledger.head();
+
+        // Unsigned: verified, and worth nothing.
+        let bare = unsigned(head);
+        let err = ledger.apply(&mut store, &bare).unwrap_err();
+        assert!(matches!(
+            err,
+            ApplyError::InsufficientWeight {
+                required: 3,
+                found: 0
+            }
+        ));
+        assert_eq!(ledger.head(), head, "head must not move");
+
+        // Signed by a key worth exactly the floor: clears it.
+        let signed = verified(&store, &ledger, sign(bare, &alice));
+        ledger.apply(&mut store, &signed).unwrap();
+        assert_ne!(ledger.head(), head);
+    }
+
+    /// The count is of distinct keys, so one key signing twice does not
+    /// stand in for two signers however heavy it is.
+    #[test]
+    fn apply_refuses_an_envelope_below_the_signature_floor() {
+        let alice = signing_key(1);
+        let bob = signing_key(2);
+        let (mut store, mut ledger) = verifying_ledger([
+            Key::new(public_key(&alice), 9),
+            Key::new(public_key(&bob), 1),
+        ]);
+        ledger
+            .apply(
+                &mut store,
+                &set_reserved(ledger.head(), MIN_ENVELOPE_SIGNATURES_KEY, Value::Int(2)),
+            )
+            .unwrap();
+        let head = ledger.head();
+
+        let envelope = unsigned(head);
+
+        // One heavy signer, counted once however many times it signs —
+        // the second signature replaces the first rather than adding one.
+        let padded = verified(
+            &store,
+            &ledger,
+            sign(sign(envelope.clone(), &alice), &alice),
+        );
+        let err = ledger.apply(&mut store, &padded).unwrap_err();
+        assert!(matches!(
+            err,
+            ApplyError::InsufficientSignatures {
+                required: 2,
+                found: 1
+            }
+        ));
+        assert_eq!(ledger.head(), head, "head must not move");
+
+        // Two distinct signers clear it, however light the second is.
+        let both = verified(&store, &ledger, sign(sign(envelope.clone(), &alice), &bob));
+        ledger.apply(&mut store, &both).unwrap();
+        assert_ne!(ledger.head(), head);
+    }
+
+    /// Attaches the status `Chain` would have attached before storing.
+    fn verified(store: &MemStorage, ledger: &Ledger, mut envelope: Envelope) -> Envelope {
+        let status = ledger.verify_envelope(store, &envelope).unwrap();
+        envelope.set_verification_status(status);
+        envelope
+    }
+
     fn set_minutes(prev: EnvelopeDigest, value: Value) -> Envelope {
         Envelope::new(Msg::SetNamespace(SetNamespace {
             prev,
@@ -1543,7 +2664,7 @@ mod tests {
 
             assert!(matches!(
                 err,
-                ApplyError::InvalidValue { key: k } if k == key(MIN_KEEP_MINUTES_KEY)
+                ApplyError::InvalidValue { key: k, .. } if k == key(MIN_KEEP_MINUTES_KEY)
             ));
             assert_eq!(ledger.head(), head, "head must not move");
             assert_eq!(

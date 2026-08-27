@@ -9,3 +9,6 @@ publish.workspace = true
 [dependencies]
 storage.workspace = true
 wire.workspace = true
+
+[dev-dependencies]
+ed25519-zebra.workspace = true

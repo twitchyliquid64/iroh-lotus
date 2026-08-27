@@ -2,7 +2,7 @@
 
 use core::fmt;
 
-use wire::{EnvelopeDigest, msg::NamespaceKey, subkey::SubkeyPath};
+use wire::{EnvelopeDigest, keys::KeyId, msg::NamespaceKey, subkey::SubkeyPath};
 
 /// An error produced while working with a ledger.
 ///
@@ -98,10 +98,116 @@ pub enum ApplyError<E> {
     InvalidValue {
         /// The namespace whose rules refused the value.
         key: NamespaceKey,
+        /// Which rule refused it, and why.
+        reason: ValueError,
+    },
+    /// The envelope's verified signature weight is below the minimum the
+    /// ledger requires at this position.
+    InsufficientWeight {
+        /// The minimum in force.
+        required: u32,
+        /// What the envelope's signatures are verified to be worth.
+        found: u32,
+    },
+    /// Fewer distinct keys have verifiably signed the envelope than the
+    /// ledger requires at this position.
+    InsufficientSignatures {
+        /// The minimum in force.
+        required: u32,
+        /// How many distinct keys verifiably signed.
+        found: u32,
     },
     /// The storage backend failed.
     Storage(E),
 }
+
+/// Why a reserved namespace refused the value a write would leave it
+/// holding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ValueError {
+    /// The compaction floor is not a positive integer that fits a `u32`.
+    MinKeepMinutes,
+    /// The minimum envelope weight is not a non-negative integer that
+    /// fits a `u32`.
+    MinEnvelopeWeight,
+    /// The minimum envelope signature count is not a non-negative integer
+    /// that fits a `u32`.
+    MinEnvelopeSignatures,
+    /// The trusted key set could not be read.
+    TrustedKeys(TrustedKeysError),
+}
+
+impl fmt::Display for ValueError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ValueError::MinKeepMinutes => {
+                f.write_str("the compaction floor must be a positive whole number of minutes")
+            }
+            ValueError::MinEnvelopeWeight => {
+                f.write_str("the minimum envelope weight must be a non-negative whole number")
+            }
+            ValueError::MinEnvelopeSignatures => f.write_str(
+                "the minimum envelope signature count must be a non-negative whole number",
+            ),
+            ValueError::TrustedKeys(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl core::error::Error for ValueError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            ValueError::MinKeepMinutes
+            | ValueError::MinEnvelopeWeight
+            | ValueError::MinEnvelopeSignatures => None,
+            ValueError::TrustedKeys(err) => Some(err),
+        }
+    }
+}
+
+/// Why a trusted key set could not be read.
+///
+/// Every variant is refused at validation, so reading one back out of a
+/// ledger means the set was written by something that did not enforce
+/// these rules — an older or foreign implementation, or a corrupt store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TrustedKeysError {
+    /// The namespace holds something other than a map of keys.
+    NotAMap,
+    /// The entry filed under `id` is not a key.
+    NotAKey {
+        /// The id the entry is filed under.
+        id: String,
+    },
+    /// The key filed under `id` derives to a different id — so the
+    /// signatures naming it could never find it.
+    IdMismatch {
+        /// The id the key is filed under.
+        id: String,
+        /// The id the key actually derives to.
+        derived: KeyId,
+    },
+}
+
+impl fmt::Display for TrustedKeysError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TrustedKeysError::NotAMap => {
+                f.write_str("the trusted key set must be a map of hex key id to key")
+            }
+            TrustedKeysError::NotAKey { id } => {
+                write!(f, "the entry under {id} is not a key")
+            }
+            TrustedKeysError::IdMismatch { id, derived } => {
+                write!(f, "the key filed under {id} derives to {derived}")
+            }
+        }
+    }
+}
+
+impl core::error::Error for TrustedKeysError {}
 
 impl<E> fmt::Display for Error<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -156,8 +262,20 @@ impl<E> fmt::Display for ApplyError<E> {
                     Target(path)
                 )
             }
-            ApplyError::InvalidValue { key } => {
-                write!(f, "value not valid for namespace {key}")
+            ApplyError::InvalidValue { key, reason } => {
+                write!(f, "namespace {key} refused the value: {reason}")
+            }
+            ApplyError::InsufficientWeight { required, found } => {
+                write!(
+                    f,
+                    "envelope is worth {found}, below the minimum weight of {required}"
+                )
+            }
+            ApplyError::InsufficientSignatures { required, found } => {
+                write!(
+                    f,
+                    "envelope carries {found} verified signatures, below the minimum of {required}"
+                )
             }
             ApplyError::Storage(_) => f.write_str("storage backend failed"),
         }
@@ -194,6 +312,7 @@ impl<E: core::error::Error + 'static> core::error::Error for ApplyError<E> {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             ApplyError::Wire(err) => Some(err),
+            ApplyError::InvalidValue { reason, .. } => Some(reason),
             ApplyError::Storage(err) => Some(err),
             _ => None,
         }

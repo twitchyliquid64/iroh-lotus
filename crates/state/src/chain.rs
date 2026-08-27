@@ -50,9 +50,20 @@ pub enum Insert {
 impl Chain {
     /// Opens a chain from the `Init` envelope that starts it, storing the
     /// envelope and installing its checkpoint.
-    pub fn init<S: Storage>(storage: &mut S, envelope: Envelope) -> Result<Self, Error<S::Error>> {
+    pub fn init<S: Storage>(
+        storage: &mut S,
+        mut envelope: Envelope,
+    ) -> Result<Self, Error<S::Error>> {
         let ledger = Ledger::init(storage, &envelope)?;
         let root = ledger.head();
+
+        // Genesis has no parent, so its signatures are verified against
+        // the key set it installs itself. Circular by nature: trusting a
+        // root is the operator's decision, not something the chain can
+        // attest to.
+        let status = ledger.verify_envelope(storage, &envelope)?;
+        envelope.set_verification_status(status);
+
         storage
             .put_envelope(root, envelope)
             .map_err(Error::Storage)?;
@@ -168,7 +179,7 @@ impl Chain {
         let mut last: Option<EnvelopeDigest> = None;
         let mut all_duplicates = true;
 
-        for envelope in envelopes {
+        for mut envelope in envelopes {
             let Some(prev) = envelope.payload().prev_digest().copied() else {
                 return Err(Error::Apply(ApplyError::UnexpectedInit));
             };
@@ -184,11 +195,33 @@ impl Chain {
             let stored = storage.envelope(digest).map_err(Error::Storage)?.is_some();
             all_duplicates &= stored;
 
+            // The ledger standing at `prev`, the parents state. Used to get at
+            // the config and trusted key set to verify signatures.
+            let parent = match trial.take() {
+                Some(ledger) => Some(ledger),
+                None => storage
+                    .contains_version(prev)
+                    .map_err(Error::Storage)?
+                    .then(|| Ledger::open(storage, prev))
+                    .transpose()?,
+            };
+            if !stored && let Some(parent) = parent {
+                let status = parent.verify_envelope(storage, &envelope)?;
+                envelope.set_verification_status(status);
+            }
+
             if storage.contains_version(digest).map_err(Error::Storage)? {
                 // A version at the digest means it applied before —
                 // digests pin content, so it can only be this envelope's
                 // result.
-                if !stored {
+                //
+                // Only taken into the log if it could be verified. With
+                // the parent's version pruned there is no key set to verify
+                // against, and an envelope stored `Unchecked` would rank
+                // at zero for good: nothing later can recover a weight
+                // whose parent is gone. Leaving the log as it was keeps
+                // this a no-op rather than a downgrade.
+                if !stored && parent.is_some() {
                     storage
                         .put_envelope(digest, envelope)
                         .map_err(Error::Storage)?;
@@ -197,15 +230,7 @@ impl Chain {
                 continue;
             }
 
-            let base = match trial.take() {
-                Some(ledger) => Some(ledger),
-                None => storage
-                    .contains_version(prev)
-                    .map_err(Error::Storage)?
-                    .then(|| Ledger::open(storage, prev))
-                    .transpose()?,
-            };
-            let Some(mut ledger) = base else {
+            let Some(mut ledger) = parent else {
                 if stored {
                     continue;
                 }
@@ -348,16 +373,18 @@ fn descends<S: Storage>(
 
 #[cfg(test)]
 mod tests {
-    use storage::MemStorage;
+    use ed25519_zebra::SigningKey;
+    use storage::{MemStorage, Storage as _};
     use wire::{
-        Msg,
+        Msg, VerificationStatus,
+        keys::{Ed25519PublicKey, Ed25519Signature, Key, PublicKey, Signature},
         msg::{
             DeleteNamespace, FullCheckpoint, InitMsg, Namespace, NamespaceKey, SetNamespace, Value,
         },
     };
 
     use super::*;
-    use crate::MIN_KEEP_MINUTES_KEY;
+    use crate::{MIN_KEEP_MINUTES_KEY, TRUSTED_KEYS_KEY};
 
     fn key(k: &str) -> NamespaceKey {
         NamespaceKey::try_new(k).unwrap()
@@ -395,6 +422,239 @@ mod tests {
 
     fn digest(envelope: &Envelope) -> EnvelopeDigest {
         envelope.digest().unwrap()
+    }
+
+    fn public_key(signing: &SigningKey) -> PublicKey {
+        PublicKey::Ed25519(Ed25519PublicKey::from_bytes(
+            signing.verification_key().into(),
+        ))
+    }
+
+    /// Signs `envelope`'s signature digest and files it under the signer's
+    /// key id. Attaching a signature never changes that digest, so this
+    /// composes however many times.
+    fn sign(envelope: Envelope, signing: &SigningKey) -> Envelope {
+        let digest = envelope.signature_digest().unwrap();
+        let signature = Signature::Ed25519(Ed25519Signature::from_bytes(
+            signing.sign(digest.as_bytes()).to_bytes(),
+        ));
+        envelope.with_signature(public_key(signing).id(), signature)
+    }
+
+    /// A chain whose genesis already trusts `keys`.
+    fn signed_setup(keys: impl IntoIterator<Item = Key>) -> (MemStorage, Chain) {
+        let trusted = Value::Map(
+            keys.into_iter()
+                .map(|key| (key.id().to_hex().as_ref().to_string(), Value::Key(key)))
+                .collect(),
+        );
+        let mut store = MemStorage::default();
+        let chain = Chain::init(
+            &mut store,
+            Envelope::new(Msg::Init(InitMsg {
+                state: FullCheckpoint {
+                    namespaces: [(key(TRUSTED_KEYS_KEY), Namespace { value: trusted })]
+                        .into_iter()
+                        .collect(),
+                },
+            })),
+        )
+        .unwrap();
+        (store, chain)
+    }
+
+    /// The status is computed before the envelope is persisted, so the
+    /// walk reads a weight rather than an `Unchecked` placeholder.
+    #[test]
+    fn inserting_persists_the_verification_status() {
+        let alice = SigningKey::from([1u8; 32]);
+        let (mut store, mut chain) = signed_setup([Key::new(public_key(&alice), 3)]);
+
+        let envelope = set(chain.head(), "a", "1");
+        let signed = sign(envelope.clone(), &alice);
+        let digest = digest(&signed);
+        chain.insert(&mut store, signed).unwrap();
+
+        assert_eq!(
+            store
+                .envelope(digest)
+                .unwrap()
+                .unwrap()
+                .verification_status(),
+            &VerificationStatus::AllMatched { total_weight: 3 }
+        );
+    }
+
+    /// Genesis is verified against the key set it installs itself.
+    #[test]
+    fn init_verifies_against_its_own_checkpoint() {
+        let (store, chain) = signed_setup([]);
+        assert_eq!(
+            store
+                .envelope(chain.root())
+                .unwrap()
+                .unwrap()
+                .verification_status(),
+            &VerificationStatus::AllMatched { total_weight: 0 }
+        );
+    }
+
+    /// The payoff: at a fork the heavier envelope wins, whichever way the
+    /// digests happen to fall — signature weight outranks the tiebreak.
+    #[test]
+    fn the_heavier_fork_wins_regardless_of_digest() {
+        let alice = SigningKey::from([1u8; 32]);
+        let (mut store, mut chain) = signed_setup([Key::new(public_key(&alice), 3)]);
+        let head = chain.head();
+
+        let heavy_unsigned = set(head, "a", "heavy");
+        let heavy = sign(heavy_unsigned.clone(), &alice);
+
+        // Pick the unsigned sibling so that it outranks the signed one on
+        // the digest tiebreak — a weightless walk would choose it, so the
+        // signed one can only win on weight.
+        let light = (0..64)
+            .map(|n| set(head, "a", &format!("light{n}")))
+            .find(|light| digest(light) > digest(&heavy))
+            .expect("some sibling digest exceeds the signed one's");
+
+        chain.insert(&mut store, light).unwrap();
+        chain.insert(&mut store, heavy.clone()).unwrap();
+
+        assert_eq!(chain.head(), digest(&heavy));
+        assert_eq!(
+            chain.ledger().namespace(&store, &key("a")).unwrap(),
+            Some(ns("heavy"))
+        );
+    }
+
+    /// A signature that does not verify is not a refusal: the envelope is
+    /// stored, worth nothing, and loses every fork it is in.
+    #[test]
+    fn a_failed_signature_stores_at_zero_weight() {
+        let alice = SigningKey::from([1u8; 32]);
+        let mallory = SigningKey::from([9u8; 32]);
+        let (mut store, mut chain) = signed_setup([Key::new(public_key(&alice), 3)]);
+
+        let envelope = set(chain.head(), "a", "1");
+        let signed = sign(envelope.clone(), &mallory);
+        let digest = digest(&signed);
+
+        chain.insert(&mut store, signed).unwrap();
+
+        assert_eq!(chain.head(), digest, "unopposed, it is still canonical");
+        assert_eq!(
+            store
+                .envelope(digest)
+                .unwrap()
+                .unwrap()
+                .verification_status(),
+            &VerificationStatus::Failed
+        );
+    }
+
+    /// Re-offering an envelope the log already holds must not disturb the
+    /// status it was stored with — a peer's copy arrives `Unchecked`, and
+    /// taking it would silently drop the envelope's weight to zero.
+    #[test]
+    fn re_inserting_does_not_downgrade_a_stored_status() {
+        let alice = SigningKey::from([1u8; 32]);
+        let (mut store, mut chain) = signed_setup([Key::new(public_key(&alice), 3)]);
+
+        let envelope = set(chain.head(), "a", "1");
+        let signed = sign(envelope.clone(), &alice);
+        let d = digest(&signed);
+        chain.insert(&mut store, signed.clone()).unwrap();
+
+        let mut peer_copy = signed;
+        peer_copy.set_verification_status(VerificationStatus::Unchecked);
+        assert_eq!(
+            chain.insert(&mut store, peer_copy).unwrap(),
+            Insert::Duplicate
+        );
+
+        assert_eq!(
+            store.envelope(d).unwrap().unwrap().verification_status(),
+            &VerificationStatus::AllMatched { total_weight: 3 }
+        );
+    }
+
+    /// Compaction can prune the version an envelope's weight was taken
+    /// from. Re-offered after that, it cannot be verified — so it is not
+    /// taken into the log at all, rather than taken in at zero.
+    #[test]
+    fn an_envelope_that_cannot_be_verified_is_not_stored() {
+        let alice = SigningKey::from([1u8; 32]);
+        let (mut store, mut chain) = signed_setup([Key::new(public_key(&alice), 3)]);
+        let root = chain.head();
+
+        let a = set(root, "a", "1");
+        let a = sign(a.clone(), &alice);
+        chain.insert(&mut store, a.clone()).unwrap();
+
+        let b = set(digest(&a), "b", "2");
+        let b = sign(b.clone(), &alice);
+        let bd = digest(&b);
+        chain.insert(&mut store, b.clone()).unwrap();
+
+        // Compaction keeps the root and the tip; the middle version goes,
+        // and the tip's envelope leaves the log with it.
+        store.retain(&[root, bd]).unwrap();
+        store.remove_envelope(bd).unwrap();
+        assert!(!store.contains_version(digest(&a)).unwrap());
+
+        let mut peer_copy = b;
+        peer_copy.set_verification_status(VerificationStatus::Unchecked);
+        chain.insert(&mut store, peer_copy).unwrap();
+
+        assert!(
+            store.envelope(bd).unwrap().is_none(),
+            "an unverifiable envelope must not enter the log"
+        );
+        // The cost of refusing: with its envelope out of the log, the
+        // tip is unreachable to the walk, so the head falls back to the
+        // last envelope the log still holds.
+        assert_eq!(chain.head(), digest(&a));
+    }
+
+    /// A chain replayed from the wire carries no verification statuses,
+    /// so `replay` has to verify each envelope itself — otherwise a chain
+    /// that satisfied its own thresholds when it was written refuses to
+    /// replay, every envelope failing the floor it once cleared.
+    #[test]
+    fn replay_verifies_envelopes_it_receives_unverified() {
+        let alice = SigningKey::from([1u8; 32]);
+        let (mut store, mut chain) = signed_setup([Key::new(public_key(&alice), 3)]);
+
+        let floor = Envelope::new(Msg::SetNamespace(SetNamespace {
+            prev: chain.head(),
+            key: key(crate::MIN_ENVELOPE_WEIGHT_KEY),
+            namespace: Namespace {
+                value: Value::Int(3),
+            },
+        }));
+        chain.insert(&mut store, floor.clone()).unwrap();
+
+        let next = set(chain.head(), "a", "1");
+        let next = sign(next.clone(), &alice);
+        chain.insert(&mut store, next.clone()).unwrap();
+        assert_eq!(chain.head(), digest(&next));
+
+        // Exactly what a peer receives: decoded from the wire, so every
+        // status is back to `Unchecked`.
+        let root = store.envelope(chain.root()).unwrap().unwrap();
+        let received: Vec<Envelope> = [&root, &floor, &next]
+            .into_iter()
+            .map(|envelope| wire::decode(&wire::encode(envelope).unwrap()).unwrap())
+            .collect();
+        assert_eq!(
+            received[2].verification_status(),
+            &VerificationStatus::Unchecked
+        );
+
+        let mut fresh = MemStorage::default();
+        let replayed = Ledger::replay(&mut fresh, received.iter()).unwrap();
+        assert_eq!(replayed.head(), chain.head());
     }
 
     /// Splits two sibling envelopes into (winner, loser) by the fork rule:
