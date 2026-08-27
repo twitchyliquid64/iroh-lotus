@@ -13,3 +13,5 @@ ed25519-zebra.workspace = true
 nutype.workspace = true
 serde.workspace = true
 
+[dev-dependencies]
+serde_json.workspace = true

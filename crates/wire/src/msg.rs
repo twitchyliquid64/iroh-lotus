@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use cbor2::Cbor;
 use nutype::nutype;
 
-use crate::{EnvelopeDigest, keys::Key, subkey::SubkeyPath};
+use crate::{EnvelopeDigest, codec::dual_repr, keys::Key, subkey::SubkeyPath};
 
 /// The name a namespace is stored under in the ledger.
 #[nutype(
@@ -33,25 +33,31 @@ pub struct NamespaceKey(String);
 
 /// A specific message in the ledger.
 ///
-/// Variants are renamed to single letters to shorten their wire encoding.
-#[derive(Debug, Clone, Cbor, Hash, PartialEq, Eq)]
+/// `dual_repr!` below defines the serde representations: integer wire
+/// tags, adjacently tagged full names in JSON.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum Msg {
     /// The first message, establishes the initial data of the ledger and
     /// shared parameters.
-    #[serde(rename = "i")]
     Init(InitMsg),
     /// Sets the value of a namespace entirely.
-    #[serde(rename = "s")]
     SetNamespace(SetNamespace),
     /// Sets or clears a single value nested inside a namespace.
-    #[serde(rename = "sk")]
     SetNamespaceKey(SetNamespaceKey),
     /// Amends a single value nested inside a namespace in place.
-    #[serde(rename = "ak")]
     AmendNamespaceKey(AmendNamespaceKey),
     /// Deletes an entire namespace.
-    #[serde(rename = "dn")]
     DeleteNamespace(DeleteNamespace),
+}
+
+dual_repr! {
+    Msg {
+        Init(InitMsg) = 1 | "init",
+        SetNamespace(SetNamespace) = 2 | "set_namespace",
+        SetNamespaceKey(SetNamespaceKey) = 3 | "set_namespace_key",
+        AmendNamespaceKey(AmendNamespaceKey) = 4 | "amend_namespace_key",
+        DeleteNamespace(DeleteNamespace) = 5 | "delete_namespace",
+    }
 }
 
 impl Msg {
@@ -146,18 +152,24 @@ pub struct AmendNamespaceKey {
 
 /// How an [`AmendNamespaceKey`] transforms the value its path addresses.
 ///
-/// Variants are renamed to single letters to shorten their wire encoding.
-#[derive(Debug, Clone, Cbor, Hash, PartialEq, Eq)]
+/// `dual_repr!` below defines the serde representations: integer wire
+/// tags, adjacently tagged full names in JSON.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum AmendOp {
     /// Appends the entry to the array at the path. A path addressing
     /// nothing creates a one-entry array — as a fresh key under an
     /// existing map only.
-    #[serde(rename = "a")]
     AppendEntry(Value),
     /// Adds a delta to the integer at the path, which must exist,
     /// clamping the sum to the bounds that are set.
-    #[serde(rename = "d")]
     IncrementDecrement(IncrementDecrement),
+}
+
+dual_repr! {
+    AmendOp {
+        AppendEntry(Value) = 1 | "append_entry",
+        IncrementDecrement(IncrementDecrement) = 2 | "increment_decrement",
+    }
 }
 
 /// Adds a delta — possibly negative — to an integer, then clamps the sum
@@ -234,24 +246,31 @@ pub struct Namespace {
 
 /// A data value.
 ///
-/// Variants are renamed to single letters to shorten their wire encoding.
-#[derive(Debug, Clone, Cbor, Hash, PartialEq, Eq)]
+/// `dual_repr!` below defines the serde representations: integer wire
+/// tags (`{2: 7}`), adjacently tagged full names in JSON
+/// (`{"type": "int", "value": 7}`) — the latter pinned by `tests/json.rs`.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum Value {
-    #[serde(rename = "s")]
     String(String),
-    #[serde(rename = "i")]
     Int(i64),
-    #[serde(rename = "b")]
     Bool(bool),
-    #[serde(rename = "a")]
     Array(Vec<Value>),
-    #[serde(rename = "m")]
     Map(BTreeMap<String, Value>),
     /// A key in the ledger's trusted key set. A leaf: subkey paths do not
     /// reach inside one, so a key is replaced whole rather than amended
     /// field by field.
-    #[serde(rename = "k")]
     Key(Key),
+}
+
+dual_repr! {
+    Value {
+        String(String) = 1 | "string",
+        Int(i64) = 2 | "int",
+        Bool(bool) = 3 | "bool",
+        Array(Vec<Value>) = 4 | "array",
+        Map(BTreeMap<String, Value>) = 5 | "map",
+        Key(Key) = 6 | "key",
+    }
 }
 
 #[cfg(test)]
@@ -275,21 +294,22 @@ mod tests {
         NamespaceKey::try_new(k).unwrap()
     }
 
-    /// Each variant is a one-entry map keyed by the renamed variant tag:
-    /// `a1` (map, 1 pair), `61 xx` (1-char text key), then the payload.
+    /// Each variant is a one-pair map keyed by the variant's integer tag —
+    /// the same shape integer-keyed struct fields use: `a1` (map, 1 pair),
+    /// the tag (`01`…), then the payload.
     #[test]
     fn value_variants() {
-        assert_wire(&Value::String("hi".into()), "a16173626869");
-        assert_wire(&Value::String(String::new()), "a1617360");
-        assert_wire(&Value::Int(7), "a1616907");
-        assert_wire(&Value::Int(-1), "a1616920");
-        assert_wire(&Value::Int(i64::MAX), "a161691b7fffffffffffffff");
-        assert_wire(&Value::Bool(true), "a16162f5");
-        assert_wire(&Value::Bool(false), "a16162f4");
-        assert_wire(&Value::Array(vec![]), "a1616180");
+        assert_wire(&Value::String("hi".into()), "a101626869");
+        assert_wire(&Value::String(String::new()), "a10160");
+        assert_wire(&Value::Int(7), "a10207");
+        assert_wire(&Value::Int(-1), "a10220");
+        assert_wire(&Value::Int(i64::MAX), "a1021b7fffffffffffffff");
+        assert_wire(&Value::Bool(true), "a103f5");
+        assert_wire(&Value::Bool(false), "a103f4");
+        assert_wire(&Value::Array(vec![]), "a10480");
     }
 
-    /// `a1 61 6b` wraps the key, which carries its own three-pair map:
+    /// `a1 06` wraps the key, which carries its own three-pair map:
     /// the public key under `01`, the weight under `02`, metadata under
     /// `03`. A key is a value like any other, so the trusted key set is
     /// ordinary namespace data.
@@ -300,7 +320,7 @@ mod tests {
                 PublicKey::Ed25519(Ed25519PublicKey::from_bytes([0xab; 32])),
                 7,
             )),
-            &format!("a1616ba301a161655820{}020703a0", "ab".repeat(32)),
+            &format!("a106a301a1015820{}020703a0", "ab".repeat(32)),
         );
     }
 
@@ -308,11 +328,11 @@ mod tests {
     fn value_arrays_nest() {
         assert_wire(
             &Value::Array(vec![Value::Bool(true), Value::Int(1)]),
-            "a1616182a16162f5a1616901",
+            "a10482a103f5a10201",
         );
         assert_wire(
             &Value::Array(vec![Value::Array(vec![Value::String("x".into())])]),
-            "a1616181a1616181a161736178",
+            "a10481a10481a1016178",
         );
     }
 
@@ -320,7 +340,7 @@ mod tests {
     /// not the field name.
     #[test]
     fn namespace_uses_integer_field_key() {
-        assert_wire(&ns("hi"), "a101a16173626869");
+        assert_wire(&ns("hi"), "a101a101626869");
     }
 
     #[test]
@@ -332,7 +352,7 @@ mod tests {
             &FullCheckpoint {
                 namespaces: BTreeMap::from([(key("a"), ns("1"))]),
             },
-            "a101a16161a101a161736131",
+            "a101a16161a101a1016131",
         );
     }
 
@@ -346,7 +366,7 @@ mod tests {
             &FullCheckpoint {
                 namespaces: BTreeMap::from([(key("z"), ns("1")), (key("aa"), ns("2"))]),
             },
-            "a101a2617aa101a161736131626161a101a161736132",
+            "a101a2617aa101a1016131626161a101a1016132",
         );
     }
 
@@ -373,23 +393,23 @@ mod tests {
                 namespaces: BTreeMap::new(),
             },
         });
-        assert_wire(&msg, "a16169a101a101a0");
+        assert_wire(&msg, "a101a101a101a0");
     }
 
     /// `Value::Map` sorts its keys the same canonical way a checkpoint does.
     #[test]
     fn value_maps_nest() {
-        assert_wire(&Value::Map(BTreeMap::new()), "a1616da0");
+        assert_wire(&Value::Map(BTreeMap::new()), "a105a0");
         assert_wire(
             &Value::Map(BTreeMap::from([("a".to_string(), val("1"))])),
-            "a1616da16161a161736131",
+            "a105a16161a1016131",
         );
         assert_wire(
             &Value::Map(BTreeMap::from([
                 ("z".to_string(), val("1")),
                 ("aa".to_string(), val("2")),
             ])),
-            "a1616da2617aa161736131626161a161736132",
+            "a105a2617aa1016131626161a1016132",
         );
     }
 
@@ -404,11 +424,7 @@ mod tests {
         });
         assert_wire(
             &msg,
-            &format!(
-                "a16173a3015820{}026161{}",
-                "ab".repeat(32),
-                "03a101a161736131"
-            ),
+            &format!("a102a3015820{}026161{}", "ab".repeat(32), "03a101a1016131"),
         );
     }
 
@@ -460,50 +476,46 @@ mod tests {
         assert_wire(
             &set(Some(val("1"))),
             &format!(
-                "a162736ba4015820{}0261610381a1616b616204a161736131",
+                "a103a4015820{}0261610381a101616204a1016131",
                 "ab".repeat(32)
             ),
         );
         assert_wire(
             &set(None),
-            &format!(
-                "a162736ba4015820{}0261610381a1616b616204f6",
-                "ab".repeat(32)
-            ),
+            &format!("a103a4015820{}0261610381a101616204f6", "ab".repeat(32)),
         );
     }
 
-    /// Same one-entry-map shape as `Value`: `a1` (map, 1 pair), `61 xx`
-    /// (1-char text key), then the payload. An increment's payload is an
-    /// `a3` (map, 3 pairs) of delta, min, max — the unset bounds encode
-    /// as `f6` (null), not omitted.
+    /// Same one-pair integer-tag shape as `Value`. An increment's payload
+    /// is an `a3` (map, 3 pairs) of delta, min, max — the unset bounds
+    /// encode as `f6` (null), not omitted.
     #[test]
     fn amend_op_variants() {
-        assert_wire(&AmendOp::AppendEntry(Value::Int(7)), "a16161a1616907");
-        assert_wire(&AmendOp::AppendEntry(val("1")), "a16161a161736131");
+        assert_wire(&AmendOp::AppendEntry(Value::Int(7)), "a101a10207");
+        assert_wire(&AmendOp::AppendEntry(val("1")), "a101a1016131");
         assert_wire(
             &AmendOp::IncrementDecrement(IncrementDecrement::new(0)),
-            "a16164a3010002f603f6",
+            "a102a3010002f603f6",
         );
         assert_wire(
             &AmendOp::IncrementDecrement(IncrementDecrement::new(-1)),
-            "a16164a3012002f603f6",
+            "a102a3012002f603f6",
         );
         assert_wire(
             &AmendOp::IncrementDecrement(IncrementDecrement::new(i64::MAX)),
-            "a16164a3011b7fffffffffffffff02f603f6",
+            "a102a3011b7fffffffffffffff02f603f6",
         );
         assert_wire(
             &AmendOp::IncrementDecrement(IncrementDecrement::new(i64::MIN)),
-            "a16164a3013b7fffffffffffffff02f603f6",
+            "a102a3013b7fffffffffffffff02f603f6",
         );
         assert_wire(
             &AmendOp::IncrementDecrement(IncrementDecrement::new(5).with_min(0).with_max(10)),
-            "a16164a301050200030a",
+            "a102a301050200030a",
         );
         assert_wire(
             &AmendOp::IncrementDecrement(IncrementDecrement::new(-2).with_min(-3)),
-            "a16164a30121022203f6",
+            "a102a30121022203f6",
         );
     }
 
@@ -555,7 +567,7 @@ mod tests {
         assert_wire(
             &amend(at_b(), AmendOp::AppendEntry(val("1"))),
             &format!(
-                "a162616ba4015820{}0261610381a1616b616204a16161a161736131",
+                "a104a4015820{}0261610381a101616204a101a1016131",
                 "ab".repeat(32)
             ),
         );
@@ -565,17 +577,14 @@ mod tests {
                 AmendOp::IncrementDecrement(IncrementDecrement::new(5)),
             ),
             &format!(
-                "a162616ba4015820{}0261610381a1616b616204a16164a3010502f603f6",
+                "a104a4015820{}0261610381a101616204a102a3010502f603f6",
                 "ab".repeat(32)
             ),
         );
         // No path — the namespace's whole value — is `f6` (null).
         assert_wire(
             &amend(None, AmendOp::AppendEntry(val("1"))),
-            &format!(
-                "a162616ba4015820{}02616103f604a16161a161736131",
-                "ab".repeat(32)
-            ),
+            &format!("a104a4015820{}02616103f604a101a1016131", "ab".repeat(32)),
         );
     }
 
@@ -587,11 +596,11 @@ mod tests {
         assert!(NamespaceKey::try_new(" ").is_ok()); // validated, not sanitized
 
         // a3 01 5820… prev, 02 60 (empty text string) key, 03 … namespace
-        let empty_key = format!("a16173a3015820{}026003a101a161736131", "ab".repeat(32));
+        let empty_key = format!("a102a3015820{}026003a101a1016131", "ab".repeat(32));
         assert!(crate::decode::<Msg>(&unhex(&empty_key)).is_err());
 
         // The same message with a one-character key (`02 6161`) decodes.
-        let one_char = format!("a16173a3015820{}02616103a101a161736131", "ab".repeat(32));
+        let one_char = format!("a102a3015820{}02616103a101a1016131", "ab".repeat(32));
         assert!(crate::decode::<Msg>(&unhex(&one_char)).is_ok());
     }
 

@@ -11,7 +11,10 @@ use cbor2::Cbor;
 use ed25519_zebra::{Signature as ZebraSignature, VerificationKey};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{codec::byte_array, envelope::EnvelopeSignatureDigest};
+use crate::{
+    codec::{byte_array, dual_repr, serialize_byte_array},
+    envelope::EnvelopeSignatureDigest,
+};
 
 /// An entry in the ledger's trusted key set: the key material, what its
 /// signatures are worth, and whatever the operator wants to record
@@ -84,11 +87,17 @@ impl fmt::Display for Key {
 
 /// The key material itself, in whichever scheme produced it.
 ///
-/// Variants are renamed to single letters to shorten their wire encoding.
-#[derive(Debug, Copy, Clone, Cbor, Hash, PartialEq, Eq)]
+/// `dual_repr!` below defines the serde representations: integer wire
+/// tags, adjacently tagged full names in JSON.
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum PublicKey {
-    #[serde(rename = "e")]
     Ed25519(Ed25519PublicKey),
+}
+
+dual_repr! {
+    PublicKey {
+        Ed25519(Ed25519PublicKey) = 1 | "ed25519",
+    }
 }
 
 impl PublicKey {
@@ -187,23 +196,29 @@ impl fmt::Display for KeyId {
 
 impl Serialize for KeyId {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_bytes(self.as_bytes())
+        serialize_byte_array(self.as_bytes(), serializer, "")
     }
 }
 
 impl<'de> Deserialize<'de> for KeyId {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        byte_array(deserializer, "a 32-byte key id").map(Self::from_bytes)
+        byte_array(deserializer, "a 32-byte key id", "").map(Self::from_bytes)
     }
 }
 
 /// A signature over an [`EnvelopeSignatureDigest`].
 ///
-/// Variants are renamed to single letters to shorten their wire encoding.
-#[derive(Debug, Copy, Clone, Cbor, Hash, PartialEq, Eq)]
+/// `dual_repr!` below defines the serde representations: integer wire
+/// tags, adjacently tagged full names in JSON.
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum Signature {
-    #[serde(rename = "e")]
     Ed25519(Ed25519Signature),
+}
+
+dual_repr! {
+    Signature {
+        Ed25519(Ed25519Signature) = 1 | "ed25519",
+    }
 }
 
 impl fmt::Display for Signature {
@@ -262,13 +277,13 @@ impl fmt::Display for Ed25519PublicKey {
 
 impl Serialize for Ed25519PublicKey {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_bytes(&self.0)
+        serialize_byte_array(&self.0, serializer, "")
     }
 }
 
 impl<'de> Deserialize<'de> for Ed25519PublicKey {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        byte_array(deserializer, "a 32-byte ed25519 public key").map(Self)
+        byte_array(deserializer, "a 32-byte ed25519 public key", "").map(Self)
     }
 }
 
@@ -306,13 +321,13 @@ impl fmt::Display for Ed25519Signature {
 
 impl Serialize for Ed25519Signature {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_bytes(&self.0)
+        serialize_byte_array(&self.0, serializer, "")
     }
 }
 
 impl<'de> Deserialize<'de> for Ed25519Signature {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        byte_array(deserializer, "a 64-byte ed25519 signature").map(Self)
+        byte_array(deserializer, "a 64-byte ed25519 signature", "").map(Self)
     }
 }
 
@@ -366,17 +381,17 @@ mod tests {
         PublicKey::Ed25519(Ed25519PublicKey::from_bytes(key.verification_key().into()))
     }
 
-    /// `a1 61 65` is the one-pair map naming the `e` variant; `5820` and
-    /// `5840` are the byte strings, not arrays of integers.
+    /// `a1 01` is the one-pair map tagging the Ed25519 variant; `5820`
+    /// and `5840` are the byte strings, not arrays of integers.
     #[test]
     fn keys_and_signatures_encode_as_byte_strings() {
         assert_wire(
             &PublicKey::Ed25519(Ed25519PublicKey::from_bytes([0xab; 32])),
-            &format!("a161655820{}", "ab".repeat(32)),
+            &format!("a1015820{}", "ab".repeat(32)),
         );
         assert_wire(
             &Signature::Ed25519(Ed25519Signature::from_bytes([0xcd; 64])),
-            &format!("a161655840{}", "cd".repeat(64)),
+            &format!("a1015840{}", "cd".repeat(64)),
         );
     }
 
@@ -434,13 +449,13 @@ mod tests {
                 PublicKey::Ed25519(Ed25519PublicKey::from_bytes([0xab; 32])),
                 7,
             ),
-            &format!("a301a161655820{}020703a0", "ab".repeat(32)),
+            &format!("a301a1015820{}020703a0", "ab".repeat(32)),
         );
     }
 
     #[test]
     fn decoding_rejects_the_wrong_length() {
-        let short = format!("a16165581f{}", "ab".repeat(31));
+        let short = format!("a101581f{}", "ab".repeat(31));
         assert!(crate::decode::<PublicKey>(&crate::testutil::unhex(&short)).is_err());
     }
 
@@ -466,7 +481,7 @@ mod tests {
     /// above encodes.
     #[test]
     fn a_malformed_key_decodes_and_fails_verification() {
-        let encoded = format!("a161655820{}", "ab".repeat(32));
+        let encoded = format!("a1015820{}", "ab".repeat(32));
         let key: PublicKey = crate::decode(&crate::testutil::unhex(&encoded)).unwrap();
 
         let signature = sign(&signing_key(), &digest());

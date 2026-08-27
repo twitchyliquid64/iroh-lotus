@@ -4,7 +4,7 @@ use cbor2::Cbor;
 
 use crate::{
     Error,
-    codec::byte_array,
+    codec::{byte_array, serialize_byte_array},
     keys::{KeyId, Signature},
 };
 
@@ -170,7 +170,8 @@ pub struct SignedTimestamp {}
 /// A digest over the entire envelope, i.e. a message in the ledger.
 ///
 /// Serialized as a CBOR byte string (major type 2), *not* a sequence
-/// of integers.
+/// of integers. In JSON it is `ed:` followed by hex — the prefix keeps
+/// it from being mistaken for the ledger's other 32-byte digests.
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct EnvelopeDigest(blake3::Hash);
 
@@ -190,13 +191,18 @@ impl PartialOrd for EnvelopeDigest {
 
 impl serde::Serialize for EnvelopeDigest {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_bytes(self.0.as_bytes())
+        serialize_byte_array(self.0.as_bytes(), serializer, "ed:")
     }
 }
 
 impl<'de> serde::Deserialize<'de> for EnvelopeDigest {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        byte_array(deserializer, "a 32-byte envelope digest").map(Self::from_bytes)
+        byte_array(
+            deserializer,
+            "a 32-byte `ed:`-prefixed envelope digest",
+            "ed:",
+        )
+        .map(Self::from_bytes)
     }
 }
 
@@ -265,12 +271,12 @@ mod tests {
     /// and no timestamps.
     //  a3                     map(3)
     //    01                   payload
-    //      a1 61 69           Msg::Init
+    //      a1 01              Msg::Init
     //        a1 01            InitMsg.state
     //          a1 01 a0       FullCheckpoint { namespaces: {} }
     //    02 a0                signatures = {}
     //    03 80                timestamps = []
-    const INIT_ENVELOPE: &str = "a301a16169a101a101a002a00380";
+    const INIT_ENVELOPE: &str = "a301a101a101a101a002a00380";
 
     /// Round-trips the bytes rather than constructing a `Msg`, whose fields
     /// are private to its module.
@@ -297,7 +303,7 @@ mod tests {
     /// one-pair map naming its scheme.
     fn entry_hex(byte: u8) -> String {
         format!(
-            "5820{}a161655840{}",
+            "5820{}a1015840{}",
             format!("{byte:02x}").repeat(32),
             "cd".repeat(64)
         )
@@ -314,14 +320,14 @@ mod tests {
         let signed = init_envelope().with_signature(id, sig);
         assert_wire(
             &signed,
-            &format!("a301a16169a101a101a002a1{}0380", entry_hex(0xef)),
+            &format!("a301a101a101a101a002a1{}0380", entry_hex(0xef)),
         );
 
         let stamped = Envelope {
             timestamps: vec![SignedTimestamp {}],
             ..init_envelope()
         };
-        assert_wire(&stamped, "a301a16169a101a101a002a00381a0");
+        assert_wire(&stamped, "a301a101a101a101a002a00381a0");
     }
 
     /// The map has one canonical encoding: signatures come back in key-id
@@ -343,7 +349,7 @@ mod tests {
         assert_wire(
             &ascending,
             &format!(
-                "a301a16169a101a101a002a2{}{}0380",
+                "a301a101a101a101a002a2{}{}0380",
                 entry_hex(0x11),
                 entry_hex(0xee)
             ),
@@ -444,7 +450,7 @@ mod tests {
         // reproducible by inspection.
         assert_eq!(
             envelope.digest().unwrap().to_hex().as_ref(),
-            "035fb73b4c287865dcf63e66a28abe1036ed6f8a346135eca14dd65be4cc1a32",
+            "4f93b708887770867171b2312c947b5d72487c40a8b11d261abd6989fb297cf5",
         );
     }
 
@@ -475,7 +481,7 @@ mod tests {
         assert_eq!(
             signed.digest().unwrap().as_bytes(),
             blake3::hash(&unhex(&format!(
-                "a301a16169a101a101a002a1{}0380",
+                "a301a101a101a101a002a1{}0380",
                 entry_hex(0xef)
             )))
             .as_bytes(),

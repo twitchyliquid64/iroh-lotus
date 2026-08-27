@@ -6,20 +6,27 @@
 
 use core::fmt;
 
-use cbor2::Cbor;
 use nutype::nutype;
+
+use crate::codec::dual_repr;
 
 /// One step of a path into a namespace's value.
 ///
-/// Variants are renamed to single letters to shorten their wire encoding.
-#[derive(Debug, Clone, Cbor, Hash, PartialEq, Eq)]
+/// `dual_repr!` below defines the serde representations: integer wire
+/// tags, adjacently tagged full names in JSON.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum Subkey {
     /// A key of a [`Value::Map`](crate::msg::Value::Map).
-    #[serde(rename = "k")]
     Key(String),
     /// An index into a [`Value::Array`](crate::msg::Value::Array).
-    #[serde(rename = "i")]
     Index(u32),
+}
+
+dual_repr! {
+    Subkey {
+        Key(String) = 1 | "key",
+        Index(u32) = 2 | "index",
+    }
 }
 
 impl fmt::Display for Subkey {
@@ -71,29 +78,29 @@ mod tests {
         Subkey::Key(k.to_string())
     }
 
-    /// Same one-entry-map shape as `Value`: `a1` (map, 1 pair), `61 xx`
-    /// (1-char text key), then the payload.
+    /// Same one-pair integer-tag shape as `Value`: `a1` (map, 1 pair),
+    /// the tag, then the payload.
     #[test]
     fn subkey_variants() {
-        assert_wire(&key("a"), "a1616b6161");
-        assert_wire(&Subkey::Key(String::new()), "a1616b60");
-        assert_wire(&Subkey::Index(0), "a1616900");
-        assert_wire(&Subkey::Index(23), "a1616917");
-        assert_wire(&Subkey::Index(300), "a1616919012c");
-        assert_wire(&Subkey::Index(u32::MAX), "a161691affffffff");
+        assert_wire(&key("a"), "a1016161");
+        assert_wire(&Subkey::Key(String::new()), "a10160");
+        assert_wire(&Subkey::Index(0), "a10200");
+        assert_wire(&Subkey::Index(23), "a10217");
+        assert_wire(&Subkey::Index(300), "a10219012c");
+        assert_wire(&Subkey::Index(u32::MAX), "a1021affffffff");
     }
 
     /// An index wider than `u32` is refused rather than truncated.
     #[test]
     fn subkey_index_is_bounded_at_u32() {
-        assert!(crate::decode::<Subkey>(&unhex("a161691b0000000100000000")).is_err());
+        assert!(crate::decode::<Subkey>(&unhex("a1021b0000000100000000")).is_err());
     }
 
     /// The path is transparent — a bare CBOR array, no wrapper map.
     #[test]
     fn subkey_path_encodes_as_an_array() {
-        assert_wire(&path([key("a")]), "81a1616b6161");
-        assert_wire(&path([key("a"), Subkey::Index(2)]), "82a1616b6161a1616902");
+        assert_wire(&path([key("a")]), "81a1016161");
+        assert_wire(&path([key("a"), Subkey::Index(2)]), "82a1016161a10202");
     }
 
     /// The empty path addresses the whole namespace value, which is what
