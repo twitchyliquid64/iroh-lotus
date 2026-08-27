@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/lotusd",
+    "crates/lotusd-rpc",
     "crates/state",
     "crates/storage",
     "crates/wire",
@@ -46,6 +47,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.24", features = ["v4", "v7", "serde"] }
 
 # Our crates
+lotusd-rpc = { path = "crates/lotusd-rpc" }
 state = { path = "crates/state" }
 storage = { path = "crates/storage" }
 wire = { path = "crates/wire" }

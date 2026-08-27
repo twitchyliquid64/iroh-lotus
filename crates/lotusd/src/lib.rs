@@ -6,6 +6,7 @@ use std::{
 };
 
 use ed25519_zebra::SigningKey;
+use lotusd_rpc as rpc;
 use rand::{TryRng, rngs::SysRng};
 use state::{Chain, TRUSTED_KEYS_KEY};
 use storage::{SqliteStorage, Storage};
@@ -47,6 +48,9 @@ impl<T, E> Responder<T, E> {
         self.respond(fut.await);
     }
 }
+
+/// The version this daemon reports over the control socket.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub const SQLITE_DB_FILENAME: &str = "db.sqlite";
 pub const OLDEST_ENVELOPE_FILENAME: &str = "oldest_envelope";
@@ -353,6 +357,7 @@ impl Server {
             local_sock,
         } = self;
         let (hnd_tx, mut hnd_recv) = mpsc::channel(8);
+        let weak = hnd_tx.downgrade();
         let handle = ServerHandle(hnd_tx);
 
         let join_hnd = tokio::spawn(async move {
@@ -372,7 +377,14 @@ impl Server {
                         }
                     }
                     conn = local_sock.accept() => match conn {
-                        Ok((stream, _addr)) => Self::handle_connection(&mut core, stream).await,
+                        // Served on its own task via own handle to avoid blocking the mainloop
+                        Ok((stream, _addr)) => match weak.upgrade() {
+                            Some(sender) => {
+                                tokio::spawn(Self::handle_connection(ServerHandle(sender), stream));
+                            }
+                            // Server about to be garbage collected
+                            None => drop(stream),
+                        },
                         Err(e) => tracing::warn!(error = %e, "accepting local connection"),
                     },
                 }
@@ -402,10 +414,44 @@ impl Server {
     }
 
     /// Serves one client on the local control socket.
-    async fn handle_connection(_core: &mut Core, stream: UnixStream) {
-        // TODO: speak the control protocol. Dropping the stream closes it.
-        tracing::info!("accepted local connection");
-        drop(stream);
+    ///
+    /// One connection, one request: dropping the stream on the way out is
+    /// what ends the answer's stream.
+    async fn handle_connection(handle: ServerHandle, mut stream: UnixStream) {
+        if let Err(e) = rpc::serve(&mut stream, &mut Rpc(handle)).await {
+            tracing::warn!(error = %e, "serving local connection");
+        }
+    }
+}
+
+/// Answers local control requests, asking the server for whatever they need.
+///
+/// Holds a handle rather than the core: it runs off the mainloop, so the
+/// state it reports has to come back through the same actor messages any
+/// other caller would use.
+struct Rpc(ServerHandle);
+
+impl rpc::Handler for Rpc {
+    async fn handle(
+        &mut self,
+        request: rpc::Request,
+        responses: &mut rpc::Responses<'_>,
+    ) -> Result<(), rpc::Error> {
+        match request {
+            rpc::Request::GetVersion(_) => {
+                responses
+                    .send(rpc::Response::Version(VERSION.to_owned()))
+                    .await
+            }
+            rpc::Request::GetHead(_) => {
+                let head = self
+                    .0
+                    .head()
+                    .await
+                    .map_err(|()| rpc::Failure::internal("the server is shutting down"))?;
+                responses.send(rpc::Response::Head(head)).await
+            }
+        }
     }
 }
 

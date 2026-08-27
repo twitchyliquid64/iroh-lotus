@@ -616,6 +616,7 @@ dependencies = [
  "clap_complete",
  "dirs",
  "ed25519-zebra",
+ "lotusd-rpc",
  "nutype",
  "rand",
  "serde",
@@ -627,6 +628,17 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "wire",
+]
+
+[[package]]
+name = "lotusd-rpc"
+version = "0.0.1"
+dependencies = [
+ "cbor2",
+ "serde",
+ "thiserror",
+ "tokio",
  "wire",
 ]
 
