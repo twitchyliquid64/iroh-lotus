@@ -2,8 +2,11 @@ use std::{path::PathBuf, process::ExitCode};
 
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
-use lotusd::{Core, IfInitialized};
+use lotusd::{Core, IfInitialized, Server};
+use tokio::net::UnixListener;
 use tokio::runtime::Builder;
+use tokio::signal::unix::SignalKind;
+use tracing_subscriber::EnvFilter;
 
 use crate::print::print_chain;
 
@@ -89,6 +92,11 @@ impl GlobalArgs {
                 )
             })
     }
+
+    /// The path to the local control socket.
+    pub fn local_sock_path(&self) -> Result<PathBuf, MainError> {
+        self.state_dir().map(|sd| sd.join("local.sock"))
+    }
 }
 
 fn main() -> ExitCode {
@@ -113,20 +121,23 @@ fn main() -> ExitCode {
 }
 
 async fn async_main() -> Result<(), MainError> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
     let cli = Cli::parse();
 
-    match cli.command {
+    // Handle all non-run commands
+    match &cli.command {
         Command::Completions(args) => {
             let mut cmd = Cli::command();
             let name = cmd.get_name().to_string();
             clap_complete::generate(args.shell, &mut cmd, name, &mut std::io::stdout());
         }
-        Command::Run => {
-            let core = Core::init_with_state_dir(cli.global_args.state_dir()?)
-                .await
-                .map_err(MainError::Init)?;
-            println!("core: {core}");
-        }
+        Command::Run => {}
         Command::Init(a) => {
             let core = Core::create_in_state_dir(
                 cli.global_args.state_dir()?,
@@ -150,12 +161,42 @@ async fn async_main() -> Result<(), MainError> {
         }
     }
 
+    // Handle run
+    if let Command::Run = cli.command {
+        let core = Core::init_with_state_dir(cli.global_args.state_dir()?)
+            .await
+            .map_err(MainError::Init)?;
+        tracing::info!("core initialized: {core}");
+
+        let local_path = cli.global_args.local_sock_path()?;
+        if let Err(e) = std::fs::remove_file(&local_path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(MainError::IO(e, "socket already in use"));
+        }
+        let listener =
+            UnixListener::bind(&local_path).map_err(|e| MainError::IO(e, "listening to socket"))?;
+        tracing::info!("Started listening on {}", local_path.display());
+
+        let (serv, join_hnd) = Server::new(core, listener)
+            .map_err(MainError::Init)?
+            .run()
+            .await;
+
+        let mut sig_int = tokio::signal::unix::signal(SignalKind::interrupt()).unwrap();
+        sig_int.recv().await;
+        if serv.shutdown().await.is_ok() {
+            let _ = join_hnd.await;
+        }
+    }
+
     Ok(())
 }
 
 /// An error at the top level of the daemon.
 #[derive(Debug)]
 pub enum MainError {
+    IO(std::io::Error, &'static str),
     Init(lotusd::InitError),
     /// The envelope log could not be read.
     Storage(storage::sqlite::Error),

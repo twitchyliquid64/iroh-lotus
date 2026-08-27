@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     fmt,
+    ops::ControlFlow,
     path::{Path, PathBuf},
 };
 
@@ -8,12 +9,44 @@ use ed25519_zebra::SigningKey;
 use rand::{TryRng, rngs::SysRng};
 use state::{Chain, TRUSTED_KEYS_KEY};
 use storage::{SqliteStorage, Storage};
-use tokio::{fs, io::AsyncWriteExt};
+use tokio::{
+    fs,
+    io::AsyncWriteExt,
+    net::{UnixListener, UnixStream},
+    sync::{mpsc, oneshot},
+    task::JoinHandle,
+};
 use wire::{
     Envelope, EnvelopeDigest, Key, KeyId, Msg, Signature,
     keys::{Ed25519PublicKey, Ed25519Signature, PublicKey},
     msg::{FullCheckpoint, InitMsg, Namespace, NamespaceKey, Value},
 };
+
+/// Encapsulates the return channel for messages back from an actor.
+#[derive(Debug)]
+pub(crate) struct Responder<T, E>(oneshot::Sender<Result<T, E>>);
+
+impl<T, E> Responder<T, E> {
+    /// Constructs both ends of the return channel.
+    pub(crate) fn channel() -> (Self, oneshot::Receiver<Result<T, E>>) {
+        let (send, recv) = oneshot::channel();
+        (Self(send), recv)
+    }
+
+    /// Transmits a result to the caller. The caller going away is not an error:
+    /// it dropped the receiver because it stopped caring about the answer.
+    pub(crate) fn respond(self, res: Result<T, E>) {
+        let _ = self.0.send(res);
+    }
+
+    /// Awaits the provided future, transmitting its result to the caller.
+    pub(crate) async fn handle<F>(self, fut: F)
+    where
+        F: Future<Output = Result<T, E>>,
+    {
+        self.respond(fut.await);
+    }
+}
 
 pub const SQLITE_DB_FILENAME: &str = "db.sqlite";
 pub const OLDEST_ENVELOPE_FILENAME: &str = "oldest_envelope";
@@ -292,4 +325,114 @@ pub enum InitError {
     Storage(storage::sqlite::Error),
     /// Error when replaying the chain back to head.
     Chain(state::Error<storage::sqlite::Error>),
+}
+
+#[derive(Debug)]
+enum ServerMsg {
+    Shutdown(Responder<(), ()>),
+    Head(Responder<EnvelopeDigest, ()>),
+}
+
+/// The server actor, encapsulates all running/server state.
+#[derive(Debug)]
+pub struct Server {
+    core: Core,
+    local_sock: UnixListener,
+}
+
+impl Server {
+    pub fn new(core: Core, local_sock: UnixListener) -> Result<Self, InitError> {
+        Ok(Self { core, local_sock })
+    }
+
+    /// Consumes the initialized server and starts an async task for its mainloop, returning
+    /// a handle that can be used to query and control the server.
+    pub async fn run(self) -> (ServerHandle, JoinHandle<()>) {
+        let Self {
+            mut core,
+            local_sock,
+        } = self;
+        let (hnd_tx, mut hnd_recv) = mpsc::channel(8);
+        let handle = ServerHandle(hnd_tx);
+
+        let join_hnd = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    // Control messages win over new connections, so a shutdown is not held
+                    // off by a socket that keeps accepting.
+                    biased;
+
+                    msg = hnd_recv.recv() => {
+                        // Every handle dropped: nothing can drive us any more.
+                        let Some(msg) = msg else { return };
+                        if let ControlFlow::Break(r) = Self::handle_message(&mut core, msg).await {
+                            // Shutdown, r is to respond when we are done shutting down.
+                            r.respond(Ok(()));
+                            return;
+                        }
+                    }
+                    conn = local_sock.accept() => match conn {
+                        Ok((stream, _addr)) => Self::handle_connection(&mut core, stream).await,
+                        Err(e) => tracing::warn!(error = %e, "accepting local connection"),
+                    },
+                }
+            }
+        });
+
+        (handle, join_hnd)
+    }
+
+    /// Routes one message to the handler for it, lending each the components it needs.
+    ///
+    /// Handlers take `&mut Core` rather than `&Core`: the SQLite connection is `Send` but not
+    /// `Sync`, so only a unique borrow of the core can be held across an await in the spawned
+    /// mainloop.
+    async fn handle_message(core: &mut Core, msg: ServerMsg) -> ControlFlow<Responder<(), ()>> {
+        match msg {
+            ServerMsg::Shutdown(r) => return ControlFlow::Break(r),
+            ServerMsg::Head(r) => Self::handle_head(core, r).await,
+        }
+
+        ControlFlow::Continue(())
+    }
+
+    /// Reads the canonical head the core stands at.
+    async fn handle_head(core: &mut Core, r: Responder<EnvelopeDigest, ()>) {
+        r.handle(async move { Ok(core.head()) }).await
+    }
+
+    /// Serves one client on the local control socket.
+    async fn handle_connection(_core: &mut Core, stream: UnixStream) {
+        // TODO: speak the control protocol. Dropping the stream closes it.
+        tracing::info!("accepted local connection");
+        drop(stream);
+    }
+}
+
+/// A handle to a running lotusd server.
+#[derive(Debug, Clone)]
+pub struct ServerHandle(mpsc::Sender<ServerMsg>);
+
+impl ServerHandle {
+    /// Issues a server shutdown. If the server is running, this future resolves with
+    /// and Ok value when shutdown is finished. If the server is not running or otherwise
+    /// in a broken state, an Err value is returned immediately.
+    pub async fn shutdown(&self) -> Result<(), ()> {
+        let (send, recv) = Responder::channel();
+        let _ = self.0.send(ServerMsg::Shutdown(send)).await;
+        match recv.await {
+            Ok(v) => v,
+            Err(_) => Err(()),
+        }
+    }
+
+    /// Reads the current HEAD.
+    pub async fn head(&self) -> Result<EnvelopeDigest, ()> {
+        let (send, recv) = Responder::channel();
+        let _ = self.0.send(ServerMsg::Head(send)).await;
+        match recv.await {
+            Ok(Ok(v)) => Ok(v),
+            _ => Err(()),
+        }
+    }
 }
