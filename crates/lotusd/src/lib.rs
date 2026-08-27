@@ -413,6 +413,7 @@ impl Server {
 #[derive(Debug, Clone)]
 pub struct ServerHandle(mpsc::Sender<ServerMsg>);
 
+#[allow(clippy::result_unit_err)]
 impl ServerHandle {
     /// Issues a server shutdown. If the server is running, this future resolves with
     /// and Ok value when shutdown is finished. If the server is not running or otherwise

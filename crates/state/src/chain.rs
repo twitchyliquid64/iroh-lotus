@@ -374,7 +374,7 @@ fn descends<S: Storage>(
 #[cfg(test)]
 mod tests {
     use ed25519_zebra::SigningKey;
-    use storage::{MemStorage, Storage as _};
+    use storage::MemStorage;
     use wire::{
         Msg, VerificationStatus,
         keys::{Ed25519PublicKey, Ed25519Signature, Key, PublicKey, Signature},
