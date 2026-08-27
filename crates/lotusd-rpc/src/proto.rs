@@ -15,18 +15,18 @@ pub enum Request {
     /// See [`GetVersion`].
     #[serde(rename = "v")]
     GetVersion(GetVersion),
-    /// See [`GetHead`].
-    #[serde(rename = "h")]
-    GetHead(GetHead),
+    /// See [`GetChainRange`].
+    #[serde(rename = "c")]
+    GetChainRange(GetChainRange),
 }
 
 /// Asks the daemon for its version.
 #[derive(Debug, Clone, Cbor, PartialEq, Eq)]
 pub struct GetVersion {}
 
-/// Asks the daemon for the canonical head it stands at.
+/// Asks the daemon how much of the chain it holds.
 #[derive(Debug, Clone, Cbor, PartialEq, Eq)]
-pub struct GetHead {}
+pub struct GetChainRange {}
 
 /// One frame of the answer to a request.
 #[derive(Debug, Clone, Cbor, PartialEq, Eq)]
@@ -34,9 +34,9 @@ pub enum Response {
     /// Answers [`GetVersion`].
     #[serde(rename = "v")]
     Version(String),
-    /// Answers [`GetHead`].
-    #[serde(rename = "h")]
-    Head(EnvelopeDigest),
+    /// Answers [`GetChainRange`].
+    #[serde(rename = "c")]
+    ChainRange(ChainRange),
     /// Ends the stream: the request could not be served to completion.
     #[serde(rename = "e")]
     Failed(Failure),
@@ -48,10 +48,24 @@ impl Response {
     pub(crate) fn name(&self) -> &'static str {
         match self {
             Response::Version(_) => "version",
-            Response::Head(_) => "head",
+            Response::ChainRange(_) => "chain range",
             Response::Failed(_) => "failure",
         }
     }
+}
+
+/// How much of the chain a node holds: everything from `root` to `head`.
+///
+/// Both ends come from one read, so `root` never overtakes the `head` it
+/// arrives with — reading them apart could catch compaction mid-move.
+#[derive(Debug, Copy, Clone, Cbor, PartialEq, Eq)]
+pub struct ChainRange {
+    /// The oldest envelope still held, until compaction moves it forward.
+    #[cbor(key = 1)]
+    pub root: EnvelopeDigest,
+    /// The canonical head the node stands at.
+    #[cbor(key = 2)]
+    pub head: EnvelopeDigest,
 }
 
 /// Why a request could not be served.

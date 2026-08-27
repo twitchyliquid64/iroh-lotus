@@ -4,13 +4,14 @@
 use std::path::PathBuf;
 
 use lotusd::{Core, IfInitialized, Server, ServerHandle, VERSION};
-use lotusd_rpc::{GetHead, GetVersion, call};
+use lotusd_rpc::{GetChainRange, GetVersion, call};
 use tempfile::TempDir;
 use tokio::{net::UnixStream, task::JoinHandle};
 use wire::EnvelopeDigest;
 
 /// Starts a server on a fresh cluster in `dir`, alongside the head it began
-/// at and the socket clients reach it on.
+/// at — the genesis, which is also its root — and the socket clients reach
+/// it on.
 ///
 /// The handle comes back for the caller to hold: the mainloop stops as soon
 /// as the last one is dropped.
@@ -38,12 +39,16 @@ async fn get_version_answers_with_the_daemon_version() {
 }
 
 #[tokio::test]
-async fn get_head_answers_with_the_head_the_core_stands_at() {
+async fn get_chain_range_answers_with_the_range_the_core_holds() {
     let dir = TempDir::new().unwrap();
     let (head, path, _handle, _join) = serve(&dir).await;
 
     let stream = UnixStream::connect(&path).await.unwrap();
-    assert_eq!(call(stream, GetHead {}).await.unwrap(), head);
+    let range = call(stream, GetChainRange {}).await.unwrap();
+
+    // A cluster one envelope old stands at its own genesis.
+    assert_eq!(range.head, head);
+    assert_eq!(range.root, head);
 }
 
 #[tokio::test]
@@ -53,7 +58,7 @@ async fn each_connection_carries_its_own_request() {
 
     for _ in 0..3 {
         let stream = UnixStream::connect(&path).await.unwrap();
-        assert_eq!(call(stream, GetHead {}).await.unwrap(), head);
+        assert_eq!(call(stream, GetChainRange {}).await.unwrap().head, head);
     }
 }
 
@@ -70,7 +75,7 @@ async fn connections_are_served_off_the_mainloop() {
             let path = path.clone();
             tokio::spawn(async move {
                 let stream = UnixStream::connect(&path).await.unwrap();
-                call(stream, GetHead {}).await.unwrap()
+                call(stream, GetChainRange {}).await.unwrap().head
             })
         })
         .collect();

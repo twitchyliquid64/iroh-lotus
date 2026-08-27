@@ -1,8 +1,6 @@
 //! What ties a request to the answers it draws back.
 
-use wire::EnvelopeDigest;
-
-use crate::{Error, GetHead, GetVersion, Request, Response};
+use crate::{ChainRange, Error, GetChainRange, GetVersion, Request, Response};
 
 /// One method of the local control protocol.
 ///
@@ -58,5 +56,5 @@ macro_rules! methods {
 
 methods! {
     "version": GetVersion => Version(String),
-    "head": GetHead => Head(EnvelopeDigest),
+    "chain range": GetChainRange => ChainRange(ChainRange),
 }

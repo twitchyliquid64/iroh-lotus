@@ -19,7 +19,7 @@ mod frame;
 pub use frame::MAX_FRAME_LEN;
 
 mod proto;
-pub use proto::{Failure, FailureKind, GetHead, GetVersion, Request, Response};
+pub use proto::{ChainRange, Failure, FailureKind, GetChainRange, GetVersion, Request, Response};
 
 mod method;
 pub use method::Method;

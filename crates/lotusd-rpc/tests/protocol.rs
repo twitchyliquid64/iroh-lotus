@@ -2,22 +2,25 @@
 //! responses out, and a failure the client can tell apart from a hangup.
 
 use lotusd_rpc::{
-    Call, Error, Failure, FailureKind, GetHead, GetVersion, Handler, MAX_FRAME_LEN, Request,
-    Response, Responses, call, serve,
+    Call, ChainRange, Error, Failure, FailureKind, GetChainRange, GetVersion, Handler,
+    MAX_FRAME_LEN, Request, Response, Responses, call, serve,
 };
 use tokio::io::{AsyncWriteExt, DuplexStream, duplex};
 use wire::EnvelopeDigest;
 
-/// A digest to answer `GetHead` with, distinct from any real chain's.
-fn head() -> EnvelopeDigest {
-    EnvelopeDigest::from_bytes([7u8; 32])
+/// A range to answer `GetChainRange` with, distinct from any real chain's.
+fn range() -> ChainRange {
+    ChainRange {
+        root: EnvelopeDigest::from_bytes([3u8; 32]),
+        head: EnvelopeDigest::from_bytes([7u8; 32]),
+    }
 }
 
 /// A handler that answers each method the way the daemon does, plus a
-/// `GetHead` that streams so the multi-response path is exercised.
+/// `GetChainRange` that streams so the multi-response path is exercised.
 struct Fake {
-    /// How many times `GetHead` answers before ending its stream.
-    heads: usize,
+    /// How many times `GetChainRange` answers before ending its stream.
+    ranges: usize,
     /// Fails every request with this, rather than answering.
     fail: Option<Failure>,
 }
@@ -25,7 +28,7 @@ struct Fake {
 impl Fake {
     fn new() -> Self {
         Self {
-            heads: 1,
+            ranges: 1,
             fail: None,
         }
     }
@@ -43,9 +46,9 @@ impl Handler for Fake {
 
         match request {
             Request::GetVersion(_) => responses.send(Response::Version("1.2.3".to_owned())).await,
-            Request::GetHead(_) => {
-                for _ in 0..self.heads {
-                    responses.send(Response::Head(head())).await?;
+            Request::GetChainRange(_) => {
+                for _ in 0..self.ranges {
+                    responses.send(Response::ChainRange(range())).await?;
                 }
                 Ok(())
             }
@@ -70,26 +73,26 @@ async fn get_version_answers_with_the_version() {
 }
 
 #[tokio::test]
-async fn get_head_answers_with_the_head() {
-    let digest = call(connect(Fake::new()), GetHead {}).await.unwrap();
+async fn get_chain_range_answers_with_both_ends() {
+    let answer = call(connect(Fake::new()), GetChainRange {}).await.unwrap();
 
-    assert_eq!(digest, head());
+    assert_eq!(answer, range());
 }
 
 #[tokio::test]
 async fn a_method_may_answer_more_than_once() {
     let mut stream = Call::send(
         connect(Fake {
-            heads: 3,
+            ranges: 3,
             ..Fake::new()
         }),
-        GetHead {},
+        GetChainRange {},
     )
     .await
     .unwrap();
 
     for _ in 0..3 {
-        assert_eq!(stream.next().await.unwrap(), Some(head()));
+        assert_eq!(stream.next().await.unwrap(), Some(range()));
     }
     // The daemon closing is what ends the stream.
     assert_eq!(stream.next().await.unwrap(), None);
@@ -99,10 +102,10 @@ async fn a_method_may_answer_more_than_once() {
 async fn a_method_that_answers_nothing_closes_the_stream() {
     let mut stream = Call::send(
         connect(Fake {
-            heads: 0,
+            ranges: 0,
             ..Fake::new()
         }),
-        GetHead {},
+        GetChainRange {},
     )
     .await
     .unwrap();
@@ -115,10 +118,10 @@ async fn a_stream_that_ends_unanswered_is_not_a_silent_success() {
     assert!(matches!(
         call(
             connect(Fake {
-                heads: 0,
+                ranges: 0,
                 ..Fake::new()
             }),
-            GetHead {}
+            GetChainRange {}
         )
         .await,
         Err(Error::NoResponse)
@@ -132,7 +135,7 @@ async fn a_handler_failure_reaches_the_client() {
             fail: Some(Failure::internal("the disk melted")),
             ..Fake::new()
         }),
-        GetHead {},
+        GetChainRange {},
     )
     .await
     .unwrap_err();
@@ -156,7 +159,7 @@ async fn a_request_the_daemon_cannot_decode_is_unsupported() {
         .unwrap();
     client.write_all(&body).await.unwrap();
 
-    let mut stream: Call<_, GetHead> = Call::send(client, GetHead {}).await.unwrap();
+    let mut stream: Call<_, GetChainRange> = Call::send(client, GetChainRange {}).await.unwrap();
     let Err(Error::Failed(failure)) = stream.next().await else {
         panic!("expected an unsupported failure");
     };
@@ -172,7 +175,7 @@ async fn a_frame_past_the_limit_is_refused_before_it_is_read() {
         .await
         .unwrap();
 
-    let mut stream: Call<_, GetHead> = Call::send(client, GetHead {}).await.unwrap();
+    let mut stream: Call<_, GetChainRange> = Call::send(client, GetChainRange {}).await.unwrap();
     // The server tore the connection down rather than allocating the body.
     assert!(stream.next().await.unwrap().is_none());
 }

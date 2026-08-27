@@ -36,6 +36,25 @@ async fn head_answers_with_the_head_the_core_started_at() {
 }
 
 #[tokio::test]
+async fn root_answers_with_the_genesis_a_fresh_cluster_was_founded_on() {
+    let dir = TempDir::new().unwrap();
+    let (head, handle, _join) = serve(&dir).await;
+
+    // One envelope in, so the chain's oldest is also the head.
+    assert_eq!(handle.root().await.unwrap(), head);
+}
+
+#[tokio::test]
+async fn chain_range_answers_with_both_ends_at_once() {
+    let dir = TempDir::new().unwrap();
+    let (head, handle, _join) = serve(&dir).await;
+
+    let range = handle.chain_range().await.unwrap();
+    assert_eq!(range.root, head);
+    assert_eq!(range.head, head);
+}
+
+#[tokio::test]
 async fn head_is_answerable_more_than_once() {
     let dir = TempDir::new().unwrap();
     let (head, handle, _join) = serve(&dir).await;
@@ -65,6 +84,7 @@ async fn a_shut_down_server_answers_nothing() {
     handle.shutdown().await.unwrap();
 
     assert!(handle.head().await.is_err());
+    assert!(handle.root().await.is_err());
     assert!(handle.shutdown().await.is_err());
 }
 
