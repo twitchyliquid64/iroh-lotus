@@ -1,11 +1,9 @@
-use std::{collections::BTreeMap, path::PathBuf, process::ExitCode};
+use std::{path::PathBuf, process::ExitCode};
 
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
-use lotusd::Core;
-use state::Chain;
-use storage::SqliteStorage;
-use tokio::{fs, runtime::Builder};
+use lotusd::{Core, IfInitialized};
+use tokio::runtime::Builder;
 
 #[derive(Parser)]
 #[command(name = "lotusd", version = "0.0.1")]
@@ -116,49 +114,18 @@ async fn async_main() -> Result<(), MainError> {
             println!("core: {core}");
         }
         Command::Init(a) => {
-            let state_dir = cli.global_args.state_dir()?;
-            fs::create_dir_all(&state_dir)
-                .await
-                .map_err(|e| MainError::IO(e, "creating state-dir"))?;
-
-            if fs::try_exists(state_dir.join(lotusd::OLDEST_ENVELOPE_FILENAME))
-                .await
-                .map_err(|e| MainError::IO(e, "reading oldest-envelope"))?
-                && !a.overwrite_existing
-            {
-                return Err(MainError::Other(format!(
-                    "Cluster at {} already initialized, pass --overwrite_existing to overwrite",
-                    state_dir.display(),
-                )));
-            }
-
-            // Make the init message
-            use wire::{Envelope, Msg, VerificationStatus, msg::FullCheckpoint, msg::InitMsg};
-            let mut envelope = Envelope::new(Msg::Init(InitMsg {
-                state: FullCheckpoint {
-                    namespaces: BTreeMap::from_iter([]),
+            let core = Core::create_in_state_dir(
+                cli.global_args.state_dir()?,
+                if a.overwrite_existing {
+                    IfInitialized::Overwrite
+                } else {
+                    IfInitialized::Fail
                 },
-            }));
-            envelope.set_verification_status(VerificationStatus::AllMatched { total_weight: 2 });
-
-            let mut storage = SqliteStorage::open(state_dir.join(lotusd::SQLITE_DB_FILENAME))
-                .map_err(MainError::Storage)?;
-            let chain = Chain::init(&mut storage, envelope).map_err(MainError::Chain)?;
-
-            // Written only once the genesis is durable, so the file never names an
-            // envelope the store is missing.
-            fs::write(
-                state_dir.join(lotusd::OLDEST_ENVELOPE_FILENAME),
-                chain.root().as_bytes(),
             )
             .await
-            .map_err(|e| MainError::IO(e, "writing oldest-envelope"))?;
+            .map_err(MainError::Init)?;
 
-            println!(
-                "Initialized cluster at {} rooted at {}",
-                state_dir.display(),
-                chain.root().to_hex().as_ref()
-            );
+            println!("Initialized cluster {core}");
         }
     }
 
@@ -169,10 +136,5 @@ async fn async_main() -> Result<(), MainError> {
 #[derive(Debug)]
 pub enum MainError {
     Init(lotusd::InitError),
-    /// The sqlite store could not be opened.
-    Storage(storage::sqlite::Error),
-    /// The genesis envelope could not be committed to the chain.
-    Chain(state::Error<storage::sqlite::Error>),
-    IO(std::io::Error, &'static str),
     Other(String),
 }

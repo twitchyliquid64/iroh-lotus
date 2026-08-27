@@ -12,7 +12,9 @@ cbor2.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 dirs.workspace = true
+ed25519-zebra.workspace = true
 nutype.workspace = true
+rand.workspace = true
 serde.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
@@ -22,3 +24,6 @@ tokio-util.workspace = true
 state.workspace = true
 storage.workspace = true
 wire.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
