@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/lotusctl",
     "crates/lotusd",
     "crates/lotusd-rpc",
     "crates/state",

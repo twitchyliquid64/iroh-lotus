@@ -1,0 +1,19 @@
+[package]
+name = "lotusctl"
+version.workspace = true
+rust-version.workspace = true
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+clap.workspace = true
+clap_complete.workspace = true
+dirs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+# Our crates
+lotusd-rpc.workspace = true
+wire.workspace = true

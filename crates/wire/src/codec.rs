@@ -221,11 +221,13 @@ impl<'de, const N: usize> de::Visitor<'de> for ByteArrayVisitor<N> {
             return Err(E::invalid_length(hex.len(), &self));
         }
         let mut bytes = [0u8; N];
+        // The length check above leaves no remainder.
+        let (pairs, _) = hex.as_bytes().as_chunks::<2>();
         bytes
             .iter_mut()
-            .zip(hex.as_bytes().chunks_exact(2))
-            .try_for_each(|(byte, pair)| {
-                *byte = (nibble(pair[0])? << 4) | nibble(pair[1])?;
+            .zip(pairs)
+            .try_for_each(|(byte, [hi, lo])| {
+                *byte = (nibble(*hi)? << 4) | nibble(*lo)?;
                 Some(())
             })
             .ok_or_else(|| E::invalid_value(de::Unexpected::Str(s), &self))?;
