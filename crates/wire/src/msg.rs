@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use cbor2::Cbor;
 use nutype::nutype;
 
-use crate::{EnvelopeDigest, subkey::SubkeyPath};
+use crate::{EnvelopeDigest, keys::Key, subkey::SubkeyPath};
 
 /// The name a namespace is stored under in the ledger.
 #[nutype(
@@ -247,12 +247,18 @@ pub enum Value {
     Array(Vec<Value>),
     #[serde(rename = "m")]
     Map(BTreeMap<String, Value>),
+    /// A key in the ledger's trusted key set. A leaf: subkey paths do not
+    /// reach inside one, so a key is replaced whole rather than amended
+    /// field by field.
+    #[serde(rename = "k")]
+    Key(Key),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
+        keys::{Ed25519PublicKey, PublicKey},
         subkey::Subkey,
         testutil::{assert_wire, unhex},
     };
@@ -281,6 +287,21 @@ mod tests {
         assert_wire(&Value::Bool(true), "a16162f5");
         assert_wire(&Value::Bool(false), "a16162f4");
         assert_wire(&Value::Array(vec![]), "a1616180");
+    }
+
+    /// `a1 61 6b` wraps the key, which carries its own three-pair map:
+    /// the public key under `01`, the weight under `02`, metadata under
+    /// `03`. A key is a value like any other, so the trusted key set is
+    /// ordinary namespace data.
+    #[test]
+    fn value_holds_a_key() {
+        assert_wire(
+            &Value::Key(Key::new(
+                PublicKey::Ed25519(Ed25519PublicKey::from_bytes([0xab; 32])),
+                7,
+            )),
+            &format!("a1616ba301a161655820{}020703a0", "ab".repeat(32)),
+        );
     }
 
     #[test]

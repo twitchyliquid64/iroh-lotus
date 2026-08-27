@@ -8,8 +8,12 @@ pub use error::Error;
 
 mod envelope;
 pub use envelope::{
-    Envelope, EnvelopeDigest, EnvelopeSignature, SignedTimestamp, VerificationStatus,
+    Envelope, EnvelopeDigest, EnvelopeSignature, EnvelopeSignatureDigest, SignedTimestamp,
+    VerificationStatus,
 };
+
+pub mod keys;
+pub use keys::{Key, KeyId, PublicKey, Signature};
 
 pub mod msg;
 pub use msg::Msg;

@@ -1006,6 +1006,41 @@ mod tests {
         AmendOp::IncrementDecrement(IncrementDecrement::new(delta))
     }
 
+    /// A key is a leaf, so neither writing through one nor amending one is
+    /// legal — both are refused at validation, never stored.
+    #[test]
+    fn a_key_cannot_be_descended_into_or_amended() {
+        let (mut store, mut ledger) = nested_ledger();
+
+        let signer = Value::Key(wire::keys::Key::new(
+            wire::keys::PublicKey::Ed25519(wire::keys::Ed25519PublicKey::from_bytes([0xab; 32])),
+            1,
+        ));
+        let envelope = set_key(ledger.head(), path([sub("signer")]), Some(signer.clone()));
+        ledger.apply(&mut store, &envelope).unwrap();
+        assert_eq!(at(&store, &ledger, &[sub("signer")]), Some(signer));
+
+        let head = ledger.head();
+        let err = ledger
+            .apply(
+                &mut store,
+                &set_key(
+                    head,
+                    path([sub("signer"), sub("weight")]),
+                    Some(Value::Int(9)),
+                ),
+            )
+            .unwrap_err();
+        assert!(matches!(err, ApplyError::PathTypeMismatch { .. }));
+
+        let err = ledger
+            .apply(&mut store, &amend(head, path([sub("signer")]), inc(1)))
+            .unwrap_err();
+        assert!(matches!(err, ApplyError::AmendTypeMismatch { .. }));
+
+        assert_eq!(ledger.head(), head);
+    }
+
     #[test]
     fn amend_appends_to_an_existing_array() {
         let (mut store, mut ledger) = nested_ledger();

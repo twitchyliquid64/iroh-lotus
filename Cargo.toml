@@ -26,6 +26,8 @@ chrono = {version = "0.4", features = ["serde", "std"]}
 clap = { version = "4.6", features = ["derive", "env", "string"] }
 clap_complete = { version = "4.6" }
 dirs = "6"
+# ZIP 215 verification: see "Signature verification" in AGENTS.md.
+ed25519-zebra = "4"
 
 nutype = { version = "0.7", features = ["serde"] }
 rand = "0.10"

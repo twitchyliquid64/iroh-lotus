@@ -21,7 +21,7 @@ pub fn kind(value: &Value) -> NodeKind {
     match value {
         Value::Map(_) => NodeKind::Map,
         Value::Array(_) => NodeKind::Array,
-        Value::String(_) | Value::Int(_) | Value::Bool(_) => NodeKind::Leaf,
+        Value::String(_) | Value::Int(_) | Value::Bool(_) | Value::Key(_) => NodeKind::Leaf,
     }
 }
 
@@ -146,4 +146,46 @@ fn walk_mut<'a>(root: &'a mut Value, path: &[Subkey]) -> Option<&'a mut Value> {
             (Value::Array(array), Subkey::Index(index)) => array.get_mut(*index as usize),
             _ => None,
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use wire::{
+        keys::{Ed25519PublicKey, Key, PublicKey},
+        msg::Value,
+    };
+
+    use super::*;
+
+    fn key_value() -> Value {
+        Value::Key(Key::new(
+            PublicKey::Ed25519(Ed25519PublicKey::from_bytes([0xab; 32])),
+            1,
+        ))
+    }
+
+    /// A key is an atom to the walk: it has fields, but no subkey reaches
+    /// them, so descending into one is a mismatch like stepping through
+    /// any other leaf.
+    #[test]
+    fn a_path_cannot_descend_into_a_key() {
+        assert_eq!(kind(&key_value()), NodeKind::Leaf);
+
+        let root = Value::Map([("signer".to_string(), key_value())].into());
+
+        assert_eq!(
+            resolve(&root, &[Subkey::Key("signer".to_string())]),
+            Resolution::Node(NodeKind::Leaf),
+        );
+        assert_eq!(
+            resolve(
+                &root,
+                &[
+                    Subkey::Key("signer".to_string()),
+                    Subkey::Key("weight".to_string()),
+                ],
+            ),
+            Resolution::Mismatch { depth: 1 },
+        );
+    }
 }

@@ -16,6 +16,29 @@ as long as compaction has not run on the oldest trustworthy message.
 | `state` | The state a chain folds down to. `Ledger::apply` advances it one envelope at a time, like replaying a database log. `Chain` stores every envelope seen — competing forks included — in the store's log and keeps a ledger on the canonical path: at every fork the highest verified signature weight wins, ties broken by the highest envelope digest. |
 | `storage` | Where ledger state lives: a content-addressed version store keyed by envelope digest, so many ledgers (forks, rewrites, old positions) share one backend, plus the envelope log those versions fold down from. Namespace/path-granular reads and writes, the in-memory backend, the SQLite backend (default feature `sqlite`), and the conformance suite every backend must pass. |
 
+## Signature verification
+
+If different nodes disagree on what signatures are valid, you get a permanent chain split: fork resolution picks the path with the highest
+*verified* signature weight, so nodes that disagree about one signature pick different canonical chains and never
+reconverge.
+
+`wire` therefore verifies with `ed25519-zebra`, which implements [ZIP 215](https://zips.z.cash/zip-0215) — a precisely
+specified rule set where individual verification agrees with batch verification.
+
+Rules that follow:
+
+ - Verify only through `wire`'s `Key::verify`. Never reach for `ed25519-dalek`'s `verify` or `verify_strict` on ledger
+   signatures: those are different rule sets, and `verify_strict` disagrees with dalek's own batch verifier.
+ - Keys and signatures are stored as the bytes that arrived and parsed only at verification time. A malformed key is a
+   *failed verification*, never a decode error — an envelope one node cannot decode and another can is the same split
+   by another name.
+ - Signatures cover `Envelope::signature_digest`, not `Envelope::digest`; the latter covers the signatures themselves.
+   Timestamps are inside the signed portion, so they must be attached before signing.
+ - An envelope names its signing key by `KeyId` — blake3 over the *public key's* canonical encoding, never over the
+   whole `Key` — and the trusted key set that resolves ids to keys is ordinary ledger state. Weight and metadata sit
+   outside the id so a key can be re-weighted without orphaning the signatures naming it. The derivation is
+   consensus-critical: nodes that derive different ids resolve different keys for the same signature.
+
 ## Development conventions and hard rules
 
  - Use **Conventional Commits** for the commit message. Don't commit unless asked.
