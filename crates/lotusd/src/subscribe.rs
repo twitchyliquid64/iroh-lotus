@@ -15,9 +15,9 @@
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
-use generational_arena::{Arena, Index};
 use lotusd_rpc as rpc;
 use state::{Change, Movement};
+use thunderdome::{Arena, Index};
 use tokio::sync::mpsc;
 use wire::{EnvelopeDigest, msg::NamespaceKey, subkey::SubkeyPath};
 

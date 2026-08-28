@@ -495,15 +495,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "generational-arena"
-version = "0.2.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "877e94aff08e743b651baaea359664321055749b398adff8740a7399af7796e7"
-dependencies = [
- "cfg-if",
-]
-
-[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -722,7 +713,6 @@ dependencies = [
  "clap_complete",
  "dirs",
  "ed25519-zebra",
- "generational-arena",
  "lotusd-rpc",
  "nutype",
  "rand",
@@ -733,6 +723,7 @@ dependencies = [
  "sync",
  "tempfile",
  "thiserror",
+ "thunderdome",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -1297,6 +1288,12 @@ checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
 dependencies = [
  "cfg-if",
 ]
+
+[[package]]
+name = "thunderdome"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92e170f93360bf9ae6fe3c31116bbf27adb1d054cedd6bc3d7857e34f2d98d0b"
 
 [[package]]
 name = "tokio"
