@@ -7,6 +7,7 @@ use std::{
 };
 
 use ed25519_zebra::SigningKey;
+use iroh::SecretKey;
 use rand::{TryRng, rngs::SysRng};
 use state::{Chain, ChangeDiffer, Insert, TRUSTED_KEYS_KEY};
 use storage::{LogEntry, SqliteStorage, Storage, StoredAt};
@@ -22,6 +23,7 @@ use crate::{ChangeFilter, SubscriptionHandle, Subscriptions};
 pub const SQLITE_DB_FILENAME: &str = "db.sqlite";
 pub const OLDEST_ENVELOPE_FILENAME: &str = "oldest_envelope";
 pub const SIGNING_KEY_FILENAME: &str = "node.ed25519";
+pub const IROH_SECRET_FILENAME: &str = "node.iroh";
 
 /// The weight given to the key a new cluster is founded on.
 const ROOT_KEY_WEIGHT: u32 = 2;
@@ -39,8 +41,12 @@ pub struct Core {
     chain: Chain,
     oldest: EnvelopeDigest,
     state_dir: PathBuf,
-    /// The one key this node signs with.
+    /// The one key this node signs ledger envelopes with.
     signing_key: SigningKey,
+    /// The one key this node's iroh endpoint is identified by. Nothing to
+    /// do with the ledger: peers dial it, the trusted key set never names
+    /// it, and it signs no envelope.
+    iroh_secret: SecretKey,
     subscriptions: Subscriptions,
 }
 
@@ -79,6 +85,7 @@ impl Core {
 
         let chain = Chain::open(&mut storage, oldest).map_err(InitError::Chain)?;
         let signing_key = load_signing_key(&state_dir).await?;
+        let iroh_secret = load_iroh_secret(&state_dir).await?;
 
         Ok(Self {
             storage,
@@ -86,12 +93,13 @@ impl Core {
             oldest,
             state_dir,
             signing_key,
+            iroh_secret,
             subscriptions: Subscriptions::default(),
         })
     }
 
-    /// Initializes a new cluster in `state_dir` — generating its first signing
-    /// key and committing the genesis envelope — and returns it opened, as
+    /// Initializes a new cluster in `state_dir` — generating this node's
+    /// keys and committing the genesis envelope — and returns it opened, as
     /// [`Core::init_with_state_dir`] would return it on the next start.
     pub async fn create_in_state_dir(
         state_dir: PathBuf,
@@ -110,6 +118,7 @@ impl Core {
         }
 
         let signing_key = gen_signing_key(&state_dir).await?;
+        gen_iroh_secret(&state_dir).await?;
         let trusted = Key::new(public_key(&signing_key), ROOT_KEY_WEIGHT);
         let key_id = trusted.id();
 
@@ -139,9 +148,10 @@ impl Core {
             .await
             .map_err(|e| InitError::IO(e, "writing oldest-envelope"))?;
 
-        // Read back rather than assembled from the key just generated, so a
+        // Read back rather than assembled from the keys just generated, so a
         // core is the same whichever way it was reached.
         let signing_key = load_signing_key(&state_dir).await?;
+        let iroh_secret = load_iroh_secret(&state_dir).await?;
 
         Ok(Self {
             storage,
@@ -149,6 +159,7 @@ impl Core {
             oldest,
             state_dir,
             signing_key,
+            iroh_secret,
             subscriptions: Subscriptions::default(),
         })
     }
@@ -285,9 +296,14 @@ impl Core {
             .collect()
     }
 
-    /// The key this node signs with.
+    /// The key this node signs ledger envelopes with.
     pub fn signing_key(&self) -> &SigningKey {
         &self.signing_key
+    }
+
+    /// The secret key this node's iroh endpoint is identified by.
+    pub fn iroh_secret(&self) -> &SecretKey {
+        &self.iroh_secret
     }
 
     /// The id the ledger's trusted key set refers to this node's key by.
@@ -391,16 +407,40 @@ fn public_key(key: &SigningKey) -> PublicKey {
     PublicKey::Ed25519(Ed25519PublicKey::from_bytes(key.verification_key().into()))
 }
 
-/// Loads the node's signing key from `state_dir`.
+/// Loads the node's ledger signing key from `state_dir`.
 async fn load_signing_key(state_dir: &Path) -> Result<SigningKey, InitError> {
-    let path = state_dir.join(SIGNING_KEY_FILENAME);
+    load_secret(
+        state_dir.join(SIGNING_KEY_FILENAME),
+        "reading signing-key",
+        InitError::SigningKeyLength,
+    )
+    .await
+    .map(SigningKey::from)
+}
+
+/// Loads the node's iroh secret key from `state_dir`.
+async fn load_iroh_secret(state_dir: &Path) -> Result<SecretKey, InitError> {
+    load_secret(
+        state_dir.join(IROH_SECRET_FILENAME),
+        "reading iroh-secret",
+        InitError::IrohSecretLength,
+    )
+    .await
+    .map(|secret| SecretKey::from_bytes(&secret))
+}
+
+/// Reads the 32 bytes of key material at `path`, reporting a file of any
+/// other length through `wrong_length`.
+async fn load_secret(
+    path: PathBuf,
+    reading: &'static str,
+    wrong_length: impl FnOnce(PathBuf, usize) -> InitError,
+) -> Result<[u8; 32], InitError> {
     let bytes = fs::read(&path)
         .await
-        .map_err(|e| InitError::IO(e, "reading signing-key"))?;
+        .map_err(|e| InitError::IO(e, reading))?;
 
-    <[u8; 32]>::try_from(bytes.as_slice())
-        .map(SigningKey::from)
-        .map_err(|_| InitError::SigningKeyLength(path, bytes.len()))
+    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| wrong_length(path, bytes.len()))
 }
 
 /// Attaches `key_id`'s signature over `envelope` to it.
@@ -415,38 +455,70 @@ fn sign(key: &SigningKey, key_id: KeyId, envelope: Envelope) -> Result<Envelope,
     Ok(envelope.with_signature(key_id, signature))
 }
 
-/// Generates this node's signing key and saves it under `state_dir`,
+/// Generates this node's ledger signing key and saves it under `state_dir`,
 /// replacing whatever key was there: a node has exactly one.
 async fn gen_signing_key(state_dir: &Path) -> Result<SigningKey, InitError> {
-    // Drawn straight from the OS rather than through a userspace generator:
-    // this is one 32-byte draw, so ThreadRng's speed buys nothing and it
-    // leaves PRNG state that outlives the key.
-    //
+    let secret = draw_secret()?;
+    write_secret(
+        &state_dir.join(SIGNING_KEY_FILENAME),
+        &secret,
+        ("creating signing-key", "saving signing-key"),
+    )
+    .await?;
+
     // Not `SigningKey::new`: ed25519-zebra takes rand_core 0.6's traits while
     // the workspace is on rand 0.10, so no RNG here satisfies it. `new` only
     // fills 32 bytes and calls `from`, which is what this does.
-    let mut seed = [0u8; 32];
-    SysRng
-        .try_fill_bytes(&mut seed)
-        .map_err(InitError::Entropy)?;
-    let key = SigningKey::from(seed);
+    Ok(SigningKey::from(secret))
+}
 
+/// Generates this node's iroh secret key and saves it under `state_dir`,
+/// replacing whatever key was there: a node has exactly one, and its
+/// endpoint is that key.
+async fn gen_iroh_secret(state_dir: &Path) -> Result<(), InitError> {
+    write_secret(
+        &state_dir.join(IROH_SECRET_FILENAME),
+        &draw_secret()?,
+        ("creating iroh-secret", "saving iroh-secret"),
+    )
+    .await
+}
+
+/// Draws 32 bytes of key material.
+///
+/// Straight from the OS rather than through a userspace generator: this is
+/// one 32-byte draw, so ThreadRng's speed buys nothing and it leaves PRNG
+/// state that outlives the key.
+fn draw_secret() -> Result<[u8; 32], InitError> {
+    let mut secret = [0u8; 32];
+    SysRng
+        .try_fill_bytes(&mut secret)
+        .map_err(InitError::Entropy)?;
+    Ok(secret)
+}
+
+/// Writes key material to `path`, reporting the two ways that fails under
+/// the labels given.
+async fn write_secret(
+    path: &Path,
+    secret: &[u8; 32],
+    (creating, saving): (&'static str, &'static str),
+) -> Result<(), InitError> {
     let mut options = fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
-    // Created 0600 rather than relaxed-then-tightened: a signing key must never
+    // Created 0600 rather than relaxed-then-tightened: a secret key must never
     // exist group- or world-readable, not even for the width of one write.
     // `mode` is tokio's own inherent unix-only method, not `OpenOptionsExt`.
     #[cfg(unix)]
     options.mode(0o600);
 
     options
-        .open(state_dir.join(SIGNING_KEY_FILENAME))
+        .open(path)
         .await
-        .map_err(|e| InitError::IO(e, "creating signing-key"))?
-        .write_all(&key.to_bytes())
+        .map_err(|e| InitError::IO(e, creating))?
+        .write_all(secret)
         .await
-        .map_err(|e| InitError::IO(e, "saving signing-key"))?;
-    Ok(key)
+        .map_err(|e| InitError::IO(e, saving))
 }
 
 #[derive(Debug)]
@@ -455,12 +527,14 @@ pub enum InitError {
     IO(std::io::Error, &'static str),
     /// The state directory already holds a cluster; holds that directory.
     AlreadyInitialized(PathBuf),
-    /// The OS could not supply entropy for a new signing key.
+    /// The OS could not supply entropy for a new key.
     Entropy(rand::rngs::SysError),
     /// The genesis envelope could not be encoded to be signed.
     Wire(wire::Error),
     /// The signing key file was not exactly 32 bytes; holds it and the length found.
     SigningKeyLength(PathBuf, usize),
+    /// The iroh secret file was not exactly 32 bytes; holds it and the length found.
+    IrohSecretLength(PathBuf, usize),
     /// The oldest-envelope file was not exactly 32 bytes; holds the length found.
     OldestDigestLength(usize),
     /// An error occurred initializing the sqlite database.

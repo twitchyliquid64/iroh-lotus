@@ -13,6 +13,7 @@ clap.workspace = true
 clap_complete.workspace = true
 dirs.workspace = true
 ed25519-zebra.workspace = true
+iroh.workspace = true
 nutype.workspace = true
 rand.workspace = true
 serde.workspace = true

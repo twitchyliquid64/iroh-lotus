@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use ed25519_zebra::SigningKey;
+use iroh::SecretKey;
 use lotusd::{Core, IfInitialized, InitError};
 use state::{Chain, Insert, Ledger};
 use storage::{SqliteStorage, Storage};
@@ -27,6 +28,17 @@ fn signing_key_file(dir: &Path) -> PathBuf {
 fn stored_signing_key(dir: &Path) -> SigningKey {
     let bytes = std::fs::read(signing_key_file(dir)).expect("init writes a signing key");
     SigningKey::from(<[u8; 32]>::try_from(bytes.as_slice()).unwrap())
+}
+
+/// The one iroh secret `create_in_state_dir` leaves in `dir`.
+fn iroh_secret_file(dir: &Path) -> PathBuf {
+    dir.join(lotusd::IROH_SECRET_FILENAME)
+}
+
+/// The key held in `dir`'s iroh secret file.
+fn stored_iroh_secret(dir: &Path) -> SecretKey {
+    let bytes = std::fs::read(iroh_secret_file(dir)).expect("init writes an iroh secret");
+    SecretKey::from_bytes(&<[u8; 32]>::try_from(bytes.as_slice()).unwrap())
 }
 
 #[tokio::test]
@@ -72,17 +84,20 @@ async fn overwrite_reinitializes_an_openable_cluster() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn the_signing_key_is_written_unreadable_to_anyone_else() {
+async fn the_keys_are_written_unreadable_to_anyone_else() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = TempDir::new().unwrap();
     create(&dir, IfInitialized::Fail).await.unwrap();
 
-    let key = signing_key_file(dir.path());
-    assert_eq!(
-        std::fs::metadata(key).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
+    for key in [signing_key_file(dir.path()), iroh_secret_file(dir.path())] {
+        assert_eq!(
+            std::fs::metadata(&key).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "{} is readable by someone else",
+            key.display(),
+        );
+    }
 }
 
 /// Genesis is verified against the key set genesis installs itself, so a
@@ -129,13 +144,13 @@ async fn reopening_loads_the_signing_key_on_disk() {
     );
 }
 
-/// A node has exactly one key: re-initializing replaces it rather than
-/// leaving the old one beside it.
+/// A node has exactly one key of each kind: re-initializing replaces them
+/// rather than leaving the old ones beside them.
 #[tokio::test]
 async fn reinitializing_replaces_the_one_key() {
     let dir = TempDir::new().unwrap();
     let created = create(&dir, IfInitialized::Fail).await.unwrap();
-    let key_id = created.key_id();
+    let (key_id, iroh_secret) = (created.key_id(), created.iroh_secret().clone());
     drop(created);
 
     let recreated = create(&dir, IfInitialized::Overwrite).await.unwrap();
@@ -144,6 +159,44 @@ async fn reinitializing_replaces_the_one_key() {
     assert_eq!(
         recreated.signing_key().as_ref(),
         stored_signing_key(dir.path()).as_ref(),
+    );
+
+    assert_ne!(recreated.iroh_secret().public(), iroh_secret.public());
+    assert_eq!(
+        recreated.iroh_secret().public(),
+        stored_iroh_secret(dir.path()).public(),
+    );
+}
+
+/// The endpoint a node is dialled at outlives a restart: a node that drew
+/// a new iroh secret on every start would be a new peer each time.
+#[tokio::test]
+async fn reopening_loads_the_iroh_secret_on_disk() {
+    let dir = TempDir::new().unwrap();
+    let created = create(&dir, IfInitialized::Fail).await.unwrap();
+    let endpoint = created.iroh_secret().public();
+    drop(created);
+
+    let opened = Core::init_with_state_dir(dir.path().to_path_buf())
+        .await
+        .unwrap();
+
+    assert_eq!(opened.iroh_secret().public(), endpoint);
+    assert_eq!(
+        opened.iroh_secret().public(),
+        stored_iroh_secret(dir.path()).public(),
+    );
+}
+
+/// The two keys are drawn separately: one file must never be the other.
+#[tokio::test]
+async fn the_iroh_secret_is_not_the_signing_key() {
+    let dir = TempDir::new().unwrap();
+    create(&dir, IfInitialized::Fail).await.unwrap();
+
+    assert_ne!(
+        std::fs::read(signing_key_file(dir.path())).unwrap(),
+        std::fs::read(iroh_secret_file(dir.path())).unwrap(),
     );
 }
 
@@ -157,6 +210,19 @@ async fn a_truncated_signing_key_is_refused() {
     assert!(matches!(
         Core::init_with_state_dir(dir.path().to_path_buf()).await,
         Err(InitError::SigningKeyLength(path, 31)) if path == key
+    ));
+}
+
+#[tokio::test]
+async fn a_truncated_iroh_secret_is_refused() {
+    let dir = TempDir::new().unwrap();
+    create(&dir, IfInitialized::Fail).await.unwrap();
+    let key = iroh_secret_file(dir.path());
+    std::fs::write(&key, [0u8; 31]).unwrap();
+
+    assert!(matches!(
+        Core::init_with_state_dir(dir.path().to_path_buf()).await,
+        Err(InitError::IrohSecretLength(path, 31)) if path == key
     ));
 }
 

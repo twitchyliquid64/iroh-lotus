@@ -202,7 +202,9 @@ async fn async_main() -> Result<(), MainError> {
         }
         let listener =
             UnixListener::bind(&local_path).map_err(|e| MainError::IO(e, "listening to socket"))?;
-        tracing::info!("Started listening on {}", local_path.display());
+        tracing::info!("Control-socket listening on {}", local_path.display());
+        tracing::info!("Node ID:     {}", core.key_id().to_hex().as_ref());
+        tracing::info!("Endpoint ID: {}", core.iroh_secret().public().to_z32());
 
         let (serv, join_hnd) = Server::new(core, listener)
             .map_err(MainError::Init)?
