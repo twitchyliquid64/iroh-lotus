@@ -3,14 +3,11 @@ use std::{path::PathBuf, process::ExitCode};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use lotusd::{Core, IfInitialized, Server};
+use render::{ColorChoice, Render};
 use tokio::net::UnixListener;
 use tokio::runtime::Builder;
 use tokio::signal::unix::SignalKind;
 use tracing_subscriber::EnvFilter;
-
-use crate::print::print_chain;
-
-mod print;
 
 #[derive(Parser)]
 #[command(name = "lotusd", version = "0.0.1")]
@@ -43,7 +40,19 @@ enum Command {
 #[derive(Debug, Subcommand)]
 enum DebugCommand {
     /// Prints the canonical chain, from the oldest envelope still held to head
-    Chain,
+    Chain(ChainArgs),
+}
+
+/// The arguments for the debug chain subcommand.
+#[derive(Debug, Args)]
+struct ChainArgs {
+    /// Print at most this many envelopes, counted back from the head
+    #[arg(long, short = 'n')]
+    limit: Option<u32>,
+
+    /// When to colour the output
+    #[arg(long, value_enum, default_value_t = ColorChoice::Auto)]
+    color: ColorChoice,
 }
 
 /// The arguments for the completions subcommand.
@@ -152,12 +161,23 @@ async fn async_main() -> Result<(), MainError> {
 
             println!("Initialized cluster {core}");
         }
-        Command::Debug(DebugCommand::Chain) => {
+        Command::Debug(DebugCommand::Chain(args)) => {
             let core = Core::init_with_state_dir(cli.global_args.state_dir()?)
                 .await
                 .map_err(MainError::Init)?;
+            let chain = core
+                .canonical_chain(args.limit)
+                .map_err(MainError::Storage)?;
 
-            print_chain(&core, &core.canonical_chain().map_err(MainError::Storage)?);
+            print!(
+                "{}",
+                Render::new()
+                    .with_palette(args.color.palette(&std::io::stdout()))
+                    .with_header(core.to_string())
+                    .with_root(core.root())
+                    .with_head(core.head())
+                    .chain(&chain)
+            );
         }
     }
 

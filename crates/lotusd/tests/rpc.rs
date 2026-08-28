@@ -1,13 +1,22 @@
 //! The local control socket, end to end: a client connects, asks one
 //! question, and the running daemon answers it out of its core.
 
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use lotusd::{Core, IfInitialized, Server, ServerHandle, VERSION};
-use lotusd_rpc::{Call, GetChainRange, GetVersion, Watch, WatchSelector, call};
+use lotusd_rpc::{
+    Call, EnvelopeFrame, GetChainRange, GetEnvelopes, GetVersion, Verification, Watch,
+    WatchSelector, call,
+};
 use tempfile::TempDir;
 use tokio::{net::UnixStream, task::JoinHandle, time::timeout};
-use wire::EnvelopeDigest;
+use wire::{
+    Envelope, EnvelopeDigest, Msg,
+    msg::{Namespace, NamespaceKey, SetNamespace, Value},
+};
 
 /// How long a step gets before we call it hung. Generous: this bounds a
 /// test failure, it does not measure anything.
@@ -42,6 +51,39 @@ async fn serve(dir: &TempDir) -> (EnvelopeDigest, PathBuf, ServerHandle, JoinHan
     let (handle, join) = Server::new(core, listener).unwrap().run().await;
 
     (head, path, handle, join)
+}
+
+/// A write onto `prev`, distinct per `value` so two of them fork.
+fn set_ns(prev: EnvelopeDigest, value: &str) -> Envelope {
+    Envelope::new(Msg::SetNamespace(SetNamespace {
+        prev,
+        key: NamespaceKey::try_new("cfg").unwrap(),
+        namespace: Namespace {
+            value: Value::String(value.to_string()),
+        },
+    }))
+}
+
+/// Splits two siblings into (winner, loser) by the fork rule: equal
+/// signature weight, so the higher digest wins.
+fn ranked(a: Envelope, b: Envelope) -> (Envelope, Envelope) {
+    if a.digest().unwrap() > b.digest().unwrap() {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+/// Reads a whole `GetEnvelopes` answer, which arrives a frame at a time.
+async fn envelopes(path: &Path, request: GetEnvelopes) -> Vec<EnvelopeFrame> {
+    let stream = UnixStream::connect(path).await.unwrap();
+    let mut call = Call::send(stream, request).await.unwrap();
+
+    let mut frames = Vec::new();
+    while let Some(frame) = call.next().await.unwrap() {
+        frames.push(frame);
+    }
+    frames
 }
 
 #[tokio::test]
@@ -174,4 +216,128 @@ async fn watchers_are_deregistered_one_at_a_time() {
 
     calls.clear();
     watchers(&handle, 0).await;
+}
+
+/// The chain comes back oldest first, genesis included — the same order
+/// the daemon walks it in on disk.
+#[tokio::test]
+async fn get_envelopes_answers_with_the_canonical_chain_oldest_first() {
+    let dir = TempDir::new().unwrap();
+    let (head, path, handle, _join) = serve(&dir).await;
+
+    let first = set_ns(head, "one");
+    handle.insert([first.clone()]).await.unwrap();
+    let second = set_ns(first.digest().unwrap(), "two");
+    handle.insert([second.clone()]).await.unwrap();
+
+    let digests: Vec<_> = envelopes(&path, GetEnvelopes::chain())
+        .await
+        .into_iter()
+        .map(|frame| frame.digest)
+        .collect();
+
+    assert_eq!(
+        digests,
+        [head, first.digest().unwrap(), second.digest().unwrap()],
+    );
+}
+
+/// A limit counts back from the head, so it keeps the newest end — the
+/// part an operator is asking about.
+#[tokio::test]
+async fn get_envelopes_limits_from_the_head_end() {
+    let dir = TempDir::new().unwrap();
+    let (head, path, handle, _join) = serve(&dir).await;
+
+    let first = set_ns(head, "one");
+    handle.insert([first.clone()]).await.unwrap();
+    let second = set_ns(first.digest().unwrap(), "two");
+    handle.insert([second.clone()]).await.unwrap();
+
+    let digests: Vec<_> = envelopes(&path, GetEnvelopes::newest(2))
+        .await
+        .into_iter()
+        .map(|frame| frame.digest)
+        .collect();
+
+    assert_eq!(digests, [first.digest().unwrap(), second.digest().unwrap()]);
+
+    // A limit past the chain's length is not an error, just the whole chain.
+    assert_eq!(envelopes(&path, GetEnvelopes::newest(99)).await.len(), 3);
+    assert!(envelopes(&path, GetEnvelopes::newest(0)).await.is_empty());
+}
+
+/// By digest reads the log, not the canonical chain: an envelope rewritten
+/// out of history is exactly the one an operator needs to look at.
+#[tokio::test]
+async fn get_envelopes_by_digest_reaches_an_orphan() {
+    let dir = TempDir::new().unwrap();
+    let (head, path, handle, _join) = serve(&dir).await;
+
+    let (winner, loser) = ranked(set_ns(head, "one"), set_ns(head, "two"));
+    handle.insert([loser.clone()]).await.unwrap();
+    handle.insert([winner.clone()]).await.unwrap();
+    let orphan = loser.digest().unwrap();
+
+    // Gone from the chain...
+    assert!(
+        !envelopes(&path, GetEnvelopes::chain())
+            .await
+            .iter()
+            .any(|frame| frame.digest == orphan)
+    );
+    // ...and still readable by name.
+    let frames = envelopes(&path, GetEnvelopes::digests([orphan])).await;
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].digest, orphan);
+    assert_eq!(frames[0].envelope.payload(), loser.payload());
+}
+
+/// Digests are answered in the order asked for, and one the node does not
+/// hold is left out rather than reported.
+#[tokio::test]
+async fn get_envelopes_answers_in_the_order_asked_and_skips_what_it_lacks() {
+    let dir = TempDir::new().unwrap();
+    let (head, path, handle, _join) = serve(&dir).await;
+
+    let first = set_ns(head, "one");
+    handle.insert([first.clone()]).await.unwrap();
+    let unknown = EnvelopeDigest::from_bytes([0xab; 32]);
+
+    let digests: Vec<_> = envelopes(
+        &path,
+        GetEnvelopes::digests([first.digest().unwrap(), unknown, head]),
+    )
+    .await
+    .into_iter()
+    .map(|frame| frame.digest)
+    .collect();
+
+    assert_eq!(digests, [first.digest().unwrap(), head]);
+    assert!(
+        envelopes(&path, GetEnvelopes::digests([unknown]))
+            .await
+            .is_empty()
+    );
+}
+
+/// The verification status never crosses the ledger wire, so a fetched
+/// envelope would read as unchecked unless the protocol carried it — and
+/// a printout that called every envelope unchecked would be a lie.
+#[tokio::test]
+async fn a_fetched_envelope_keeps_the_verification_status_the_node_gave_it() {
+    let dir = TempDir::new().unwrap();
+    let (head, path, _handle, _join) = serve(&dir).await;
+
+    let frames = envelopes(&path, GetEnvelopes::digests([head])).await;
+    let [frame] = frames.as_slice() else {
+        panic!("expected the genesis back, got {frames:?}");
+    };
+
+    // The genesis is signed by the key the cluster was founded on.
+    assert_eq!(frame.verification, Verification::AllMatched(2));
+
+    let (digest, envelope) = frame.clone().into_parts();
+    assert_eq!(digest, head);
+    assert_eq!(envelope.verification_status().signature_weight(), 2);
 }

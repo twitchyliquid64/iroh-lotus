@@ -4,12 +4,17 @@
 use std::collections::BTreeMap;
 
 use lotusd_rpc::{
-    Call, ChainRange, Changed, Error, Failure, FailureKind, GetChainRange, GetVersion, Handler,
-    MAX_FRAME_LEN, NamespaceChange, Request, Response, Responses, Watch, WatchEvent, WatchPath,
-    WatchSelector, call, serve,
+    Call, ChainRange, ChainWalk, Changed, EnvelopeFrame, EnvelopeSelector, Error, Failure,
+    FailureKind, GetChainRange, GetEnvelopes, GetVersion, Handler, MAX_FRAME_LEN, NamespaceChange,
+    Request, Response, Responses, Verification, Watch, WatchEvent, WatchPath, WatchSelector, call,
+    serve,
 };
 use tokio::io::{AsyncWriteExt, DuplexStream, duplex};
-use wire::{EnvelopeDigest, msg::NamespaceKey, subkey::SubkeyPath};
+use wire::{
+    Envelope, EnvelopeDigest, Msg, VerificationStatus,
+    msg::{FullCheckpoint, InitMsg, NamespaceKey},
+    subkey::SubkeyPath,
+};
 
 /// A range to answer `GetChainRange` with, distinct from any real chain's.
 fn range() -> ChainRange {
@@ -36,6 +41,14 @@ fn changed() -> Changed {
     }
 }
 
+/// A genesis envelope, the one shape that can be built without naming a
+/// parent that has to exist.
+fn envelope() -> Envelope {
+    Envelope::new(Msg::Init(InitMsg {
+        state: FullCheckpoint::default(),
+    }))
+}
+
 fn key(k: &str) -> NamespaceKey {
     NamespaceKey::try_new(k).unwrap()
 }
@@ -51,6 +64,8 @@ struct Fake {
     ranges: usize,
     /// The watch selector the last request carried, for a test to read back.
     watched: Option<WatchSelector>,
+    /// The envelope selector the last request carried, likewise.
+    selected: Option<EnvelopeSelector>,
     /// Fails every request with this, rather than answering.
     fail: Option<Failure>,
 }
@@ -60,6 +75,7 @@ impl Fake {
         Self {
             ranges: 1,
             watched: None,
+            selected: None,
             fail: None,
         }
     }
@@ -80,6 +96,29 @@ impl Handler for Fake {
             Request::GetChainRange(_) => {
                 for _ in 0..self.ranges {
                     responses.send(Response::ChainRange(range())).await?;
+                }
+                Ok(())
+            }
+            Request::GetEnvelopes(get) => {
+                self.selected = Some(get.select.clone());
+
+                // One frame each, as the daemon sends them: an envelope
+                // per digest asked for, or a two-envelope chain.
+                let digests = match get.select {
+                    EnvelopeSelector::Digests(digests) => digests,
+                    EnvelopeSelector::Chain(ChainWalk { limit }) => (0..limit.unwrap_or(2))
+                        .map(|n| EnvelopeDigest::from_bytes([n as u8; 32]))
+                        .collect(),
+                };
+
+                for digest in digests {
+                    let mut envelope = envelope();
+                    envelope.set_verification_status(VerificationStatus::AllMatched {
+                        total_weight: 3,
+                    });
+                    responses
+                        .send(Response::Envelope(EnvelopeFrame::new(digest, envelope)))
+                        .await?;
                 }
                 Ok(())
             }
@@ -296,5 +335,83 @@ async fn an_already_orphaned_watch_is_answered_and_ended() {
         call.next().await.unwrap(),
         Some(WatchEvent::AlreadyOrphaned(digest))
     );
+    assert_eq!(call.next().await.unwrap(), None);
+}
+
+/// One frame per envelope, not one frame carrying all of them: a chain
+/// longer than a frame is what the streaming shape is for.
+#[tokio::test]
+async fn get_envelopes_streams_one_frame_per_envelope() {
+    let mut call = Call::send(connect(Fake::new()), GetEnvelopes::newest(3))
+        .await
+        .unwrap();
+
+    let mut digests = Vec::new();
+    while let Some(frame) = call.next().await.unwrap() {
+        digests.push(frame.digest);
+    }
+
+    assert_eq!(
+        digests,
+        (0..3)
+            .map(|n| EnvelopeDigest::from_bytes([n; 32]))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// The verification status is outside an envelope's canonical encoding, so
+/// it has to travel beside it — otherwise every fetched envelope reads as
+/// unchecked however the sending node scored it.
+#[tokio::test]
+async fn an_envelope_frame_carries_the_verification_status_beside_the_envelope() {
+    let frame = call(connect(Fake::new()), GetEnvelopes::newest(1))
+        .await
+        .unwrap();
+
+    assert_eq!(frame.verification, Verification::AllMatched(3));
+    // The envelope itself arrived unchecked, as the encoding demands.
+    assert_eq!(
+        frame.envelope.verification_status(),
+        &VerificationStatus::Unchecked
+    );
+
+    let (_digest, envelope) = frame.into_parts();
+    assert_eq!(
+        envelope.verification_status(),
+        &VerificationStatus::AllMatched { total_weight: 3 }
+    );
+}
+
+/// Every selector survives the round trip, limit and digest list included.
+#[tokio::test]
+async fn a_get_envelopes_carries_its_selector_across() {
+    for request in [
+        GetEnvelopes::chain(),
+        GetEnvelopes::newest(2),
+        GetEnvelopes::digests([EnvelopeDigest::from_bytes([5u8; 32])]),
+        GetEnvelopes::digests([]),
+    ] {
+        let (client, mut server) = duplex(64 * 1024);
+        let served = tokio::spawn(async move {
+            let mut handler = Fake::new();
+            serve(&mut server, &mut handler).await.unwrap();
+            handler.selected
+        });
+
+        let mut call = Call::send(client, request.clone()).await.unwrap();
+        while call.next().await.unwrap().is_some() {}
+
+        assert_eq!(served.await.unwrap(), Some(request.select));
+    }
+}
+
+/// Asking for nothing is answered with nothing, and the stream simply ends
+/// — which is also how a digest the node does not hold reads.
+#[tokio::test]
+async fn asking_for_no_envelopes_ends_the_stream_at_once() {
+    let mut call = Call::send(connect(Fake::new()), GetEnvelopes::digests([]))
+        .await
+        .unwrap();
+
     assert_eq!(call.next().await.unwrap(), None);
 }

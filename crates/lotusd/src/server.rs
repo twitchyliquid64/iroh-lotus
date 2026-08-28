@@ -22,6 +22,10 @@ use crate::{
 enum ServerMsg {
     Shutdown(Responder<(), ()>),
     ChainRange(Responder<rpc::ChainRange, ()>),
+    Envelopes(
+        rpc::EnvelopeSelector,
+        Responder<Vec<(EnvelopeDigest, Envelope)>, ChainError>,
+    ),
     Insert(Vec<Envelope>, Responder<Insert, ChainError>),
     Subscribe(ChangeFilter, Responder<SubscriptionHandle, ()>),
     Contains(EnvelopeDigest, Responder<bool, ChainError>),
@@ -98,6 +102,7 @@ impl Server {
         match msg {
             ServerMsg::Shutdown(r) => return ControlFlow::Break(r),
             ServerMsg::ChainRange(r) => Self::handle_chain_range(core, r).await,
+            ServerMsg::Envelopes(select, r) => r.respond(Self::read_envelopes(core, select)),
             // Both run to completion here on the mainloop: advancing the
             // chain and registering against it are the operations whose
             // ordering against each other is the whole guarantee, so
@@ -121,6 +126,18 @@ impl Server {
             })
         })
         .await
+    }
+
+    /// Reads whatever `select` picks out of the log.
+    fn read_envelopes(
+        core: &Core,
+        select: rpc::EnvelopeSelector,
+    ) -> Result<Vec<(EnvelopeDigest, Envelope)>, ChainError> {
+        match select {
+            rpc::EnvelopeSelector::Chain(walk) => core.canonical_chain(walk.limit),
+            rpc::EnvelopeSelector::Digests(digests) => core.envelopes(digests),
+        }
+        .map_err(ChainError::Storage)
     }
 
     /// Serves one client on the local control socket.
@@ -161,12 +178,39 @@ impl rpc::Handler for Rpc {
                     .map_err(|()| rpc::Failure::internal("the server is shutting down"))?;
                 responses.send(rpc::Response::ChainRange(range)).await
             }
+            rpc::Request::GetEnvelopes(get) => self.envelopes(get.select, responses).await,
             rpc::Request::Watch(watch) => self.watch(watch.selector, responses).await,
         }
     }
 }
 
 impl Rpc {
+    /// Streams the envelopes `select` picks out, one response frame each.
+    ///
+    /// Read in one trip to the mainloop and then written out: a frame per
+    /// envelope keeps a long chain off the frame size limit, and it is the
+    /// stream, not the answer, that is chunked.
+    async fn envelopes(
+        &self,
+        select: rpc::EnvelopeSelector,
+        responses: &mut rpc::Responses<'_>,
+    ) -> Result<(), rpc::Error> {
+        let envelopes = self
+            .0
+            .envelopes(select)
+            .await
+            .map_err(|err| rpc::Failure::internal(err.to_string()))?;
+
+        for (digest, envelope) in envelopes {
+            responses
+                .send(rpc::Response::Envelope(rpc::EnvelopeFrame::new(
+                    digest, envelope,
+                )))
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Streams what `selector` picks out until the client hangs up or the
     /// daemon stops.
     ///
@@ -269,6 +313,16 @@ impl ServerHandle {
     /// until compaction moves it forward.
     pub async fn root(&self) -> Result<EnvelopeDigest, ()> {
         self.chain_range().await.map(|range| range.root)
+    }
+
+    /// Reads the envelopes `select` picks out of the node's log.
+    pub async fn envelopes(
+        &self,
+        select: rpc::EnvelopeSelector,
+    ) -> Result<Vec<(EnvelopeDigest, Envelope)>, RequestError> {
+        let (send, recv) = Responder::channel();
+        let _ = self.0.send(ServerMsg::Envelopes(select, send)).await;
+        Self::answer(recv.await)
     }
 
     /// Ingests a parent-first run of envelopes, waking every subscriber the

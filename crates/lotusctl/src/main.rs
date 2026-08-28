@@ -3,11 +3,13 @@ use std::{collections::BTreeMap, fmt, path::PathBuf, process::ExitCode};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use lotusd_rpc::{
-    Call, GetChainRange, GetVersion, NamespaceChange, Watch, WatchEvent, WatchSelector, call,
+    Call, EnvelopeFrame, GetChainRange, GetEnvelopes, GetVersion, NamespaceChange, Watch,
+    WatchEvent, WatchSelector, call,
 };
+use render::{ColorChoice, Render};
 use tokio::net::UnixStream;
 use tokio::runtime::Builder;
-use wire::{EnvelopeDigest, msg::NamespaceKey, subkey::SubkeyPath};
+use wire::{Envelope, EnvelopeDigest, msg::NamespaceKey, subkey::SubkeyPath};
 
 /// The version of this CLI.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -30,12 +32,32 @@ enum Command {
         long_about = "Generate a shell tab-completion script for lotusctl.\nSupported shells include bash, zsh, elvish and fish.\n\n   source <(lotusctl completions bash)"
     )]
     Completions(CompletionsArgs),
+    /// Prints the canonical chain the daemon holds, oldest envelope first
+    Chain(ChainCommand),
+    /// Prints the envelopes named, wherever they sit in the daemon's log
+    Show(ShowCommand),
     /// Reports the daemon's version and how much of the chain it holds
     Status,
     /// Reports this CLI's version alongside the daemon's
     Version,
     /// Reports movements of the chain as they happen, until interrupted
     Watch(WatchCommand),
+}
+
+/// The arguments for the chain subcommand.
+#[derive(Debug, Args)]
+struct ChainCommand {
+    /// Print at most this many envelopes, counted back from the head
+    #[arg(long, short = 'n')]
+    limit: Option<u32>,
+}
+
+/// The arguments for the show subcommand.
+#[derive(Debug, Args)]
+struct ShowCommand {
+    /// The envelope digests to print, in hex
+    #[arg(value_parser = parse_digest, required = true)]
+    digests: Vec<EnvelopeDigest>,
 }
 
 /// The arguments for the watch subcommand.
@@ -123,6 +145,10 @@ struct GlobalArgs {
     /// How to render output
     #[arg(long, short, value_enum, default_value_t = Format::Text)]
     format: Format,
+
+    /// When to colour the output. JSON is never coloured
+    #[arg(long, value_enum, default_value_t = ColorChoice::Auto)]
+    color: ColorChoice,
 }
 
 /// How a command renders what it read.
@@ -289,6 +315,52 @@ async fn async_main() -> Result<(), MainError> {
             let name = cmd.get_name().to_string();
             clap_complete::generate(args.shell, &mut cmd, name, &mut std::io::stdout());
         }
+        Command::Chain(args) => {
+            let path = cli.global_args.local_sock_path()?;
+            let request = args
+                .limit
+                .map_or_else(GetEnvelopes::chain, GetEnvelopes::newest);
+            let frames = envelopes(&path, request).await?;
+
+            match cli.global_args.format {
+                Format::Json => print_json(&frames)?,
+                Format::Text => print!(
+                    "{}",
+                    renderer(&cli.global_args, &path)
+                        .await?
+                        .with_header(path.display().to_string())
+                        .chain(&parts(frames))
+                ),
+            }
+        }
+        Command::Show(args) => {
+            let path = cli.global_args.local_sock_path()?;
+            let frames = envelopes(&path, GetEnvelopes::digests(args.digests.clone())).await?;
+            let missing = missing(&args.digests, &frames);
+
+            match cli.global_args.format {
+                Format::Json => print_json(&frames)?,
+                Format::Text => {
+                    let render = renderer(&cli.global_args, &path).await?;
+                    parts(frames).iter().for_each(|(digest, envelope)| {
+                        print!("{}", render.envelope(digest, envelope))
+                    });
+                }
+            }
+
+            // Reported after what was found, so a typo in one digest does
+            // not cost the answer to the others.
+            if !missing.is_empty() {
+                return Err(MainError::Other(format!(
+                    "the daemon holds no envelope {}",
+                    missing
+                        .iter()
+                        .map(|digest| digest.to_hex().as_ref().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                )));
+            }
+        }
         Command::Status => {
             let path = cli.global_args.local_sock_path()?;
 
@@ -371,6 +443,53 @@ async fn async_main() -> Result<(), MainError> {
     }
 
     Ok(())
+}
+
+/// Fetches whatever `request` selects, reading the stream to its end.
+async fn envelopes(
+    path: &std::path::Path,
+    request: GetEnvelopes,
+) -> Result<Vec<EnvelopeFrame>, MainError> {
+    let mut call = Call::send(connect(path).await?, request)
+        .await
+        .map_err(MainError::Rpc)?;
+
+    let mut frames = Vec::new();
+    while let Some(frame) = call.next().await.map_err(MainError::Rpc)? {
+        frames.push(frame);
+    }
+    Ok(frames)
+}
+
+/// The envelopes the frames carry, each with the verification status the
+/// daemon holds it under put back.
+fn parts(frames: Vec<EnvelopeFrame>) -> Vec<(EnvelopeDigest, Envelope)> {
+    frames.into_iter().map(EnvelopeFrame::into_parts).collect()
+}
+
+/// The digests asked for that came back in no frame.
+fn missing(asked: &[EnvelopeDigest], frames: &[EnvelopeFrame]) -> Vec<EnvelopeDigest> {
+    asked
+        .iter()
+        .filter(|digest| !frames.iter().any(|frame| frame.digest == **digest))
+        .copied()
+        .collect()
+}
+
+/// A renderer that marks the ends of the chain the daemon at `path` holds.
+///
+/// A second connection — one carries one request — so the chain can move
+/// between reading it and reading the envelopes. The cost is a stale mark
+/// on a printout, never a wrong envelope.
+async fn renderer(args: &GlobalArgs, path: &std::path::Path) -> Result<Render, MainError> {
+    let range = call(connect(path).await?, GetChainRange {})
+        .await
+        .map_err(MainError::Rpc)?;
+
+    Ok(Render::new()
+        .with_palette(args.color.palette(&std::io::stdout()))
+        .with_root(range.root)
+        .with_head(range.head))
 }
 
 /// Connects to the daemon's control socket.

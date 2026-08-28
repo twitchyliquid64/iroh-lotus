@@ -7,7 +7,7 @@ use core::fmt;
 use std::collections::{BTreeMap, BTreeSet};
 
 use cbor2::Cbor;
-use wire::{EnvelopeDigest, msg::NamespaceKey, subkey::SubkeyPath};
+use wire::{Envelope, EnvelopeDigest, VerificationStatus, msg::NamespaceKey, subkey::SubkeyPath};
 
 /// A request on the local control socket.
 #[derive(Debug, Clone, Cbor, PartialEq, Eq)]
@@ -17,6 +17,8 @@ pub enum Request {
     GetVersion(GetVersion),
     /// See [`GetChainRange`].
     GetChainRange(GetChainRange),
+    /// See [`GetEnvelopes`].
+    GetEnvelopes(GetEnvelopes),
     /// See [`Watch`].
     Watch(Watch),
 }
@@ -28,6 +30,138 @@ pub struct GetVersion {}
 /// Asks the daemon how much of the chain it holds.
 #[derive(Debug, Clone, Cbor, PartialEq, Eq)]
 pub struct GetChainRange {}
+
+/// Asks the daemon for envelopes it holds.
+///
+/// Answered with one [`Response::Envelope`] per envelope and nothing else,
+/// so a client that asked for envelopes the node does not hold learns it
+/// from the stream simply ending.
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+pub struct GetEnvelopes {
+    #[cbor(key = 1)]
+    pub select: EnvelopeSelector,
+}
+
+impl GetEnvelopes {
+    /// Asks for the whole canonical chain the node still holds.
+    pub fn chain() -> Self {
+        Self {
+            select: EnvelopeSelector::Chain(ChainWalk::default()),
+        }
+    }
+
+    /// Asks for the newest `limit` envelopes of the canonical chain.
+    pub fn newest(limit: u32) -> Self {
+        Self {
+            select: EnvelopeSelector::Chain(ChainWalk { limit: Some(limit) }),
+        }
+    }
+
+    /// Asks for exactly these envelopes.
+    pub fn digests(digests: impl IntoIterator<Item = EnvelopeDigest>) -> Self {
+        Self {
+            select: EnvelopeSelector::Digests(digests.into_iter().collect()),
+        }
+    }
+}
+
+/// Which envelopes a [`GetEnvelopes`] asks for.
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvelopeSelector {
+    /// The canonical chain, oldest first.
+    Chain(ChainWalk),
+    /// Only these envelopes, in the order asked for and wherever they sit
+    /// in the log — an orphan included. Digests the node does not hold are
+    /// left out of the answer rather than reported.
+    Digests(Vec<EnvelopeDigest>),
+}
+
+/// How much of the canonical chain to send.
+#[derive(Debug, Copy, Clone, Cbor, Default, PartialEq, Eq)]
+pub struct ChainWalk {
+    /// At most this many envelopes, counted back from the head; `None` for
+    /// everything the node still holds.
+    #[cbor(key = 1)]
+    pub limit: Option<u32>,
+}
+
+/// One envelope of a [`GetEnvelopes`] answer.
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+pub struct EnvelopeFrame {
+    /// The digest the node holds this envelope under. Derivable from the
+    /// envelope, and sent anyway so a client need not re-encode to name
+    /// what it was given.
+    #[cbor(key = 1)]
+    pub digest: EnvelopeDigest,
+    #[cbor(key = 2)]
+    pub envelope: Envelope,
+    /// What the sending node made of the signatures. Outside the
+    /// envelope's canonical encoding, so it travels beside it.
+    #[cbor(key = 3)]
+    pub verification: Verification,
+}
+
+impl EnvelopeFrame {
+    /// The frame carrying `envelope` as the node holds it, verification
+    /// status and all.
+    pub fn new(digest: EnvelopeDigest, envelope: Envelope) -> Self {
+        Self {
+            digest,
+            verification: Verification::from(envelope.verification_status()),
+            envelope,
+        }
+    }
+
+    /// The envelope as the sending node holds it: the verification status
+    /// put back where it belongs, so a reader sees what that node
+    /// concluded rather than an unchecked envelope.
+    pub fn into_parts(self) -> (EnvelopeDigest, Envelope) {
+        let mut envelope = self.envelope;
+        envelope.set_verification_status(self.verification.into());
+        (self.digest, envelope)
+    }
+}
+
+/// How an envelope's signatures scored on the node that holds it.
+///
+/// Mirrors [`wire::VerificationStatus`], which never crosses the ledger
+/// wire: it is what a node concluded about an envelope, not something the
+/// envelope carries.
+#[derive(Debug, Copy, Clone, Cbor, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Verification {
+    /// Nothing has checked the signatures yet.
+    Unchecked,
+    /// A signature did not verify.
+    Failed,
+    /// Every signature verified, together worth this much.
+    AllMatched(u32),
+}
+
+impl From<&VerificationStatus> for Verification {
+    fn from(status: &VerificationStatus) -> Self {
+        match status {
+            VerificationStatus::Unchecked => Verification::Unchecked,
+            VerificationStatus::Failed => Verification::Failed,
+            VerificationStatus::AllMatched { total_weight } => {
+                Verification::AllMatched(*total_weight)
+            }
+        }
+    }
+}
+
+impl From<Verification> for VerificationStatus {
+    fn from(verification: Verification) -> Self {
+        match verification {
+            Verification::Unchecked => VerificationStatus::Unchecked,
+            Verification::Failed => VerificationStatus::Failed,
+            Verification::AllMatched(total_weight) => {
+                VerificationStatus::AllMatched { total_weight }
+            }
+        }
+    }
+}
 
 /// Asks the daemon to report every movement of the chain that `selector`
 /// picks out, until the connection is dropped.
@@ -115,6 +249,8 @@ pub enum Response {
     Version(String),
     /// Answers [`GetChainRange`].
     ChainRange(ChainRange),
+    /// Answers [`GetEnvelopes`], once per envelope sent.
+    Envelope(EnvelopeFrame),
     /// Answers [`Watch`], as many times as the chain moves.
     Watch(WatchEvent),
     /// Ends the stream: the request could not be served to completion.
@@ -128,6 +264,7 @@ impl Response {
         match self {
             Response::Version(_) => "version",
             Response::ChainRange(_) => "chain range",
+            Response::Envelope(_) => "envelope",
             Response::Watch(_) => "watch event",
             Response::Failed(_) => "failure",
         }

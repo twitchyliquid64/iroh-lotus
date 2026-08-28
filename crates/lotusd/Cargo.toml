@@ -25,6 +25,7 @@ tracing-subscriber.workspace = true
 
 # Our crates
 lotusd-rpc.workspace = true
+render = { workspace = true, features = ["clap"] }
 state.workspace = true
 storage.workspace = true
 wire.workspace = true

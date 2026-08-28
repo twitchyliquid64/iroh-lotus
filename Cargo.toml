@@ -3,6 +3,7 @@ members = [
     "crates/lotusctl",
     "crates/lotusd",
     "crates/lotusd-rpc",
+    "crates/render",
     "crates/state",
     "crates/storage",
     "crates/wire",
@@ -52,6 +53,7 @@ uuid = { version = "1.24", features = ["v4", "v7", "serde"] }
 # Our crates
 lotusd = { path = "crates/lotusd" }
 lotusd-rpc = { path = "crates/lotusd-rpc" }
+render = { path = "crates/render" }
 state = { path = "crates/state" }
 storage = { path = "crates/storage" }
 wire = { path = "crates/wire" }

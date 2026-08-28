@@ -229,20 +229,23 @@ impl Core {
         self.oldest
     }
 
-    /// The canonical chain, oldest envelope first.
+    /// The canonical chain, oldest envelope first, of at most `limit`
+    /// envelopes counted back from the head.
     ///
-    /// Walks back from head by `prev` and stops where the log does, so the
-    /// first entry is as far back as this node can still see — the chain's
-    /// root, until compaction has moved it.
+    /// Walks back from head by `prev` and stops where the log does, so an
+    /// unlimited walk starts as far back as this node can still see — the
+    /// chain's root, until compaction has moved it.
     pub fn canonical_chain(
         &self,
+        limit: Option<u32>,
     ) -> Result<Vec<(EnvelopeDigest, Envelope)>, storage::sqlite::Error> {
+        let limit = limit.map_or(usize::MAX, |limit| limit as usize);
         let mut chain = Vec::new();
         let mut next = Some(self.chain.head());
 
         // Terminates without a seen-set: a digest covers its parent's, so a
         // cycle would need a hash collision to exist.
-        while let Some(digest) = next {
+        while let Some(digest) = next.filter(|_| chain.len() < limit) {
             let Some(envelope) = self.storage.envelope(digest)? else {
                 break;
             };
@@ -252,6 +255,26 @@ impl Core {
 
         chain.reverse();
         Ok(chain)
+    }
+
+    /// The envelopes stored under `digests`, in the order asked for.
+    ///
+    /// Reads the log, not the canonical chain: an envelope on a losing
+    /// fork comes back like any other. Digests the log does not hold are
+    /// left out, so the answer can be shorter than the question.
+    pub fn envelopes(
+        &self,
+        digests: impl IntoIterator<Item = EnvelopeDigest>,
+    ) -> Result<Vec<(EnvelopeDigest, Envelope)>, storage::sqlite::Error> {
+        digests
+            .into_iter()
+            .filter_map(|digest| {
+                self.storage
+                    .envelope(digest)
+                    .map(|found| found.map(|envelope| (digest, envelope)))
+                    .transpose()
+            })
+            .collect()
     }
 
     /// Every key this node can sign with, by id.
