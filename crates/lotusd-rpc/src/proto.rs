@@ -1,8 +1,7 @@
 //! The wire types: what a client may ask, and what it is answered with.
 //!
-//! Variants are renamed to short strings to keep the encoding small, as
-//! [`wire::Msg`]'s are. Request payloads are structs rather than bare
-//! variants so a method can grow a field without changing shape.
+//! Request payloads are structs rather than bare variants so a method can
+//! grow a field without changing shape.
 
 use core::fmt;
 use std::collections::{BTreeMap, BTreeSet};
@@ -12,15 +11,13 @@ use wire::{EnvelopeDigest, msg::NamespaceKey, subkey::SubkeyPath};
 
 /// A request on the local control socket.
 #[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum Request {
     /// See [`GetVersion`].
-    #[serde(rename = "v")]
     GetVersion(GetVersion),
     /// See [`GetChainRange`].
-    #[serde(rename = "c")]
     GetChainRange(GetChainRange),
     /// See [`Watch`].
-    #[serde(rename = "w")]
     Watch(Watch),
 }
 
@@ -45,18 +42,15 @@ pub struct Watch {
 
 /// What a [`Watch`] asks to hear about.
 #[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum WatchSelector {
     /// Every movement of the canonical head, whatever it changed.
-    #[serde(rename = "h")]
     Head,
     /// Any change anywhere under a namespace.
-    #[serde(rename = "n")]
     Namespace(NamespaceKey),
     /// A change to what a path addresses in a namespace.
-    #[serde(rename = "p")]
     Path(WatchPath),
     /// One envelope leaving the canonical chain.
-    #[serde(rename = "o")]
     Orphaned(EnvelopeDigest),
 }
 
@@ -71,14 +65,13 @@ pub struct WatchPath {
 
 /// One frame of a [`Watch`]'s answer.
 #[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum WatchEvent {
     /// The chain moved in a way the watch selects.
-    #[serde(rename = "c")]
     Changed(Changed),
     /// A digest the watch asked about is already off the chain. An
     /// orphaned envelope never returns, so there is nothing further to
     /// say and the stream ends here.
-    #[serde(rename = "o")]
     AlreadyOrphaned(EnvelopeDigest),
 }
 
@@ -106,29 +99,25 @@ pub struct Changed {
 
 /// What changed inside one namespace.
 #[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum NamespaceChange {
     /// The namespace was written, removed, or amended at its root.
-    #[serde(rename = "w")]
     Whole,
     /// Only these paths were touched. No path here is a prefix of another.
-    #[serde(rename = "p")]
     Paths(BTreeSet<SubkeyPath>),
 }
 
 /// One frame of the answer to a request.
 #[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum Response {
     /// Answers [`GetVersion`].
-    #[serde(rename = "v")]
     Version(String),
     /// Answers [`GetChainRange`].
-    #[serde(rename = "c")]
     ChainRange(ChainRange),
     /// Answers [`Watch`], as many times as the chain moves.
-    #[serde(rename = "w")]
     Watch(WatchEvent),
     /// Ends the stream: the request could not be served to completion.
-    #[serde(rename = "e")]
     Failed(Failure),
 }
 
@@ -199,11 +188,10 @@ impl fmt::Display for Failure {
 
 /// The category of a [`Failure`].
 #[derive(Debug, Copy, Clone, Cbor, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum FailureKind {
     /// The daemon could not carry the request out.
-    #[serde(rename = "i")]
     Internal,
     /// The daemon does not serve this request.
-    #[serde(rename = "u")]
     Unsupported,
 }
