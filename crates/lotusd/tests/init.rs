@@ -1,8 +1,9 @@
 //! What `Core::create_in_state_dir` lays down must be what
 //! `Core::init_with_state_dir` picks up on the next start.
 
-use std::{fs::DirEntry, path::Path};
+use std::path::{Path, PathBuf};
 
+use ed25519_zebra::SigningKey;
 use lotusd::{Core, IfInitialized, InitError};
 use state::{Chain, Insert, Ledger};
 use storage::{SqliteStorage, Storage};
@@ -18,20 +19,14 @@ async fn create(dir: &TempDir, if_initialized: IfInitialized) -> Result<Core, In
 }
 
 /// The one signing key `create_in_state_dir` leaves in `dir`.
-fn signing_key_file(dir: &Path) -> DirEntry {
-    let mut keys = std::fs::read_dir(dir)
-        .unwrap()
-        .map(Result::unwrap)
-        .filter(|entry| {
-            entry
-                .path()
-                .extension()
-                .is_some_and(|ext| ext == lotusd::SIGNING_KEY_EXTENSION)
-        });
+fn signing_key_file(dir: &Path) -> PathBuf {
+    dir.join(lotusd::SIGNING_KEY_FILENAME)
+}
 
-    let key = keys.next().expect("init writes a signing key");
-    assert!(keys.next().is_none(), "init writes only one signing key");
-    key
+/// The key held in `dir`'s signing key file.
+fn stored_signing_key(dir: &Path) -> SigningKey {
+    let bytes = std::fs::read(signing_key_file(dir)).expect("init writes a signing key");
+    SigningKey::from(<[u8; 32]>::try_from(bytes.as_slice()).unwrap())
 }
 
 #[tokio::test]
@@ -84,7 +79,10 @@ async fn the_signing_key_is_written_unreadable_to_anyone_else() {
     create(&dir, IfInitialized::Fail).await.unwrap();
 
     let key = signing_key_file(dir.path());
-    assert_eq!(key.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        std::fs::metadata(key).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
 }
 
 /// Genesis is verified against the key set genesis installs itself, so a
@@ -94,7 +92,7 @@ async fn the_signing_key_is_written_unreadable_to_anyone_else() {
 async fn genesis_is_signed_by_the_key_it_trusts() {
     let dir = TempDir::new().unwrap();
     let core = create(&dir, IfInitialized::Fail).await.unwrap();
-    let root = core.root();
+    let (root, key_id) = (core.root(), core.key_id());
     drop(core);
 
     let storage = SqliteStorage::open(dir.path().join(lotusd::SQLITE_DB_FILENAME)).unwrap();
@@ -106,57 +104,54 @@ async fn genesis_is_signed_by_the_key_it_trusts() {
     let signers: Vec<_> = genesis.signatures().keys().collect();
     assert_eq!(signers.len(), 1);
     assert_eq!(
-        signers[0].to_hex().as_ref(),
-        signing_key_file(dir.path()).path().file_stem().unwrap(),
-        "the key on disk is named by the id that signed genesis",
+        *signers[0], key_id,
+        "the key on disk is the one that signed genesis",
     );
 
     assert!(genesis.verification_status().signature_weight() > 0);
 }
 
 #[tokio::test]
-async fn reopening_loads_the_signing_keys_on_disk() {
+async fn reopening_loads_the_signing_key_on_disk() {
     let dir = TempDir::new().unwrap();
     let created = create(&dir, IfInitialized::Fail).await.unwrap();
-    let ids: Vec<_> = created.signing_keys().keys().copied().collect();
+    let key_id = created.key_id();
     drop(created);
 
     let opened = Core::init_with_state_dir(dir.path().to_path_buf())
         .await
         .unwrap();
 
+    assert_eq!(opened.key_id(), key_id);
     assert_eq!(
-        opened.signing_keys().keys().copied().collect::<Vec<_>>(),
-        ids
-    );
-    assert_eq!(
-        ids.len(),
-        1,
-        "a fresh cluster is founded on exactly one key"
-    );
-    assert_eq!(
-        ids[0].to_hex().as_ref(),
-        signing_key_file(dir.path()).path().file_stem().unwrap(),
+        opened.signing_key().as_ref(),
+        stored_signing_key(dir.path()).as_ref(),
     );
 }
 
-/// Every key in the directory loads, not just the one the latest init wrote —
-/// an overwritten cluster leaves the previous key behind, and a node that
-/// forgot it could not sign under the old id again.
+/// A node has exactly one key: re-initializing replaces it rather than
+/// leaving the old one beside it.
 #[tokio::test]
-async fn every_key_in_the_state_dir_is_loaded() {
+async fn reinitializing_replaces_the_one_key() {
     let dir = TempDir::new().unwrap();
-    create(&dir, IfInitialized::Fail).await.unwrap();
+    let created = create(&dir, IfInitialized::Fail).await.unwrap();
+    let key_id = created.key_id();
+    drop(created);
+
     let recreated = create(&dir, IfInitialized::Overwrite).await.unwrap();
 
-    assert_eq!(recreated.signing_keys().len(), 2);
+    assert_ne!(recreated.key_id(), key_id);
+    assert_eq!(
+        recreated.signing_key().as_ref(),
+        stored_signing_key(dir.path()).as_ref(),
+    );
 }
 
 #[tokio::test]
 async fn a_truncated_signing_key_is_refused() {
     let dir = TempDir::new().unwrap();
     create(&dir, IfInitialized::Fail).await.unwrap();
-    let key = signing_key_file(dir.path()).path();
+    let key = signing_key_file(dir.path());
     std::fs::write(&key, [0u8; 31]).unwrap();
 
     assert!(matches!(
@@ -194,8 +189,9 @@ async fn genesis_reverifies_against_the_state_at_head() {
         .keys()
         .map(|id| {
             let key = trusted.get(id).expect("every signer is trusted at head");
-            assert!(
-                core.signing_keys().contains_key(id),
+            assert_eq!(
+                *id,
+                core.key_id(),
                 "the node holds the key that signed its own genesis",
             );
             key.weight()
@@ -229,10 +225,7 @@ async fn a_fresh_chain_holds_only_genesis() {
 async fn the_chain_is_walked_back_to_the_root_and_returned_oldest_first() {
     let dir = TempDir::new().unwrap();
     let core = create(&dir, IfInitialized::Fail).await.unwrap();
-    let (root, signing_key) = (
-        core.root(),
-        *core.signing_keys().values().next().expect("a founding key"),
-    );
+    let (root, signing_key) = (core.root(), *core.signing_key());
     drop(core);
 
     // Appended behind lotusd's back: nothing but `init` writes envelopes yet.

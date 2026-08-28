@@ -7,7 +7,7 @@ use tokio::sync::oneshot;
 
 mod core;
 pub use crate::core::{
-    ChainError, Core, IfInitialized, InitError, OLDEST_ENVELOPE_FILENAME, SIGNING_KEY_EXTENSION,
+    ChainError, Core, IfInitialized, InitError, OLDEST_ENVELOPE_FILENAME, SIGNING_KEY_FILENAME,
     SQLITE_DB_FILENAME,
 };
 

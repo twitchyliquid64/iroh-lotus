@@ -21,9 +21,7 @@ use crate::{ChangeFilter, SubscriptionHandle, Subscriptions};
 
 pub const SQLITE_DB_FILENAME: &str = "db.sqlite";
 pub const OLDEST_ENVELOPE_FILENAME: &str = "oldest_envelope";
-/// Extension of the signing key files in a state directory, each named by
-/// the [`KeyId`] of the key it holds.
-pub const SIGNING_KEY_EXTENSION: &str = "ed25519";
+pub const SIGNING_KEY_FILENAME: &str = "node.ed25519";
 
 /// The weight given to the key a new cluster is founded on.
 const ROOT_KEY_WEIGHT: u32 = 2;
@@ -41,9 +39,8 @@ pub struct Core {
     chain: Chain,
     oldest: EnvelopeDigest,
     state_dir: PathBuf,
-    /// Every key this node can sign with, by the id the ledger's trusted
-    /// key set refers to it by.
-    signing_keys: BTreeMap<KeyId, SigningKey>,
+    /// The one key this node signs with.
+    signing_key: SigningKey,
     subscriptions: Subscriptions,
 }
 
@@ -81,14 +78,14 @@ impl Core {
             .map_err(|_| InitError::OldestDigestLength(oldest_envelope.len()))?;
 
         let chain = Chain::open(&mut storage, oldest).map_err(InitError::Chain)?;
-        let signing_keys = load_signing_keys(&state_dir).await?;
+        let signing_key = load_signing_key(&state_dir).await?;
 
         Ok(Self {
             storage,
             chain,
             oldest,
             state_dir,
-            signing_keys,
+            signing_key,
             subscriptions: Subscriptions::default(),
         })
     }
@@ -142,16 +139,16 @@ impl Core {
             .await
             .map_err(|e| InitError::IO(e, "writing oldest-envelope"))?;
 
-        // Scanned rather than assembled from the key just generated, so a
+        // Read back rather than assembled from the key just generated, so a
         // core is the same whichever way it was reached.
-        let signing_keys = load_signing_keys(&state_dir).await?;
+        let signing_key = load_signing_key(&state_dir).await?;
 
         Ok(Self {
             storage,
             chain,
             oldest,
             state_dir,
-            signing_keys,
+            signing_key,
             subscriptions: Subscriptions::default(),
         })
     }
@@ -288,9 +285,14 @@ impl Core {
             .collect()
     }
 
-    /// Every key this node can sign with, by id.
-    pub fn signing_keys(&self) -> &BTreeMap<KeyId, SigningKey> {
-        &self.signing_keys
+    /// The key this node signs with.
+    pub fn signing_key(&self) -> &SigningKey {
+        &self.signing_key
+    }
+
+    /// The id the ledger's trusted key set refers to this node's key by.
+    pub fn key_id(&self) -> KeyId {
+        public_key(&self.signing_key).id()
     }
 
     /// Answers one sync-machine query against this node's chain — the
@@ -389,41 +391,16 @@ fn public_key(key: &SigningKey) -> PublicKey {
     PublicKey::Ed25519(Ed25519PublicKey::from_bytes(key.verification_key().into()))
 }
 
-/// Loads every signing key saved under `state_dir`.
-///
-/// Filed under the id derived from the key material, never from the
-/// filename: the name is a label for operators to read, and a renamed file
-/// must not change which key an id resolves to.
-async fn load_signing_keys(state_dir: &Path) -> Result<BTreeMap<KeyId, SigningKey>, InitError> {
-    let mut entries = fs::read_dir(state_dir)
+/// Loads the node's signing key from `state_dir`.
+async fn load_signing_key(state_dir: &Path) -> Result<SigningKey, InitError> {
+    let path = state_dir.join(SIGNING_KEY_FILENAME);
+    let bytes = fs::read(&path)
         .await
-        .map_err(|e| InitError::IO(e, "listing state-dir"))?;
-    let mut keys = BTreeMap::new();
+        .map_err(|e| InitError::IO(e, "reading signing-key"))?;
 
-    while let Some(entry) = entries
-        .next_entry()
-        .await
-        .map_err(|e| InitError::IO(e, "listing state-dir"))?
-    {
-        let path = entry.path();
-        if path
-            .extension()
-            .is_none_or(|ext| ext != SIGNING_KEY_EXTENSION)
-        {
-            continue;
-        }
-
-        let bytes = fs::read(&path)
-            .await
-            .map_err(|e| InitError::IO(e, "reading signing-key"))?;
-        let seed = <[u8; 32]>::try_from(bytes.as_slice())
-            .map_err(|_| InitError::SigningKeyLength(path, bytes.len()))?;
-
-        let key = SigningKey::from(seed);
-        keys.insert(public_key(&key).id(), key);
-    }
-
-    Ok(keys)
+    <[u8; 32]>::try_from(bytes.as_slice())
+        .map(SigningKey::from)
+        .map_err(|_| InitError::SigningKeyLength(path, bytes.len()))
 }
 
 /// Attaches `key_id`'s signature over `envelope` to it.
@@ -438,9 +415,8 @@ fn sign(key: &SigningKey, key_id: KeyId, envelope: Envelope) -> Result<Envelope,
     Ok(envelope.with_signature(key_id, signature))
 }
 
-/// Generates a cluster's first signing key and saves it under `state_dir`,
-/// named by the [`wire::KeyId`] the trusted key set refers to it by so an
-/// operator can match the file to a key set entry.
+/// Generates this node's signing key and saves it under `state_dir`,
+/// replacing whatever key was there: a node has exactly one.
 async fn gen_signing_key(state_dir: &Path) -> Result<SigningKey, InitError> {
     // Drawn straight from the OS rather than through a userspace generator:
     // this is one 32-byte draw, so ThreadRng's speed buys nothing and it
@@ -464,7 +440,7 @@ async fn gen_signing_key(state_dir: &Path) -> Result<SigningKey, InitError> {
     options.mode(0o600);
 
     options
-        .open(state_dir.join(format!("{}.{SIGNING_KEY_EXTENSION}", public_key(&key).id())))
+        .open(state_dir.join(SIGNING_KEY_FILENAME))
         .await
         .map_err(|e| InitError::IO(e, "creating signing-key"))?
         .write_all(&key.to_bytes())
@@ -483,7 +459,7 @@ pub enum InitError {
     Entropy(rand::rngs::SysError),
     /// The genesis envelope could not be encoded to be signed.
     Wire(wire::Error),
-    /// A signing key file was not exactly 32 bytes; holds it and the length found.
+    /// The signing key file was not exactly 32 bytes; holds it and the length found.
     SigningKeyLength(PathBuf, usize),
     /// The oldest-envelope file was not exactly 32 bytes; holds the length found.
     OldestDigestLength(usize),
