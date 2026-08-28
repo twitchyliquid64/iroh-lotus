@@ -35,11 +35,13 @@ use wire::{
 };
 
 pub mod conformance;
+mod log;
 mod mem;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 pub mod value;
 
+pub use log::{LogEntry, StoredAt};
 pub use mem::MemStorage;
 #[cfg(feature = "sqlite")]
 pub use sqlite::SqliteStorage;
@@ -207,7 +209,8 @@ pub trait Storage {
     fn retain(&mut self, keep: &[EnvelopeDigest]) -> Result<(), Self::Error>;
 
     /// Stores `envelope` in the log under `digest`, indexing it under its
-    /// `prev` for [`children`](Storage::children).
+    /// `prev` for [`children`](Storage::children) and stamping it with the
+    /// time the node first saw it.
     ///
     /// The whole [`Envelope`] must be persisted — its verification status
     /// included, even though the status is *not* part of the envelope's
@@ -217,16 +220,31 @@ pub trait Storage {
     /// resets to `Unchecked` on a round-trip changes which fork wins
     /// after a restart. Re-storing under the same digest replaces the
     /// record — how a caller upgrades the status after verifying.
+    ///
+    /// The [`StoredAt`] survives that replacement: it says when this node
+    /// first saw the envelope, not when the record was last written, and a
+    /// status upgraded an hour later must not make an envelope look an
+    /// hour younger. It is local bookkeeping either way — see [`StoredAt`]
+    /// for why nothing may decide anything by it.
     fn put_envelope(
         &mut self,
         digest: EnvelopeDigest,
         envelope: Envelope,
     ) -> Result<(), Self::Error>;
 
+    /// The envelope stored under `digest` and when the log first stored
+    /// it — or `None` when the log holds no such envelope.
+    fn logged_envelope(&self, digest: EnvelopeDigest) -> Result<Option<LogEntry>, Self::Error>;
+
     /// The envelope stored under `digest` — exactly as stored,
     /// verification status included — or `None` when the log holds no
     /// such envelope.
-    fn envelope(&self, digest: EnvelopeDigest) -> Result<Option<Envelope>, Self::Error>;
+    ///
+    /// The reads that don't care when it arrived, which is every read on
+    /// the apply path.
+    fn envelope(&self, digest: EnvelopeDigest) -> Result<Option<Envelope>, Self::Error> {
+        Ok(self.logged_envelope(digest)?.map(|entry| entry.envelope))
+    }
 
     /// Removes the envelope stored under `digest` from the log, unindexing
     /// it from its parent's [`children`](Storage::children). Removing what

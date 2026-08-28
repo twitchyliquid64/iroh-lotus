@@ -6,6 +6,7 @@ use std::ops::ControlFlow;
 
 use lotusd_rpc as rpc;
 use state::Insert;
+use storage::{LogEntry, StoredAt};
 use tokio::{
     net::{UnixListener, UnixStream},
     sync::{mpsc, oneshot},
@@ -24,7 +25,7 @@ enum ServerMsg {
     ChainRange(Responder<rpc::ChainRange, ()>),
     Envelopes(
         rpc::EnvelopeSelector,
-        Responder<Vec<(EnvelopeDigest, Envelope)>, ChainError>,
+        Responder<Vec<(EnvelopeDigest, LogEntry)>, ChainError>,
     ),
     Insert(Vec<Envelope>, Responder<Insert, ChainError>),
     Subscribe(ChangeFilter, Responder<SubscriptionHandle, ()>),
@@ -129,12 +130,19 @@ impl Server {
     }
 
     /// Reads whatever `select` picks out of the log.
+    ///
+    /// A `since` window is turned into a cutoff here, against this node's
+    /// clock: it is the only clock the times in the log were read from. A
+    /// window too wide to subtract reaches further back than any log goes,
+    /// which is the same as asking for all of it.
     fn read_envelopes(
         core: &Core,
         select: rpc::EnvelopeSelector,
-    ) -> Result<Vec<(EnvelopeDigest, Envelope)>, ChainError> {
+    ) -> Result<Vec<(EnvelopeDigest, LogEntry)>, ChainError> {
         match select {
-            rpc::EnvelopeSelector::Chain(walk) => core.canonical_chain(walk.limit),
+            rpc::EnvelopeSelector::Chain(walk) => {
+                core.canonical_chain(walk.limit, walk.since().and_then(StoredAt::ago))
+            }
             rpc::EnvelopeSelector::Digests(digests) => core.envelopes(digests),
         }
         .map_err(ChainError::Storage)
@@ -201,10 +209,12 @@ impl Rpc {
             .await
             .map_err(|err| rpc::Failure::internal(err.to_string()))?;
 
-        for (digest, envelope) in envelopes {
+        for (digest, entry) in envelopes {
             responses
                 .send(rpc::Response::Envelope(rpc::EnvelopeFrame::new(
-                    digest, envelope,
+                    digest,
+                    entry.envelope,
+                    entry.stored_at.timestamp_millis(),
                 )))
                 .await?;
         }
@@ -319,7 +329,7 @@ impl ServerHandle {
     pub async fn envelopes(
         &self,
         select: rpc::EnvelopeSelector,
-    ) -> Result<Vec<(EnvelopeDigest, Envelope)>, RequestError> {
+    ) -> Result<Vec<(EnvelopeDigest, LogEntry)>, RequestError> {
         let (send, recv) = Responder::channel();
         let _ = self.0.send(ServerMsg::Envelopes(select, send)).await;
         Self::answer(recv.await)

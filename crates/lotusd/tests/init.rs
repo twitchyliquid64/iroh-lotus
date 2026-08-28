@@ -217,7 +217,7 @@ async fn a_fresh_chain_holds_only_genesis() {
     let dir = TempDir::new().unwrap();
     let core = create(&dir, IfInitialized::Fail).await.unwrap();
 
-    let chain = core.canonical_chain(None).unwrap();
+    let chain = core.canonical_chain(None, None).unwrap();
     assert_eq!(chain.len(), 1);
     assert_eq!(chain[0].0, core.root());
     assert_eq!(chain[0].0, core.head());
@@ -271,7 +271,7 @@ async fn the_chain_is_walked_back_to_the_root_and_returned_oldest_first() {
         .unwrap();
 
     let walked: Vec<_> = core
-        .canonical_chain(None)
+        .canonical_chain(None, None)
         .unwrap()
         .into_iter()
         .map(|(digest, _)| digest)

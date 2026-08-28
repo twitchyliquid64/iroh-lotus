@@ -2,12 +2,44 @@
 
 use core::fmt;
 
+use chrono::NaiveDateTime;
 use wire::{Envelope, EnvelopeDigest, Msg, VerificationStatus, msg::AmendOp};
 
 use crate::style::{Palette, Style};
 
 /// Width the field labels are padded to.
 const LABEL: usize = 13;
+
+/// One envelope, as a rendering takes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    /// The digest it is shown under.
+    pub digest: EnvelopeDigest,
+    /// The envelope itself, carrying the verification status the node that
+    /// holds it reached.
+    pub envelope: Envelope,
+    /// When that node's log first stored it, where that is known. Local
+    /// bookkeeping off one machine's clock — shown because an operator
+    /// reading a log wants it, never because anything acts on it.
+    pub stored_at: Option<NaiveDateTime>,
+}
+
+impl Entry {
+    /// An envelope with nothing known about when it arrived.
+    pub fn new(digest: EnvelopeDigest, envelope: Envelope) -> Self {
+        Self {
+            digest,
+            envelope,
+            stored_at: None,
+        }
+    }
+
+    /// The same entry, stamped with when its node first stored it.
+    pub fn with_stored_at(mut self, stored_at: Option<NaiveDateTime>) -> Self {
+        self.stored_at = stored_at;
+        self
+    }
+}
 
 /// Renders envelopes, and chains of them.
 ///
@@ -54,11 +86,7 @@ impl Render {
 
     /// Writes `envelopes` — a chain, oldest first — under a line counting
     /// them, one numbered stanza each.
-    pub fn write_chain<W: fmt::Write>(
-        &self,
-        out: &mut W,
-        envelopes: &[(EnvelopeDigest, Envelope)],
-    ) -> fmt::Result {
+    pub fn write_chain<W: fmt::Write>(&self, out: &mut W, envelopes: &[Entry]) -> fmt::Result {
         let count = plural(envelopes.len(), "envelope", "envelopes");
         let header = match &self.header {
             Some(header) => format!("{count} on {header}"),
@@ -69,25 +97,18 @@ impl Render {
         envelopes
             .iter()
             .enumerate()
-            .try_for_each(|(index, (digest, envelope))| {
-                self.write_stanza(out, Some(index), digest, envelope)
-            })
+            .try_for_each(|(index, entry)| self.write_stanza(out, Some(index), entry))
     }
 
     /// Writes one envelope's stanza, unnumbered: nothing says where it
     /// sits, only what it is.
-    pub fn write_envelope<W: fmt::Write>(
-        &self,
-        out: &mut W,
-        digest: &EnvelopeDigest,
-        envelope: &Envelope,
-    ) -> fmt::Result {
-        self.write_stanza(out, None, digest, envelope)
+    pub fn write_envelope<W: fmt::Write>(&self, out: &mut W, entry: &Entry) -> fmt::Result {
+        self.write_stanza(out, None, entry)
     }
 
     /// The rendering of a chain, as [`write_chain`](Self::write_chain)
     /// writes it.
-    pub fn chain(&self, envelopes: &[(EnvelopeDigest, Envelope)]) -> String {
+    pub fn chain(&self, envelopes: &[Entry]) -> String {
         let mut out = String::new();
         // Writing to a String is infallible; `fmt::Write` cannot say so.
         let _ = self.write_chain(&mut out, envelopes);
@@ -96,9 +117,9 @@ impl Render {
 
     /// The rendering of one envelope, as
     /// [`write_envelope`](Self::write_envelope) writes it.
-    pub fn envelope(&self, digest: &EnvelopeDigest, envelope: &Envelope) -> String {
+    pub fn envelope(&self, entry: &Entry) -> String {
         let mut out = String::new();
-        let _ = self.write_envelope(&mut out, digest, envelope);
+        let _ = self.write_envelope(&mut out, entry);
         out
     }
 
@@ -108,9 +129,14 @@ impl Render {
         &self,
         out: &mut W,
         index: Option<usize>,
-        digest: &EnvelopeDigest,
-        envelope: &Envelope,
+        entry: &Entry,
     ) -> fmt::Result {
+        let Entry {
+            digest,
+            envelope,
+            stored_at,
+        } = entry;
+
         let number = index.map_or_else(String::new, |index| format!("#{index} "));
         let marks = [(self.root, "root"), (self.head, "head")]
             .into_iter()
@@ -160,6 +186,13 @@ impl Render {
 
         // Nothing to show per timestamp while `SignedTimestamp` is empty.
         self.field(out, "timestamps", envelope.timestamps().len())?;
+        // Last, and apart from the attested timestamps above on purpose:
+        // this one is a note the local log made, not anything signed.
+        self.field_list(
+            out,
+            "stored",
+            stored_at.map(|at| at.format("%Y-%m-%d %H:%M:%S%.3f").to_string()),
+        )?;
         writeln!(out)
     }
 

@@ -12,7 +12,11 @@ publish.workspace = true
 clap = ["dep:clap"]
 
 [dependencies]
+chrono.workspace = true
 clap = { workspace = true, optional = true }
 
 # Our crates
 wire.workspace = true
+
+[dev-dependencies]
+chrono.workspace = true

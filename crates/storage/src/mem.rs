@@ -12,7 +12,7 @@ use wire::{
     subkey::Subkey,
 };
 
-use crate::{NamespaceOp, Resolution, Storage, value};
+use crate::{LogEntry, NamespaceOp, Resolution, Storage, StoredAt, value};
 
 // Arc-shared with the versions derived from it; a commit clones the map
 // of pointers and copy-on-writes only what it touches.
@@ -26,7 +26,7 @@ type Version = BTreeMap<NamespaceKey, Arc<Namespace>>;
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct MemStorage {
     versions: HashMap<EnvelopeDigest, Version>,
-    envelopes: HashMap<EnvelopeDigest, Envelope>,
+    envelopes: HashMap<EnvelopeDigest, LogEntry>,
     // Children by parent digest; a BTreeSet so `children` yields them in
     // the ascending order the trait promises.
     children: HashMap<EnvelopeDigest, BTreeSet<EnvelopeDigest>>,
@@ -154,17 +154,30 @@ impl Storage for MemStorage {
         if let Some(prev) = envelope.payload().prev_digest() {
             self.children.entry(*prev).or_default().insert(digest);
         }
-        self.envelopes.insert(digest, envelope);
+        // Kept from the record being replaced: the stamp says when this
+        // node first saw the envelope, not when it last wrote it down.
+        let stored_at = self
+            .envelopes
+            .get(&digest)
+            .map_or_else(StoredAt::now, |entry| entry.stored_at);
+
+        self.envelopes.insert(
+            digest,
+            LogEntry {
+                envelope,
+                stored_at,
+            },
+        );
         Ok(())
     }
 
-    fn envelope(&self, digest: EnvelopeDigest) -> Result<Option<Envelope>, Infallible> {
+    fn logged_envelope(&self, digest: EnvelopeDigest) -> Result<Option<LogEntry>, Infallible> {
         Ok(self.envelopes.get(&digest).cloned())
     }
 
     fn remove_envelope(&mut self, digest: EnvelopeDigest) -> Result<(), Infallible> {
-        if let Some(envelope) = self.envelopes.remove(&digest)
-            && let Some(prev) = envelope.payload().prev_digest()
+        if let Some(entry) = self.envelopes.remove(&digest)
+            && let Some(prev) = entry.envelope.payload().prev_digest()
             && let Some(siblings) = self.children.get_mut(prev)
         {
             siblings.remove(&digest);

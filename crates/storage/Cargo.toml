@@ -11,6 +11,7 @@ default = ["sqlite"]
 sqlite = ["dep:rand", "dep:rusqlite", "dep:thiserror"]
 
 [dependencies]
+chrono.workspace = true
 rand = { workspace = true, optional = true }
 rusqlite = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }

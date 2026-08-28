@@ -22,7 +22,7 @@ use wire::{
     subkey::{Subkey, SubkeyPath},
 };
 
-use crate::{NamespaceOp, NodeKind, Resolution, Storage};
+use crate::{NamespaceOp, NodeKind, Resolution, Storage, StoredAt};
 
 /// Instantiates the conformance suite as `#[test]` functions.
 #[macro_export]
@@ -111,6 +111,14 @@ macro_rules! storage_conformance {
         #[test]
         fn conformance_envelopes_round_trip_the_verification_status() {
             $crate::conformance::envelopes_round_trip_the_verification_status($make);
+        }
+        #[test]
+        fn conformance_envelopes_record_when_they_were_stored() {
+            $crate::conformance::envelopes_record_when_they_were_stored($make);
+        }
+        #[test]
+        fn conformance_re_storing_keeps_the_time_first_seen() {
+            $crate::conformance::re_storing_keeps_the_time_first_seen($make);
         }
         #[test]
         fn conformance_children_come_back_in_digest_order() {
@@ -852,6 +860,80 @@ pub fn envelopes_store_and_read_back<S: Storage>(mut store: S) {
     put(&mut store, &stored);
     assert_eq!(store.envelope(d).expect("envelope"), Some(stored));
     assert_eq!(children_of(&store, digest(1)), vec![d]);
+}
+
+/// A stored envelope is stamped with when the log took it, and the plain
+/// `envelope` read is the same envelope the stamped one carries.
+pub fn envelopes_record_when_they_were_stored<S: Storage>(mut store: S) {
+    let stored = envelope(digest(1), "1");
+    let d = digest_of(&stored);
+
+    let before = StoredAt::now();
+    put(&mut store, &stored);
+    let after = StoredAt::now();
+
+    let entry = store
+        .logged_envelope(d)
+        .expect("logged_envelope")
+        .expect("stored");
+    let at = entry.stored_at;
+
+    assert!(
+        before <= at && at <= after,
+        "{at} is outside {before}..{after}"
+    );
+    assert_eq!(entry.envelope, stored);
+    // The two reads are the same envelope, whichever a caller reaches for.
+    assert_eq!(store.envelope(d).expect("envelope"), Some(stored));
+
+    // Nothing is stamped until something is stored.
+    assert_eq!(
+        store.logged_envelope(digest(9)).expect("logged_envelope"),
+        None,
+    );
+}
+
+/// Verification lands after an envelope did, and re-storing it is how the
+/// status is upgraded. The stamp says when this node first saw the
+/// envelope, so that upgrade must not make it look newer than it is.
+pub fn re_storing_keeps_the_time_first_seen<S: Storage>(mut store: S) {
+    let stored = envelope(digest(1), "1");
+    let d = digest_of(&stored);
+    put(&mut store, &stored);
+
+    let first = store
+        .logged_envelope(d)
+        .expect("logged_envelope")
+        .expect("stored")
+        .stored_at;
+
+    // Long enough that a clock reading a millisecond at a time has moved.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+
+    let mut verified = stored.clone();
+    verified.set_verification_status(VerificationStatus::AllMatched { total_weight: 3 });
+    put(&mut store, &verified);
+
+    let entry = store
+        .logged_envelope(d)
+        .expect("logged_envelope")
+        .expect("stored");
+    assert_eq!(entry.stored_at, first, "the stamp was rewritten");
+    assert_eq!(
+        entry.envelope.verification_status(),
+        &VerificationStatus::AllMatched { total_weight: 3 },
+        "the rest of the record must still be replaced",
+    );
+
+    // An envelope genuinely stored later is stamped later, which is what
+    // makes the assertion above mean anything.
+    let later = put(&mut store, &envelope(digest(1), "2"));
+    let later = store
+        .logged_envelope(later)
+        .expect("logged_envelope")
+        .expect("stored")
+        .stored_at;
+    assert!(first < later, "{first} should precede {later}");
 }
 
 /// The verification status rides outside the envelope's canonical CBOR:

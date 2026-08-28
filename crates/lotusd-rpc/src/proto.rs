@@ -4,9 +4,13 @@
 //! grow a field without changing shape.
 
 use core::fmt;
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use cbor2::Cbor;
+use chrono::NaiveDateTime;
 use wire::{Envelope, EnvelopeDigest, VerificationStatus, msg::NamespaceKey, subkey::SubkeyPath};
 
 /// A request on the local control socket.
@@ -52,8 +56,18 @@ impl GetEnvelopes {
 
     /// Asks for the newest `limit` envelopes of the canonical chain.
     pub fn newest(limit: u32) -> Self {
+        Self::walk(ChainWalk::default().with_limit(limit))
+    }
+
+    /// Asks for the envelopes the node stored within the last `since`.
+    pub fn since(since: Duration) -> Self {
+        Self::walk(ChainWalk::default().with_since(since))
+    }
+
+    /// Asks for the part of the canonical chain `walk` describes.
+    pub fn walk(walk: ChainWalk) -> Self {
         Self {
-            select: EnvelopeSelector::Chain(ChainWalk { limit: Some(limit) }),
+            select: EnvelopeSelector::Chain(walk),
         }
     }
 
@@ -78,12 +92,45 @@ pub enum EnvelopeSelector {
 }
 
 /// How much of the canonical chain to send.
+///
+/// Both bounds are counted back from the head, and both may be set: the
+/// walk stops at whichever it reaches first.
 #[derive(Debug, Copy, Clone, Cbor, Default, PartialEq, Eq)]
 pub struct ChainWalk {
     /// At most this many envelopes, counted back from the head; `None` for
     /// everything the node still holds.
     #[cbor(key = 1)]
     pub limit: Option<u32>,
+    /// Only envelopes the node stored within this many milliseconds of
+    /// now, by that node's own clock; `None` for however far back its log
+    /// goes.
+    ///
+    /// A window, not an instant, precisely because the clock is the
+    /// daemon's: a client naming an absolute time would be naming it on a
+    /// clock the daemon does not read.
+    #[cbor(key = 2)]
+    pub since_millis: Option<u64>,
+}
+
+impl ChainWalk {
+    /// Stops the walk after `limit` envelopes.
+    pub fn with_limit(mut self, limit: u32) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    /// Stops the walk at the envelopes the node stored longer than `since`
+    /// ago. A window past what a `u64` of milliseconds holds saturates,
+    /// which reaches further back than any log goes.
+    pub fn with_since(mut self, since: Duration) -> Self {
+        self.since_millis = Some(u64::try_from(since.as_millis()).unwrap_or(u64::MAX));
+        self
+    }
+
+    /// The window this walk asks for, if it asks for one.
+    pub fn since(&self) -> Option<Duration> {
+        self.since_millis.map(Duration::from_millis)
+    }
 }
 
 /// One envelope of a [`GetEnvelopes`] answer.
@@ -100,17 +147,37 @@ pub struct EnvelopeFrame {
     /// envelope's canonical encoding, so it travels beside it.
     #[cbor(key = 3)]
     pub verification: Verification,
+    /// When the sending node's log first stored the envelope, in
+    /// milliseconds since the unix epoch on that node's clock.
+    ///
+    /// For an operator reading a log and nothing else. Two nodes disagree
+    /// about it by construction, so nothing that decides anything may
+    /// read it — the ledger's own notion of time is a signed timestamp
+    /// inside the envelope.
+    #[cbor(key = 4)]
+    pub stored_at_millis: i64,
 }
 
 impl EnvelopeFrame {
-    /// The frame carrying `envelope` as the node holds it, verification
-    /// status and all.
-    pub fn new(digest: EnvelopeDigest, envelope: Envelope) -> Self {
+    /// The frame carrying `envelope` as the node holds it — verification
+    /// status, and when the log first saw it.
+    pub fn new(digest: EnvelopeDigest, envelope: Envelope, stored_at_millis: i64) -> Self {
         Self {
             digest,
             verification: Verification::from(envelope.verification_status()),
             envelope,
+            stored_at_millis,
         }
+    }
+
+    /// When the sending node first stored this envelope, as a datetime —
+    /// `None` only for a number no datetime can hold, which is a peer
+    /// sending nonsense rather than anything a log produces.
+    ///
+    /// Naive UTC, because there is no zone on it: the reading came off
+    /// another machine's clock and means nothing beside a local one.
+    pub fn stored_at(&self) -> Option<NaiveDateTime> {
+        chrono::DateTime::from_timestamp_millis(self.stored_at_millis).map(|at| at.naive_utc())
     }
 
     /// The envelope as the sending node holds it: the verification status

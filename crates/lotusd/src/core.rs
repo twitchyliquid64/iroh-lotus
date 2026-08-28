@@ -9,7 +9,7 @@ use std::{
 use ed25519_zebra::SigningKey;
 use rand::{TryRng, rngs::SysRng};
 use state::{Chain, ChangeDiffer, Insert, TRUSTED_KEYS_KEY};
-use storage::{SqliteStorage, Storage};
+use storage::{LogEntry, SqliteStorage, Storage, StoredAt};
 use tokio::{fs, io::AsyncWriteExt};
 use wire::{
     Envelope, EnvelopeDigest, Key, KeyId, Msg, Signature,
@@ -230,15 +230,23 @@ impl Core {
     }
 
     /// The canonical chain, oldest envelope first, of at most `limit`
-    /// envelopes counted back from the head.
+    /// envelopes counted back from the head and no further back than
+    /// `since`.
     ///
     /// Walks back from head by `prev` and stops where the log does, so an
-    /// unlimited walk starts as far back as this node can still see — the
+    /// unbounded walk starts as far back as this node can still see — the
     /// chain's root, until compaction has moved it.
+    ///
+    /// `since` stops the walk rather than filtering it, which is what
+    /// makes the answer a contiguous run: envelopes reach the log
+    /// parent-first, so along any one chain the times only ever go
+    /// forward, and the first envelope stored too long ago has nothing
+    /// newer behind it.
     pub fn canonical_chain(
         &self,
         limit: Option<u32>,
-    ) -> Result<Vec<(EnvelopeDigest, Envelope)>, storage::sqlite::Error> {
+        since: Option<StoredAt>,
+    ) -> Result<Vec<(EnvelopeDigest, LogEntry)>, storage::sqlite::Error> {
         let limit = limit.map_or(usize::MAX, |limit| limit as usize);
         let mut chain = Vec::new();
         let mut next = Some(self.chain.head());
@@ -246,11 +254,14 @@ impl Core {
         // Terminates without a seen-set: a digest covers its parent's, so a
         // cycle would need a hash collision to exist.
         while let Some(digest) = next.filter(|_| chain.len() < limit) {
-            let Some(envelope) = self.storage.envelope(digest)? else {
+            let Some(entry) = self.storage.logged_envelope(digest)? else {
                 break;
             };
-            next = envelope.payload().prev_digest().copied();
-            chain.push((digest, envelope));
+            if since.is_some_and(|since| entry.stored_at < since) {
+                break;
+            }
+            next = entry.envelope.payload().prev_digest().copied();
+            chain.push((digest, entry));
         }
 
         chain.reverse();
@@ -265,13 +276,13 @@ impl Core {
     pub fn envelopes(
         &self,
         digests: impl IntoIterator<Item = EnvelopeDigest>,
-    ) -> Result<Vec<(EnvelopeDigest, Envelope)>, storage::sqlite::Error> {
+    ) -> Result<Vec<(EnvelopeDigest, LogEntry)>, storage::sqlite::Error> {
         digests
             .into_iter()
             .filter_map(|digest| {
                 self.storage
-                    .envelope(digest)
-                    .map(|found| found.map(|envelope| (digest, envelope)))
+                    .logged_envelope(digest)
+                    .map(|found| found.map(|entry| (digest, entry)))
                     .transpose()
             })
             .collect()

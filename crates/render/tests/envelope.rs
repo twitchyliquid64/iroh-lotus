@@ -3,7 +3,8 @@
 //! One rendering serves the daemon and the CLI both, so the stanza is a
 //! contract between them rather than each one's private taste.
 
-use render::{ColorChoice, Palette, Render};
+use chrono::NaiveDate;
+use render::{ColorChoice, Entry, Palette, Render};
 use wire::{
     Envelope, EnvelopeDigest, Msg, VerificationStatus,
     keys::{Ed25519Signature, KeyId, Signature},
@@ -14,6 +15,14 @@ use wire::{
 /// digest it is shown under, which the caller supplies.
 fn digest(byte: u8) -> EnvelopeDigest {
     EnvelopeDigest::from_bytes([byte; 32])
+}
+
+/// A fixed reading, so what is rendered doesn't move with the clock.
+fn stored_at() -> chrono::NaiveDateTime {
+    NaiveDate::from_ymd_opt(2026, 8, 27)
+        .unwrap()
+        .and_hms_milli_opt(12, 43, 1, 250)
+        .unwrap()
 }
 
 fn hex(byte: u8) -> String {
@@ -50,6 +59,12 @@ fn set(prev: EnvelopeDigest) -> Envelope {
     }))
 }
 
+/// An entry with nothing known about when it arrived, which is most of
+/// what these tests render.
+fn entry(digest_byte: u8, envelope: Envelope) -> Entry {
+    Entry::new(digest(digest_byte), envelope)
+}
+
 fn signed(envelope: Envelope, byte: u8) -> Envelope {
     envelope.with_signature(
         KeyId::from_bytes([byte; 32]),
@@ -74,7 +89,7 @@ fn plain(text: &str) -> String {
 
 #[test]
 fn a_chain_renders_a_numbered_stanza_per_envelope() {
-    let chain = [(digest(1), genesis()), (digest(2), set(digest(1)))];
+    let chain = [entry(1, genesis()), entry(2, set(digest(1)))];
     let rendered = Render::new()
         .with_root(digest(1))
         .with_head(digest(2))
@@ -93,6 +108,7 @@ fn a_chain_renders_a_numbered_stanza_per_envelope() {
    verification   unchecked
    signed by      —
    timestamps     0
+   stored         —
 
 #1 {}  [head]
    prev           {}
@@ -100,6 +116,7 @@ fn a_chain_renders_a_numbered_stanza_per_envelope() {
    verification   unchecked
    signed by      —
    timestamps     0
+   stored         —
 
 ",
             hex(1),
@@ -114,7 +131,7 @@ fn a_chain_renders_a_numbered_stanza_per_envelope() {
 fn a_header_names_where_the_chain_came_from() {
     let rendered = Render::new()
         .with_header("/run/lotus/local.sock")
-        .chain(&[(digest(1), genesis())]);
+        .chain(&[entry(1, genesis())]);
 
     assert!(
         rendered.starts_with("1 envelope on /run/lotus/local.sock\n\n"),
@@ -134,7 +151,7 @@ fn an_envelope_that_is_both_ends_of_the_chain_is_marked_twice() {
     let rendered = Render::new()
         .with_root(digest(1))
         .with_head(digest(1))
-        .chain(&[(digest(1), genesis())]);
+        .chain(&[entry(1, genesis())]);
 
     assert!(rendered.contains(&format!("#0 {}  [root, head]\n", hex(1))));
 }
@@ -143,7 +160,7 @@ fn an_envelope_that_is_both_ends_of_the_chain_is_marked_twice() {
 /// which is the CLI fetching envelopes it has no range for.
 #[test]
 fn nothing_is_marked_without_a_root_or_head() {
-    let rendered = Render::new().chain(&[(digest(1), genesis())]);
+    let rendered = Render::new().chain(&[entry(1, genesis())]);
 
     assert!(rendered.contains(&format!("#0 {}\n", hex(1))));
 }
@@ -151,7 +168,7 @@ fn nothing_is_marked_without_a_root_or_head() {
 /// A lone envelope carries no number: nothing says where it sits.
 #[test]
 fn one_envelope_renders_unnumbered() {
-    let rendered = Render::new().envelope(&digest(2), &set(digest(1)));
+    let rendered = Render::new().envelope(&entry(2, set(digest(1))));
 
     assert_eq!(
         rendered,
@@ -163,6 +180,7 @@ fn one_envelope_renders_unnumbered() {
    verification   unchecked
    signed by      —
    timestamps     0
+   stored         —
 
 ",
             hex(2),
@@ -190,7 +208,7 @@ fn verification_is_reported_as_the_envelope_holds_it() {
 
         assert!(
             Render::new()
-                .envelope(&digest(1), &envelope)
+                .envelope(&entry(1, envelope))
                 .contains(&format!("   verification   {expected}\n")),
             "expected {expected}",
         );
@@ -204,14 +222,14 @@ fn signers_are_listed_one_per_line_under_a_single_label() {
 
     assert!(
         Render::new()
-            .envelope(&digest(1), &envelope)
+            .envelope(&entry(1, envelope.clone()))
             .contains(&format!(
                 "   signed by      {}\n                  {}\n",
                 hex(0x11),
                 hex(0xee),
             )),
         "got {}",
-        Render::new().envelope(&digest(1), &envelope),
+        Render::new().envelope(&entry(1, envelope)),
     );
 }
 
@@ -220,7 +238,10 @@ fn signers_are_listed_one_per_line_under_a_single_label() {
 /// things.
 #[test]
 fn colour_only_wraps_what_the_plain_rendering_already_says() {
-    let chain = [(digest(1), genesis()), (digest(2), set(digest(1)))];
+    let chain = [
+        entry(1, genesis()).with_stored_at(Some(stored_at())),
+        entry(2, set(digest(1))),
+    ];
     let render = Render::new().with_root(digest(1)).with_head(digest(2));
 
     let coloured = render.clone().with_palette(Palette::Ansi).chain(&chain);
@@ -234,7 +255,7 @@ fn colour_only_wraps_what_the_plain_rendering_already_says() {
 fn colour_does_not_disturb_the_columns() {
     let coloured = Render::new()
         .with_palette(Palette::Ansi)
-        .envelope(&digest(1), &genesis());
+        .envelope(&entry(1, genesis()));
 
     assert!(
         plain(&coloured).contains("   verification   unchecked\n"),
@@ -250,7 +271,7 @@ fn every_sequence_is_closed() {
     let coloured = Render::new()
         .with_palette(Palette::Ansi)
         .with_head(digest(1))
-        .chain(&[(digest(1), genesis())]);
+        .chain(&[entry(1, genesis())]);
 
     assert_eq!(
         coloured.matches("\x1b[0m").count(),
@@ -270,4 +291,21 @@ fn auto_does_not_colour_what_is_not_a_terminal() {
     assert_eq!(ColorChoice::Never.palette(&sink), Palette::Plain);
     // `Always` is what a caller redirecting to a pager or a test reaches for.
     assert_eq!(ColorChoice::Always.palette(&sink), Palette::Ansi);
+}
+
+/// The time the log took an envelope is shown where it is known, and reads
+/// as absent where it is not — a log written before anything recorded one.
+#[test]
+fn the_time_the_log_took_an_envelope_is_shown_where_it_is_known() {
+    let stamped = Render::new().envelope(&entry(1, genesis()).with_stored_at(Some(stored_at())));
+    assert!(
+        stamped.contains("   stored         2026-08-27 12:43:01.250\n"),
+        "got {stamped}",
+    );
+
+    let unstamped = Render::new().envelope(&entry(1, genesis()));
+    assert!(
+        unstamped.contains("   stored         —\n"),
+        "got {unstamped}",
+    );
 }

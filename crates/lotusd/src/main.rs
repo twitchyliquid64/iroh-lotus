@@ -3,7 +3,7 @@ use std::{path::PathBuf, process::ExitCode};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use lotusd::{Core, IfInitialized, Server};
-use render::{ColorChoice, Render};
+use render::{ColorChoice, Entry, Render};
 use tokio::net::UnixListener;
 use tokio::runtime::Builder;
 use tokio::signal::unix::SignalKind;
@@ -165,9 +165,15 @@ async fn async_main() -> Result<(), MainError> {
             let core = Core::init_with_state_dir(cli.global_args.state_dir()?)
                 .await
                 .map_err(MainError::Init)?;
-            let chain = core
-                .canonical_chain(args.limit)
-                .map_err(MainError::Storage)?;
+            let chain: Vec<Entry> = core
+                .canonical_chain(args.limit, None)
+                .map_err(MainError::Storage)?
+                .into_iter()
+                .map(|(digest, entry)| {
+                    Entry::new(digest, entry.envelope)
+                        .with_stored_at(Some(entry.stored_at.naive_utc()))
+                })
+                .collect();
 
             print!(
                 "{}",

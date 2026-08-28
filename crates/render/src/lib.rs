@@ -10,7 +10,7 @@
 //! and then writes stanzas into any [`fmt::Write`](core::fmt::Write).
 
 mod envelope;
-pub use envelope::Render;
+pub use envelope::{Entry, Render};
 
 mod style;
 pub use style::{ColorChoice, Palette};

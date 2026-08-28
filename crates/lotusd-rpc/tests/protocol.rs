@@ -9,6 +9,8 @@ use lotusd_rpc::{
     Request, Response, Responses, Verification, Watch, WatchEvent, WatchPath, WatchSelector, call,
     serve,
 };
+use std::time::Duration;
+
 use tokio::io::{AsyncWriteExt, DuplexStream, duplex};
 use wire::{
     Envelope, EnvelopeDigest, Msg, VerificationStatus,
@@ -40,6 +42,9 @@ fn changed() -> Changed {
         orphaned: [EnvelopeDigest::from_bytes([9u8; 32])].into(),
     }
 }
+
+/// A fixed reading for the fake's log to claim, well clear of now.
+const STORED_AT_MILLIS: i64 = 1_787_000_000_000;
 
 /// A genesis envelope, the one shape that can be built without naming a
 /// parent that has to exist.
@@ -106,7 +111,7 @@ impl Handler for Fake {
                 // per digest asked for, or a two-envelope chain.
                 let digests = match get.select {
                     EnvelopeSelector::Digests(digests) => digests,
-                    EnvelopeSelector::Chain(ChainWalk { limit }) => (0..limit.unwrap_or(2))
+                    EnvelopeSelector::Chain(walk) => (0..walk.limit.unwrap_or(2))
                         .map(|n| EnvelopeDigest::from_bytes([n as u8; 32]))
                         .collect(),
                 };
@@ -117,7 +122,11 @@ impl Handler for Fake {
                         total_weight: 3,
                     });
                     responses
-                        .send(Response::Envelope(EnvelopeFrame::new(digest, envelope)))
+                        .send(Response::Envelope(EnvelopeFrame::new(
+                            digest,
+                            envelope,
+                            STORED_AT_MILLIS,
+                        )))
                         .await?;
                 }
                 Ok(())
@@ -388,6 +397,8 @@ async fn a_get_envelopes_carries_its_selector_across() {
     for request in [
         GetEnvelopes::chain(),
         GetEnvelopes::newest(2),
+        GetEnvelopes::since(Duration::from_secs(900)),
+        GetEnvelopes::walk(ChainWalk::default().with_limit(4).with_since(HALF_A_SECOND)),
         GetEnvelopes::digests([EnvelopeDigest::from_bytes([5u8; 32])]),
         GetEnvelopes::digests([]),
     ] {
@@ -414,4 +425,44 @@ async fn asking_for_no_envelopes_ends_the_stream_at_once() {
         .unwrap();
 
     assert_eq!(call.next().await.unwrap(), None);
+}
+
+/// Sub-second windows survive the trip: the wire carries milliseconds, so
+/// a window shorter than a second must not round down to "everything".
+const HALF_A_SECOND: Duration = Duration::from_millis(500);
+
+#[test]
+fn a_window_crosses_as_milliseconds() {
+    assert_eq!(
+        ChainWalk::default().with_since(HALF_A_SECOND).since(),
+        Some(HALF_A_SECOND),
+    );
+    assert_eq!(ChainWalk::default().since(), None);
+
+    // A window past what the field holds saturates rather than wrapping
+    // into a short one that would quietly hide most of the chain.
+    assert_eq!(
+        ChainWalk::default().with_since(Duration::MAX).since_millis,
+        Some(u64::MAX),
+    );
+}
+
+/// The stored-at reading is the node's own clock and has no zone on it, so
+/// it crosses as a plain number of milliseconds and reads back the same.
+#[tokio::test]
+async fn an_envelope_frame_carries_when_the_node_stored_it() {
+    let frame = call(connect(Fake::new()), GetEnvelopes::newest(1))
+        .await
+        .unwrap();
+
+    assert_eq!(frame.stored_at_millis, STORED_AT_MILLIS);
+    assert_eq!(
+        frame.stored_at(),
+        chrono::DateTime::from_timestamp_millis(STORED_AT_MILLIS).map(|at| at.naive_utc()),
+    );
+
+    // A number no datetime can hold is a peer sending nonsense, not a
+    // reading: it reads back as no time rather than as some other one.
+    let nonsense = EnvelopeFrame::new(EnvelopeDigest::from_bytes([1u8; 32]), envelope(), i64::MAX);
+    assert_eq!(nonsense.stored_at(), None);
 }

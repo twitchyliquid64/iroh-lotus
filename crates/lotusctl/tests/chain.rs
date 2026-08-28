@@ -135,6 +135,72 @@ async fn chain_prints_every_envelope_the_daemon_holds() {
     );
 }
 
+/// When the daemon's log took each envelope is shown — the reason for
+/// recording it at all, since nothing else may read it.
+#[tokio::test]
+async fn chain_shows_when_the_daemon_stored_each_envelope() {
+    let dir = TempDir::new().unwrap();
+    let (_digests, _handle, _join) = chain_of_three(&dir).await;
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+
+    let text = output(&dir, &["chain"]).await;
+
+    assert_eq!(
+        text.matches("   stored         ").count(),
+        3,
+        "every envelope carries the time it was stored: {text}",
+    );
+    assert_eq!(
+        text.matches(&format!("   stored         {today} ")).count(),
+        3,
+        "got {text}",
+    );
+}
+
+/// The window keeps what the daemon took recently and drops what it took
+/// before — the point of the flag.
+#[tokio::test]
+async fn chain_since_prints_only_what_arrived_in_the_window() {
+    let dir = TempDir::new().unwrap();
+    let (head, handle, _join) = serve(&dir).await;
+
+    // The genesis ages out of the window; what follows lands inside it.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let recent = set_ns(head, "one");
+    handle.insert([recent.clone()]).await.unwrap();
+    let recent = recent.digest().unwrap();
+
+    let text = output(&dir, &["chain", "--since", "150ms"]).await;
+    assert!(text.starts_with("1 envelope on "), "got {text}");
+    assert!(
+        text.contains(&format!("#0 {}  [head]\n", hex(recent))),
+        "got {text}"
+    );
+    assert!(!text.contains(&format!("#0 {}", hex(head))), "got {text}");
+
+    // A window wide enough reaches back to the genesis.
+    let text = output(&dir, &["chain", "--since", "1h"]).await;
+    assert!(text.starts_with("2 envelopes on "), "got {text}");
+
+    // And the two bounds combine, the tighter one winning.
+    let text = output(&dir, &["chain", "--since", "1h", "-n", "1"]).await;
+    assert!(text.starts_with("1 envelope on "), "got {text}");
+}
+
+/// A window nobody could have meant is refused before the daemon is asked,
+/// rather than read as some other window.
+#[tokio::test]
+async fn chain_refuses_a_window_it_cannot_read() {
+    let dir = TempDir::new().unwrap();
+    let (_digests, _handle, _join) = chain_of_three(&dir).await;
+
+    let (ok, _text) = run(&dir, &["chain", "--since", "yesterday"]).await;
+    assert!(!ok, "an unreadable window must not exit zero");
+
+    let (ok, _text) = run(&dir, &["chain", "--since", "5w"]).await;
+    assert!(!ok, "an unsupported unit must not exit zero");
+}
+
 /// The limit keeps the newest end, so the head is always in what is shown.
 #[tokio::test]
 async fn chain_takes_a_limit_from_the_head_end() {

@@ -1,15 +1,15 @@
-use std::{collections::BTreeMap, fmt, path::PathBuf, process::ExitCode};
+use std::{collections::BTreeMap, fmt, path::PathBuf, process::ExitCode, time::Duration};
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use lotusd_rpc::{
-    Call, EnvelopeFrame, GetChainRange, GetEnvelopes, GetVersion, NamespaceChange, Watch,
-    WatchEvent, WatchSelector, call,
+    Call, ChainWalk, EnvelopeFrame, GetChainRange, GetEnvelopes, GetVersion, NamespaceChange,
+    Watch, WatchEvent, WatchSelector, call,
 };
-use render::{ColorChoice, Render};
+use render::{ColorChoice, Entry, Render};
 use tokio::net::UnixStream;
 use tokio::runtime::Builder;
-use wire::{Envelope, EnvelopeDigest, msg::NamespaceKey, subkey::SubkeyPath};
+use wire::{EnvelopeDigest, msg::NamespaceKey, subkey::SubkeyPath};
 
 /// The version of this CLI.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -50,6 +50,51 @@ struct ChainCommand {
     /// Print at most this many envelopes, counted back from the head
     #[arg(long, short = 'n')]
     limit: Option<u32>,
+
+    /// Print only what the daemon stored within this window, written like
+    /// `90s`, `15m`, `2h` or `7d`
+    ///
+    /// Measured on the daemon's clock, against the time its log first saw
+    /// each envelope — for looking at what has been arriving, never a
+    /// statement about when anything was signed.
+    #[arg(long, value_parser = parse_window)]
+    since: Option<Duration>,
+}
+
+impl ChainCommand {
+    /// The walk these arguments ask the daemon for.
+    fn walk(&self) -> ChainWalk {
+        let walk = self.limit.map_or_else(ChainWalk::default, |limit| {
+            ChainWalk::default().with_limit(limit)
+        });
+        self.since.map_or(walk, |since| walk.with_since(since))
+    }
+}
+
+/// Reads a window like `90s`, `15m`, `2h` or `7d`, for clap. A bare number
+/// is seconds; `ms` is there because the protocol carries milliseconds.
+fn parse_window(text: &str) -> Result<Duration, String> {
+    let split = text
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(text.len());
+    let (count, unit) = text.split_at(split);
+
+    let count: u64 = count
+        .parse()
+        .map_err(|_| format!("`{text}` is not a window; write one like 90s, 15m, 2h or 7d"))?;
+    let millis = match unit {
+        "ms" => 1,
+        "" | "s" => 1_000,
+        "m" => 60 * 1_000,
+        "h" => 60 * 60 * 1_000,
+        "d" => 24 * 60 * 60 * 1_000,
+        unit => return Err(format!("`{unit}` is not a unit; use ms, s, m, h or d")),
+    };
+
+    count
+        .checked_mul(millis)
+        .map(Duration::from_millis)
+        .ok_or_else(|| format!("`{text}` is a longer window than any log covers"))
 }
 
 /// The arguments for the show subcommand.
@@ -317,10 +362,7 @@ async fn async_main() -> Result<(), MainError> {
         }
         Command::Chain(args) => {
             let path = cli.global_args.local_sock_path()?;
-            let request = args
-                .limit
-                .map_or_else(GetEnvelopes::chain, GetEnvelopes::newest);
-            let frames = envelopes(&path, request).await?;
+            let frames = envelopes(&path, GetEnvelopes::walk(args.walk())).await?;
 
             match cli.global_args.format {
                 Format::Json => print_json(&frames)?,
@@ -329,7 +371,7 @@ async fn async_main() -> Result<(), MainError> {
                     renderer(&cli.global_args, &path)
                         .await?
                         .with_header(path.display().to_string())
-                        .chain(&parts(frames))
+                        .chain(&entries(frames))
                 ),
             }
         }
@@ -342,9 +384,9 @@ async fn async_main() -> Result<(), MainError> {
                 Format::Json => print_json(&frames)?,
                 Format::Text => {
                     let render = renderer(&cli.global_args, &path).await?;
-                    parts(frames).iter().for_each(|(digest, envelope)| {
-                        print!("{}", render.envelope(digest, envelope))
-                    });
+                    entries(frames)
+                        .iter()
+                        .for_each(|entry| print!("{}", render.envelope(entry)));
                 }
             }
 
@@ -461,10 +503,18 @@ async fn envelopes(
     Ok(frames)
 }
 
-/// The envelopes the frames carry, each with the verification status the
-/// daemon holds it under put back.
-fn parts(frames: Vec<EnvelopeFrame>) -> Vec<(EnvelopeDigest, Envelope)> {
-    frames.into_iter().map(EnvelopeFrame::into_parts).collect()
+/// The envelopes the frames carry, ready to render: the verification
+/// status the daemon holds each under put back, and the time its log first
+/// saw it alongside.
+fn entries(frames: Vec<EnvelopeFrame>) -> Vec<Entry> {
+    frames
+        .into_iter()
+        .map(|frame| {
+            let stored_at = frame.stored_at();
+            let (digest, envelope) = frame.into_parts();
+            Entry::new(digest, envelope).with_stored_at(stored_at)
+        })
+        .collect()
 }
 
 /// The digests asked for that came back in no frame.
@@ -517,4 +567,45 @@ pub enum MainError {
     Rpc(lotusd_rpc::Error),
     Json(serde_json::Error),
     Other(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_window_reads_in_whichever_unit_it_was_written() {
+        let cases = [
+            ("30", 30_000),
+            ("30s", 30_000),
+            ("250ms", 250),
+            ("15m", 15 * 60_000),
+            ("2h", 2 * 60 * 60_000),
+            ("7d", 7 * 24 * 60 * 60_000),
+            ("0s", 0),
+        ];
+
+        for (text, millis) in cases {
+            assert_eq!(
+                parse_window(text),
+                Ok(Duration::from_millis(millis)),
+                "{text}",
+            );
+        }
+    }
+
+    /// Nothing is guessed at: a window nobody could have meant is refused
+    /// rather than read as some other window.
+    #[test]
+    fn a_window_that_is_not_one_is_refused() {
+        for bad in [
+            "", "s", "m5", "5 m", "-5m", "5x", "5us", "5w", "abc", "1.5h",
+        ] {
+            assert!(parse_window(bad).is_err(), "`{bad}` should not parse");
+        }
+
+        // Overflowing the multiply is refused, not wrapped into a short
+        // window that would quietly hide most of the chain.
+        assert!(parse_window(&format!("{}d", u64::MAX)).is_err());
+    }
 }

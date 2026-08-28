@@ -65,7 +65,7 @@ use wire::{
     subkey::Subkey,
 };
 
-use crate::{NamespaceOp, NodeKind, Resolution, Storage};
+use crate::{LogEntry, NamespaceOp, NodeKind, Resolution, Storage, StoredAt};
 
 /// The errors the SQLite backend can produce.
 #[derive(Debug, thiserror::Error)]
@@ -98,11 +98,14 @@ const JOURNAL_SIZE_LIMIT: i64 = 32 * 1024 * 1024;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS envelopes (
-    digest BLOB PRIMARY KEY,
-    bytes  BLOB NOT NULL,
-    prev   BLOB,
-    status INTEGER NOT NULL,
-    weight INTEGER
+    digest    BLOB PRIMARY KEY,
+    bytes     BLOB NOT NULL,
+    prev      BLOB,
+    status    INTEGER NOT NULL,
+    weight    INTEGER,
+    -- Unix milliseconds off this node's clock, and nothing but a note to
+    -- whoever is reading the log.
+    stored_at INTEGER NOT NULL
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS envelopes_by_prev ON envelopes (prev) WHERE prev IS NOT NULL;
 
@@ -785,26 +788,52 @@ impl Storage for SqliteStorage {
             .prev_digest()
             .map(EnvelopeDigest::as_slice);
         let (status, weight) = status_columns(envelope.verification_status());
+        // An upsert rather than INSERT OR REPLACE: the row being replaced
+        // holds the time this node first saw the envelope, and a status
+        // upgraded an hour later must not restamp it.
         self.conn
             .prepare_cached(
-                "INSERT OR REPLACE INTO envelopes (digest, bytes, prev, status, weight)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO envelopes (digest, bytes, prev, status, weight, stored_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT (digest) DO UPDATE SET
+                     bytes = excluded.bytes,
+                     prev = excluded.prev,
+                     status = excluded.status,
+                     weight = excluded.weight",
             )?
-            .execute(params![digest.as_slice(), bytes, prev, status, weight])?;
+            .execute(params![
+                digest.as_slice(),
+                bytes,
+                prev,
+                status,
+                weight,
+                StoredAt::now().timestamp_millis(),
+            ])?;
         Ok(())
     }
 
-    fn envelope(&self, digest: EnvelopeDigest) -> Result<Option<Envelope>, Error> {
+    fn logged_envelope(&self, digest: EnvelopeDigest) -> Result<Option<LogEntry>, Error> {
         self.conn
-            .prepare_cached("SELECT bytes, status, weight FROM envelopes WHERE digest = ?1")?
+            .prepare_cached(
+                "SELECT bytes, status, weight, stored_at FROM envelopes WHERE digest = ?1",
+            )?
             .query_row([digest.as_slice()], |row| {
-                Ok((row.get::<_, Vec<u8>>(0)?, row.get(1)?, row.get(2)?))
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
             })
             .optional()?
-            .map(|(bytes, status, weight)| {
+            .map(|(bytes, status, weight, stored_at)| {
                 let mut envelope: Envelope = wire::decode(&bytes)?;
                 envelope.set_verification_status(status_from(status, weight)?);
-                Ok(envelope)
+                Ok(LogEntry {
+                    envelope,
+                    stored_at: StoredAt::from_timestamp_millis(stored_at)
+                        .ok_or(Error::Corrupt("stored-at is not a time"))?,
+                })
             })
             .transpose()
     }

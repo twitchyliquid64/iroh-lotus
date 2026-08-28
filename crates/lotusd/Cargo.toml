@@ -31,4 +31,5 @@ storage.workspace = true
 wire.workspace = true
 
 [dev-dependencies]
+chrono.workspace = true
 tempfile.workspace = true
