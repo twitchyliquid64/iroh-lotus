@@ -157,34 +157,40 @@ async fn chain_shows_when_the_daemon_stored_each_envelope() {
     );
 }
 
-/// The window keeps what the daemon took recently and drops what it took
-/// before — the point of the flag.
+/// The window is parsed here and applied by the daemon: a wide one takes
+/// in the whole chain, a zero one takes in nothing, and a limit still
+/// bounds what the window let through.
+///
+/// Where the boundary falls between those two is settled in the daemon's
+/// own tests. From here it cannot be: the window is measured from when
+/// the daemon serves the request, and everything between the insert and
+/// that point — spawning this process, linking it, connecting — is time
+/// no window can be sized against.
 #[tokio::test]
-async fn chain_since_prints_only_what_arrived_in_the_window() {
+async fn chain_since_bounds_what_is_printed() {
     let dir = TempDir::new().unwrap();
-    let (head, handle, _join) = serve(&dir).await;
+    let ([root, _middle, head], _handle, _join) = chain_of_three(&dir).await;
 
-    // The genesis ages out of the window; what follows lands inside it.
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    let recent = set_ns(head, "one");
-    handle.insert([recent.clone()]).await.unwrap();
-    let recent = recent.digest().unwrap();
-
-    let text = output(&dir, &["chain", "--since", "150ms"]).await;
-    assert!(text.starts_with("1 envelope on "), "got {text}");
+    let text = output(&dir, &["chain", "--since", "1h"]).await;
+    assert!(text.starts_with("3 envelopes on "), "got {text}");
     assert!(
-        text.contains(&format!("#0 {}  [head]\n", hex(recent))),
+        text.contains(&hex(root)) && text.contains(&hex(head)),
         "got {text}"
     );
-    assert!(!text.contains(&format!("#0 {}", hex(head))), "got {text}");
 
-    // A window wide enough reaches back to the genesis.
-    let text = output(&dir, &["chain", "--since", "1h"]).await;
-    assert!(text.starts_with("2 envelopes on "), "got {text}");
+    // Nothing was stored after the request went out, and starting a
+    // process takes far longer than the millisecond the stamps are kept
+    // to, so nothing falls inside a window that ends on arrival.
+    let text = output(&dir, &["chain", "--since", "0s"]).await;
+    assert!(text.starts_with("0 envelopes on "), "got {text}");
 
-    // And the two bounds combine, the tighter one winning.
+    // The two bounds combine, the tighter one winning.
     let text = output(&dir, &["chain", "--since", "1h", "-n", "1"]).await;
     assert!(text.starts_with("1 envelope on "), "got {text}");
+    assert!(
+        text.contains(&format!("#0 {}  [head]\n", hex(head))),
+        "got {text}"
+    );
 }
 
 /// A window nobody could have meant is refused before the daemon is asked,

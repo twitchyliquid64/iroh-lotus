@@ -342,11 +342,13 @@ async fn a_fetched_envelope_keeps_the_verification_status_the_node_gave_it() {
     assert_eq!(envelope.verification_status().signature_weight(), 2);
 }
 
-/// How long a `since` test waits before inserting, and the window it then
-/// asks for. Generous on both sides: the wait has to outlast the window,
-/// and the inserts after it have to fit inside one.
-const OLD: Duration = Duration::from_millis(250);
-const WINDOW: Duration = Duration::from_millis(150);
+/// How long the `since` test waits before inserting, and the window it
+/// then asks for. What has to fit inside the window is one in-process
+/// round trip over a unix socket, so the margin either side is enormous
+/// — where the boundary actually falls is settled in `chain_walk.rs`,
+/// against the log's own stamps rather than against a clock.
+const OLD: Duration = Duration::from_millis(500);
+const WINDOW: Duration = Duration::from_millis(250);
 
 /// The log stamps what it stores, and the stamp reaches a client — the
 /// whole point of recording it, since nothing else may read it.
@@ -383,11 +385,10 @@ async fn get_envelopes_reports_when_the_node_stored_each_envelope() {
     assert!(genesis <= stored);
 }
 
-/// A window keeps the envelopes the node took recently and stops at the
-/// first one older than it — a contiguous run ending at the head, never a
-/// chain with holes in it.
+/// The window crosses the wire and is applied against the daemon's own
+/// clock, which is the only clock the stamps were read from.
 #[tokio::test]
-async fn get_envelopes_since_keeps_only_what_arrived_in_the_window() {
+async fn get_envelopes_applies_the_window_it_was_sent() {
     let dir = TempDir::new().unwrap();
     let (head, path, handle, _join) = serve(&dir).await;
 
@@ -407,7 +408,8 @@ async fn get_envelopes_since_keeps_only_what_arrived_in_the_window() {
     assert_eq!(recent, [first.digest().unwrap(), second.digest().unwrap()]);
 
     // A window wide enough reaches the genesis, and no window at all is
-    // the whole chain.
+    // the whole chain — a bound has to differ from those to be doing
+    // anything.
     assert_eq!(
         envelopes(&path, GetEnvelopes::since(Duration::from_secs(3600)))
             .await
@@ -415,60 +417,18 @@ async fn get_envelopes_since_keeps_only_what_arrived_in_the_window() {
         3,
     );
     assert_eq!(envelopes(&path, GetEnvelopes::chain()).await.len(), 3);
-}
 
-/// Both bounds may be set at once; the walk stops at whichever it reaches
-/// first.
-#[tokio::test]
-async fn a_window_and_a_limit_bound_the_same_walk() {
-    let dir = TempDir::new().unwrap();
-    let (head, path, handle, _join) = serve(&dir).await;
-
-    tokio::time::sleep(OLD).await;
-    let first = set_ns(head, "one");
-    handle.insert([first.clone()]).await.unwrap();
-    let second = set_ns(first.digest().unwrap(), "two");
-    handle.insert([second.clone()]).await.unwrap();
-
-    // The limit bites first: one envelope, from the head end.
-    let by_limit: Vec<_> = envelopes(
+    // Both bounds travel together, and the tighter one wins.
+    let bounded = envelopes(
         &path,
         GetEnvelopes::walk(ChainWalk::default().with_limit(1).with_since(WINDOW)),
     )
-    .await
-    .into_iter()
-    .map(|frame| frame.digest)
-    .collect();
-    assert_eq!(by_limit, [second.digest().unwrap()]);
-
-    // The window bites first: the limit would have reached the genesis.
-    let by_window: Vec<_> = envelopes(
-        &path,
-        GetEnvelopes::walk(ChainWalk::default().with_limit(3).with_since(WINDOW)),
-    )
-    .await
-    .into_iter()
-    .map(|frame| frame.digest)
-    .collect();
+    .await;
     assert_eq!(
-        by_window,
-        [first.digest().unwrap(), second.digest().unwrap()]
-    );
-}
-
-/// A window nothing fits in is an empty answer, not the whole chain: a
-/// bound that silently stopped applying would be worse than no bound.
-#[tokio::test]
-async fn a_window_nothing_falls_inside_answers_with_nothing() {
-    let dir = TempDir::new().unwrap();
-    let (head, path, handle, _join) = serve(&dir).await;
-    handle.insert([set_ns(head, "one")]).await.unwrap();
-
-    tokio::time::sleep(OLD).await;
-
-    assert!(
-        envelopes(&path, GetEnvelopes::since(WINDOW))
-            .await
-            .is_empty()
+        bounded
+            .into_iter()
+            .map(|frame| frame.digest)
+            .collect::<Vec<_>>(),
+        [second.digest().unwrap()],
     );
 }
