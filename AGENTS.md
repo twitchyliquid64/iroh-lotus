@@ -13,18 +13,18 @@ as long as compaction has not run on the oldest trustworthy message.
 | Crate  | Role |
 |--------|------|
 | `wire` | Types for serializing messages on the wire. CBOR2 canonical used so messages have hash stability and can be signed. |
-| `state` | The state a chain folds down to. `Ledger::apply` advances it one envelope at a time, like replaying a database log. `Chain` stores every envelope seen — competing forks included — in the store's log and keeps a ledger on the canonical path: at every fork the highest verified signature weight wins, ties broken by the highest envelope digest. |
+| `state` | The state a chain folds down to. `Ledger::apply` advances it one envelope at a time, like replaying a database log. `Chain` is like ledger except it resolves forks (multiple envelopes with the same parent) into the canonical path: at every fork the highest verified signature weight wins, ties broken by the highest envelope digest. |
 | `storage` | Where ledger state lives: a content-addressed version store keyed by envelope digest, so many ledgers (forks, rewrites, old positions) share one backend, plus the envelope log those versions fold down from. The log also stamps each envelope with a `StoredAt` — when *this* node first saw it, for inspection only. Namespace/path-granular reads and writes, the in-memory backend, the SQLite backend (default feature `sqlite`), and the conformance suite every backend must pass. |
-| `render` | How an envelope is shown to a person: one stanza format, optionally coloured, shared by the daemon inspecting its disk and the CLI printing what it fetched. |
-| `sync` | Node-to-node sync: the peer wire protocol and sans-io session machines. A `Puller` catches a node up from one peer, a `Server` serves the peer's pull; both consume `Input`s and emit `Effect`s — storage access included, as `Ask`/`Ingest` effects the driver resolves — so sessions run without sockets, clocks, or a runtime. Each node offers only its own canonical path; fork resolution in `state` does all merging. The async drivers live with whoever owns the store (`lotusd`). |
+| `render` | How an envelope is shown to a person: one stanza format, optionally coloured. |
+| `sync` | Node-to-node sync: the peer wire protocol and sans-io session machines. A `Puller` catches a node up from one peer, a `Server` serves the peer's pull; both consume `Input`s and emit `Effect`s — storage access included, as `Ask`/`Ingest` effects the driver resolves — so sessions run without sockets, clocks, or a runtime. Each node offers only its own canonical path; fork resolution in `state` does all merging. |
 | `lotusd-rpc` | The protocol lotusd speaks on its local socket. Length-prefixed canonical CBOR frames; one connection carries one request and the stream of responses to it. A `Method` pairs a request with the response type that answers it, so callers never name the response. |
-| `lotusd` | The daemon. `Core` is the on-disk cluster — store, chain, signing keys. `Server` owns it on one mainloop task and is reached only by actor messages through a `ServerHandle`; each local connection gets its own task and its own handle. `sync_driver` drives the `sync` machines over any `AsyncRead + AsyncWrite` transport (a duplex pipe in tests, an iroh stream later), resolving their `Ask`/`Ingest` effects through the same actor messages; time — frame timeouts — lives there, never in the machines. |
+| `lotusd` | The daemon. `Core` is the on-disk cluster — store, chain, signing keys. `Server` owns it on one mainloop task and is reached only by actor messages through a `ServerHandle`; each local connection gets its own task and its own handle. `sync_driver` drives the `sync` machines over any `AsyncRead + AsyncWrite` transport (a duplex pipe in tests, an iroh stream later), resolving their `Ask`/`Ingest` effects through the same actor messages. |
 
 ## Signature verification
 
 If different nodes disagree on what signatures are valid, you get a permanent chain split: fork resolution picks the path with the highest
 *verified* signature weight, so nodes that disagree about one signature pick different canonical chains and never
-reconverge.
+converge.
 
 `wire` therefore verifies with `ed25519-zebra`, which implements [ZIP 215](https://zips.z.cash/zip-0215) — a precisely
 specified rule set where individual verification agrees with batch verification.
