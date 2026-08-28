@@ -1247,6 +1247,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "sync"
+version = "0.0.1"
+dependencies = [
+ "cbor2",
+ "ed25519-zebra",
+ "serde",
+ "state",
+ "storage",
+ "thiserror",
+ "tokio-util",
+ "wire",
+]
+
+[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1336,6 +1350,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "libc",
  "pin-project-lite",
  "tokio",
 ]

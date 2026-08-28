@@ -6,6 +6,7 @@ members = [
     "crates/render",
     "crates/state",
     "crates/storage",
+    "crates/sync",
     "crates/wire",
 ]
 resolver = "3"
@@ -56,4 +57,5 @@ lotusd-rpc = { path = "crates/lotusd-rpc" }
 render = { path = "crates/render" }
 state = { path = "crates/state" }
 storage = { path = "crates/storage" }
+sync = { path = "crates/sync" }
 wire = { path = "crates/wire" }

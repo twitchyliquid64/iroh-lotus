@@ -1,0 +1,21 @@
+[package]
+name = "sync"
+version.workspace = true
+rust-version.workspace = true
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+cbor2.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio-util = { workspace = true, features = ["codec"] }
+
+# Our crates
+wire.workspace = true
+
+[dev-dependencies]
+ed25519-zebra.workspace = true
+state.workspace = true
+storage.workspace = true
