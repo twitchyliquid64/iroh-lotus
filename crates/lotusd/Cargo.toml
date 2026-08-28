@@ -17,6 +17,7 @@ generational-arena.workspace = true
 nutype.workspace = true
 rand.workspace = true
 serde.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tokio-util.workspace = true
@@ -28,6 +29,7 @@ lotusd-rpc.workspace = true
 render = { workspace = true, features = ["clap"] }
 state.workspace = true
 storage.workspace = true
+sync.workspace = true
 wire.workspace = true
 
 [dev-dependencies]

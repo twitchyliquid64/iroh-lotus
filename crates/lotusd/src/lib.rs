@@ -19,6 +19,8 @@ pub use subscribe::{
     ChangeFilter, ChangeNotification, ChangeSelector, SubscriptionHandle, Subscriptions,
 };
 
+pub mod sync_driver;
+
 /// The version this daemon reports over the control socket.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

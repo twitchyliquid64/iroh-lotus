@@ -175,6 +175,14 @@ impl Storage for MemStorage {
         Ok(self.envelopes.get(&digest).cloned())
     }
 
+    fn parent(&self, digest: EnvelopeDigest) -> Result<Option<EnvelopeDigest>, Infallible> {
+        // Overridden to skip the default's clone of the whole entry.
+        Ok(self
+            .envelopes
+            .get(&digest)
+            .and_then(|entry| entry.envelope.payload().prev_digest().copied()))
+    }
+
     fn remove_envelope(&mut self, digest: EnvelopeDigest) -> Result<(), Infallible> {
         if let Some(entry) = self.envelopes.remove(&digest)
             && let Some(prev) = entry.envelope.payload().prev_digest()

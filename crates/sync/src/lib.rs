@@ -52,6 +52,8 @@ pub use puller::Puller;
 mod server;
 pub use server::Server;
 
+mod trace;
+
 #[cfg(test)]
 mod testutil;
 

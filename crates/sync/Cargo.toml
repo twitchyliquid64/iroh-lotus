@@ -10,7 +10,8 @@ publish.workspace = true
 cbor2.workspace = true
 serde.workspace = true
 thiserror.workspace = true
-tokio-util = { workspace = true, features = ["codec"] }
+tokio-util.workspace = true
+tracing.workspace = true
 
 # Our crates
 wire.workspace = true

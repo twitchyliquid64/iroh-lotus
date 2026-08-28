@@ -68,6 +68,15 @@ impl Server {
     /// [`Puller::handle`](crate::Puller::handle) — and on a core that
     /// answers a segment over the budget it was asked for.
     pub fn handle(&mut self, input: Input) -> Vec<Effect<ServeOutcome>> {
+        // Logged before the step so a contract panic still shows what
+        // was fed.
+        tracing::debug!(input = %crate::trace::input(&input), "server");
+        let effects = self.step(input);
+        tracing::debug!(effects = %crate::trace::effects(&effects), "server");
+        effects
+    }
+
+    fn step(&mut self, input: Input) -> Vec<Effect<ServeOutcome>> {
         // Every path either installs the next state or ends Terminal.
         let state = mem::replace(&mut self.state, State::Terminal);
         match (state, input) {

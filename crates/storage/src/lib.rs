@@ -261,4 +261,18 @@ pub trait Storage {
         &self,
         parent: EnvelopeDigest,
     ) -> impl Iterator<Item = Result<EnvelopeDigest, Self::Error>>;
+
+    /// The `prev` of the envelope stored under `digest` — `None` when the
+    /// log holds no such envelope, or holds one with no parent (an
+    /// `Init`).
+    ///
+    /// One hop of a chain walk, and walks take many: the default reads
+    /// and decodes the whole envelope for one field, so a backend that
+    /// keeps `prev` beside the envelope should override this with a
+    /// lookup that touches nothing else.
+    fn parent(&self, digest: EnvelopeDigest) -> Result<Option<EnvelopeDigest>, Self::Error> {
+        Ok(self
+            .envelope(digest)?
+            .and_then(|envelope| envelope.payload().prev_digest().copied()))
+    }
 }

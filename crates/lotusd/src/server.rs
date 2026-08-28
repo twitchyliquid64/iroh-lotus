@@ -28,6 +28,7 @@ enum ServerMsg {
         Responder<Vec<(EnvelopeDigest, LogEntry)>, ChainError>,
     ),
     Insert(Vec<Envelope>, Responder<Insert, ChainError>),
+    SyncAnswer(sync::Query, Responder<sync::Answer, ChainError>),
     Subscribe(ChangeFilter, Responder<SubscriptionHandle, ()>),
     Contains(EnvelopeDigest, Responder<bool, ChainError>),
     Watchers(Responder<usize, ()>),
@@ -109,6 +110,9 @@ impl Server {
             // ordering against each other is the whole guarantee, so
             // neither may be handed to a task that could reorder them.
             ServerMsg::Insert(envelopes, r) => r.respond(core.insert(envelopes)),
+            ServerMsg::SyncAnswer(query, r) => {
+                r.respond(core.sync_answer(query).map_err(ChainError::Storage));
+            }
             ServerMsg::Subscribe(filter, r) => r.respond(Ok(core.subscribe(filter))),
             ServerMsg::Contains(digest, r) => r.respond(core.contains(digest)),
             ServerMsg::Watchers(r) => r.respond(Ok(core.subscriptions().count())),
@@ -352,6 +356,16 @@ impl ServerHandle {
             .0
             .send(ServerMsg::Insert(envelopes.into_iter().collect(), send))
             .await;
+        Self::answer(recv.await)
+    }
+
+    /// Answers one sync-machine query against this node's chain — what
+    /// the sync driver resolves an `Effect::Ask` with.
+    ///
+    /// [`Effect::Ask`]: sync::Effect::Ask
+    pub async fn sync_answer(&self, query: sync::Query) -> Result<sync::Answer, RequestError> {
+        let (send, recv) = Responder::channel();
+        let _ = self.0.send(ServerMsg::SyncAnswer(query, send)).await;
         Self::answer(recv.await)
     }
 

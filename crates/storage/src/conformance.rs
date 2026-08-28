@@ -132,6 +132,10 @@ macro_rules! storage_conformance {
         fn conformance_remove_envelope_unstores_and_unindexes() {
             $crate::conformance::remove_envelope_unstores_and_unindexes($make);
         }
+        #[test]
+        fn conformance_parent_follows_prev() {
+            $crate::conformance::parent_follows_prev($make);
+        }
     };
 }
 
@@ -1004,6 +1008,37 @@ pub fn remove_envelope_unstores_and_unindexes<S: Storage>(mut store: S) {
     // Removing what isn't stored is a no-op.
     store.remove_envelope(digest(9)).expect("remove");
     assert_eq!(children_of(&store, digest(1)), vec![kept]);
+}
+
+/// `parent` answers what the stored envelope's own `prev` says — the hop
+/// chain walks take without materializing envelopes — and `None` for
+/// both an absent envelope and one with no parent.
+pub fn parent_follows_prev<S: Storage>(mut store: S) {
+    let first = envelope(digest(1), "1");
+    let second = envelope(digest_of(&first), "2");
+    put(&mut store, &first);
+    put(&mut store, &second);
+
+    assert_eq!(
+        store.parent(digest_of(&second)).expect("parent"),
+        Some(digest_of(&first))
+    );
+    assert_eq!(
+        store.parent(digest_of(&first)).expect("parent"),
+        Some(digest(1))
+    );
+    assert_eq!(store.parent(digest(9)).expect("parent"), None, "not stored");
+
+    // An `Init` has no parent: stored, but the walk ends on it.
+    let root = Envelope::new(Msg::Init(wire::msg::InitMsg {
+        state: wire::msg::FullCheckpoint::default(),
+    }));
+    put(&mut store, &root);
+    assert_eq!(store.parent(digest_of(&root)).expect("parent"), None);
+
+    // Removal takes the answer with it.
+    store.remove_envelope(digest_of(&second)).expect("remove");
+    assert_eq!(store.parent(digest_of(&second)).expect("parent"), None);
 }
 
 /// Versions are what the log folds down to; pruning them must not touch

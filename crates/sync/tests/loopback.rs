@@ -150,13 +150,17 @@ impl Node {
                     .rev()
                     .take(sync::MAX_BATCH_ENVELOPES as usize)
                     .map(|&digest| self.store.envelope(digest).unwrap().unwrap())
-                    .take_while(|envelope| {
+                    .enumerate()
+                    // The first envelope goes regardless of its size:
+                    // excluding it would wedge the stream at this point
+                    // for good.
+                    .take_while(|(index, envelope)| {
                         let cost = wire::encode(envelope).unwrap().len();
-                        budget
-                            .checked_sub(cost)
-                            .inspect(|&left| budget = left)
-                            .is_some()
+                        let fits = *index == 0 || cost <= budget;
+                        budget = budget.saturating_sub(cost);
+                        fits
                     })
+                    .map(|(_, envelope)| envelope)
                     .collect();
                 Answer::Segment(segment)
             }

@@ -83,6 +83,15 @@ impl Puller {
     /// unresolved effect, or any input after [`Effect::Done`] or
     /// [`Effect::Violation`] ended the session.
     pub fn handle(&mut self, input: Input) -> Vec<Effect<PullOutcome>> {
+        // Logged before the step so a contract panic still shows what
+        // was fed.
+        tracing::debug!(input = %crate::trace::input(&input), "puller");
+        let effects = self.step(input);
+        tracing::debug!(effects = %crate::trace::effects(&effects), "puller");
+        effects
+    }
+
+    fn step(&mut self, input: Input) -> Vec<Effect<PullOutcome>> {
         // Every path either installs the next state or ends Terminal.
         let state = mem::replace(&mut self.state, State::Terminal);
         match (state, input) {

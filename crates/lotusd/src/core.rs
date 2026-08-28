@@ -292,6 +292,96 @@ impl Core {
     pub fn signing_keys(&self) -> &BTreeMap<KeyId, SigningKey> {
         &self.signing_keys
     }
+
+    /// Answers one sync-machine query against this node's chain — the
+    /// core-side half of the `sync` crate's `Effect::Ask` contract.
+    pub fn sync_answer(&self, query: sync::Query) -> Result<sync::Answer, storage::sqlite::Error> {
+        match query {
+            sync::Query::ContainsEnvelope(digest) => self
+                .storage
+                .envelope(digest)
+                .map(|stored| sync::Answer::Contains(stored.is_some())),
+            sync::Query::Locator => self
+                .walk_canonical(|walk| sync::locator::sample(walk))
+                .map(sync::Answer::Locator),
+            sync::Query::SplitPoint(entries) => self
+                .walk_canonical(|walk| sync::locator::split(&entries, walk))
+                .map(sync::Answer::SplitPoint),
+            sync::Query::Segment { after } => self.segment(after).map(sync::Answer::Segment),
+        }
+    }
+
+    /// Streams the canonical path, newest first, into `consume` by digest
+    /// alone — no path is materialized and no envelope is decoded, each
+    /// hop being one [`Storage::parent`] column read. This runs on the
+    /// mainloop, so O(chain) hops is the budget; anything heavier here
+    /// stalls every other caller. A storage failure ends the walk early
+    /// and surfaces as the error, discarding `consume`'s answer.
+    fn walk_canonical<T>(
+        &self,
+        consume: impl FnOnce(&mut dyn Iterator<Item = EnvelopeDigest>) -> T,
+    ) -> Result<T, storage::sqlite::Error> {
+        let mut failure = None;
+        let mut walk = std::iter::successors(Some(self.chain.head()), |&at| {
+            match self.storage.parent(at) {
+                Ok(parent) => parent,
+                Err(err) => {
+                    failure = Some(err);
+                    None
+                }
+            }
+        });
+        let out = consume(&mut walk);
+        match failure {
+            None => Ok(out),
+            Some(err) => Err(err),
+        }
+    }
+
+    /// The canonical path just after `after`, parent-first, within the
+    /// sync segment budgets — empty when `after` is the head, or has left
+    /// the canonical path, which is how a mid-session reorg ends a stream
+    /// early rather than wrongly.
+    fn segment(&self, after: EnvelopeDigest) -> Result<Vec<Envelope>, storage::sqlite::Error> {
+        let newer = self.walk_canonical(|walk| {
+            let mut newer = Vec::new();
+            for digest in walk {
+                if digest == after {
+                    return Some(newer);
+                }
+                newer.push(digest);
+            }
+            None
+        })?;
+        let Some(newer) = newer else {
+            return Ok(Vec::new());
+        };
+
+        let mut budget = sync::SEGMENT_BYTE_BUDGET as usize;
+        let mut segment = Vec::new();
+        for digest in newer
+            .into_iter()
+            .rev()
+            .take(sync::MAX_BATCH_ENVELOPES as usize)
+        {
+            let envelope = self
+                .storage
+                .envelope(digest)?
+                .expect("the canonical walk visits only stored envelopes");
+            let cost = wire::encode(&envelope)
+                .expect("a stored envelope re-encodes")
+                .len();
+            // The first envelope goes regardless of its size: excluding
+            // it would end the stream early and wedge sync at this point
+            // for good, where an oversize frame at least fails loudly.
+            if !segment.is_empty() && cost > budget {
+                break;
+            }
+            budget = budget.saturating_sub(cost);
+            segment.push(envelope);
+        }
+        Ok(segment)
+    }
 }
 
 /// The public half of `key`, in the form the ledger's key set holds.

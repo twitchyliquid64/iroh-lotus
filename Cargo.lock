@@ -737,7 +737,9 @@ dependencies = [
  "serde",
  "state",
  "storage",
+ "sync",
  "tempfile",
+ "thiserror",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -1257,6 +1259,7 @@ dependencies = [
  "storage",
  "thiserror",
  "tokio-util",
+ "tracing",
  "wire",
 ]
 

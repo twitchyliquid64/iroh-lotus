@@ -866,6 +866,18 @@ impl Storage for SqliteStorage {
         };
         err.into_iter().chain(digests.into_iter().map(Ok))
     }
+
+    fn parent(&self, digest: EnvelopeDigest) -> Result<Option<EnvelopeDigest>, Error> {
+        // The column read the default's decode-the-envelope would waste:
+        // chain walks call this once per hop.
+        self.conn
+            .prepare_cached("SELECT prev FROM envelopes WHERE digest = ?1")?
+            .query_row([digest.as_slice()], |row| row.get::<_, Option<Vec<u8>>>(0))
+            .optional()?
+            .flatten()
+            .map(digest_from)
+            .transpose()
+    }
 }
 
 #[cfg(test)]
