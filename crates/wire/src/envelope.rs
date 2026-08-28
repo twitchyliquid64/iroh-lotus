@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use cbor2::Cbor;
 
@@ -13,7 +13,13 @@ use crate::{
 pub enum VerificationStatus {
     #[default]
     Unchecked,
-    Failed,
+    Failed {
+        /// The keys whose signatures did not verify: one the trusted set
+        /// does not hold, or one whose signature is not over this
+        /// envelope. Never empty — a status is only `Failed` because of
+        /// them.
+        failing_key_ids: BTreeSet<KeyId>,
+    },
     AllMatched {
         total_weight: u32,
     },
@@ -24,7 +30,7 @@ impl VerificationStatus {
     /// verification has succeeded.
     pub fn signature_weight(&self) -> u32 {
         match self {
-            Self::Unchecked | Self::Failed => 0,
+            Self::Unchecked | Self::Failed { .. } => 0,
             Self::AllMatched { total_weight } => *total_weight,
         }
     }
@@ -101,7 +107,7 @@ impl Envelope {
             VerificationStatus::AllMatched { .. } => {
                 self.signatures.len().try_into().unwrap_or(u32::MAX)
             }
-            VerificationStatus::Unchecked | VerificationStatus::Failed => 0,
+            VerificationStatus::Unchecked | VerificationStatus::Failed { .. } => 0,
         }
     }
 

@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 
 use wire::{
     Envelope, EnvelopeDigest, Msg, VerificationStatus,
+    keys::KeyId,
     msg::{AmendOp, IncrementDecrement, Namespace, NamespaceKey, SetNamespace, Value},
     subkey::{Subkey, SubkeyPath},
 };
@@ -958,6 +959,20 @@ pub fn envelopes_round_trip_the_verification_status<S: Storage>(mut store: S) {
         store.envelope(d).expect("envelope").expect("stored"),
         verified,
         "the status is not in the encoding and must be stored beside it"
+    );
+
+    // A failed status names the keys that failed, and a backend that
+    // dropped them would hand back a forged envelope as one that merely
+    // failed for reasons nobody recorded.
+    let mut failed = unverified.clone();
+    failed.set_verification_status(VerificationStatus::Failed {
+        failing_key_ids: [KeyId::from_bytes([7u8; 32]), KeyId::from_bytes([9u8; 32])].into(),
+    });
+    put(&mut store, &failed);
+    assert_eq!(
+        store.envelope(d).expect("envelope").expect("stored"),
+        failed,
+        "the keys a failed status names must be stored beside it"
     );
 
     // Verification usually lands after the envelope did: re-storing under

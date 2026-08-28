@@ -252,7 +252,13 @@ impl Render {
     fn describe_status(&self, status: &VerificationStatus) -> impl fmt::Display {
         let (style, text) = match status {
             VerificationStatus::Unchecked => (Style::Unknown, "unchecked".to_string()),
-            VerificationStatus::Failed => (Style::Bad, "failed".to_string()),
+            VerificationStatus::Failed { failing_key_ids } => (
+                Style::Bad,
+                format!(
+                    "failed, {}",
+                    plural(failing_key_ids.len(), "bad signature", "bad signatures")
+                ),
+            ),
             VerificationStatus::AllMatched { total_weight } => {
                 (Style::Good, format!("all matched, weight {total_weight}"))
             }

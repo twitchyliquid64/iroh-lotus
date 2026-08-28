@@ -1,6 +1,7 @@
 //! The crate's error types.
 
 use core::fmt;
+use std::collections::BTreeSet;
 
 use wire::{EnvelopeDigest, keys::KeyId, msg::NamespaceKey, subkey::SubkeyPath};
 
@@ -125,6 +126,12 @@ pub enum ApplyError<E> {
         required: u32,
         /// How many distinct keys verifiably signed.
         found: u32,
+    },
+    /// The envelope carries a signature that does not verify against the
+    /// trusted key set in force at this position.
+    InvalidSignatures {
+        /// The keys whose signatures did not verify.
+        failing_key_ids: BTreeSet<KeyId>,
     },
     /// The storage backend failed.
     Storage(E),
@@ -290,6 +297,17 @@ impl<E> fmt::Display for ApplyError<E> {
                 write!(
                     f,
                     "envelope carries {found} verified signatures, below the minimum of {required}"
+                )
+            }
+            ApplyError::InvalidSignatures { failing_key_ids } => {
+                write!(
+                    f,
+                    "envelope carries signatures that do not verify, from {}",
+                    failing_key_ids
+                        .iter()
+                        .map(KeyId::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 )
             }
             ApplyError::Storage(_) => f.write_str("storage backend failed"),

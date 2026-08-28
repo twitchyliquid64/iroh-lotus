@@ -11,7 +11,10 @@ use std::{
 
 use cbor2::Cbor;
 use chrono::{DateTime, Utc};
-use wire::{Envelope, EnvelopeDigest, VerificationStatus, msg::NamespaceKey, subkey::SubkeyPath};
+use wire::{
+    Envelope, EnvelopeDigest, VerificationStatus, keys::KeyId, msg::NamespaceKey,
+    subkey::SubkeyPath,
+};
 
 /// A request on the local control socket.
 #[derive(Debug, Clone, Cbor, PartialEq, Eq)]
@@ -196,13 +199,13 @@ impl EnvelopeFrame {
 /// Mirrors [`wire::VerificationStatus`], which never crosses the ledger
 /// wire: it is what a node concluded about an envelope, not something the
 /// envelope carries.
-#[derive(Debug, Copy, Clone, Cbor, PartialEq, Eq)]
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Verification {
     /// Nothing has checked the signatures yet.
     Unchecked,
-    /// A signature did not verify.
-    Failed,
+    /// These keys' signatures did not verify.
+    Failed(BTreeSet<KeyId>),
     /// Every signature verified, together worth this much.
     AllMatched(u32),
 }
@@ -211,7 +214,9 @@ impl From<&VerificationStatus> for Verification {
     fn from(status: &VerificationStatus) -> Self {
         match status {
             VerificationStatus::Unchecked => Verification::Unchecked,
-            VerificationStatus::Failed => Verification::Failed,
+            VerificationStatus::Failed { failing_key_ids } => {
+                Verification::Failed(failing_key_ids.clone())
+            }
             VerificationStatus::AllMatched { total_weight } => {
                 Verification::AllMatched(*total_weight)
             }
@@ -223,7 +228,7 @@ impl From<Verification> for VerificationStatus {
     fn from(verification: Verification) -> Self {
         match verification {
             Verification::Unchecked => VerificationStatus::Unchecked,
-            Verification::Failed => VerificationStatus::Failed,
+            Verification::Failed(failing_key_ids) => VerificationStatus::Failed { failing_key_ids },
             Verification::AllMatched(total_weight) => {
                 VerificationStatus::AllMatched { total_weight }
             }

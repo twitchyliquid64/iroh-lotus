@@ -1,6 +1,6 @@
 //! The state a chain of envelopes folds down to.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use storage::{NamespaceOp, NodeKind, Resolution, Storage};
 use wire::{
@@ -425,17 +425,26 @@ impl Ledger {
             })
     }
 
-    /// Refuses an envelope that clears neither threshold in force here.
+    /// Refuses an envelope whose signatures did not verify, or that
+    /// clears neither threshold in force here.
     ///
-    /// Both are read from this ledger — the envelope's parent — so they
-    /// are the thresholds that were in force when it was written, not
+    /// The thresholds are read from this ledger — the envelope's parent —
+    /// so they are the ones that were in force when it was written, not
     /// whatever a node happens to hold now.
     fn check_sig_thresholds<S: Storage>(
         &self,
         storage: &S,
         envelope: &Envelope,
     ) -> Result<(), ApplyError<S::Error>> {
-        let found = envelope.verification_status().signature_weight();
+        let status = envelope.verification_status();
+        // Refuse envelopes with invalid signatures
+        if let VerificationStatus::Failed { failing_key_ids } = status {
+            return Err(ApplyError::InvalidSignatures {
+                failing_key_ids: failing_key_ids.clone(),
+            });
+        }
+
+        let found = status.signature_weight();
         let required = self.min_envelope_weight(storage)?;
         if found < required {
             return Err(ApplyError::InsufficientWeight { required, found });
@@ -487,24 +496,32 @@ impl Ledger {
         let keys = self.trusted_keys(storage)?;
         let digest = envelope.signature_digest()?;
 
+        let failing_key_ids: BTreeSet<KeyId> = signatures
+            .iter()
+            .filter(|(key_id, signature)| {
+                !keys
+                    .get(*key_id)
+                    .is_some_and(|key| key.verify(signature, &digest).is_ok())
+            })
+            .map(|(key_id, _)| *key_id)
+            .collect();
+        if !failing_key_ids.is_empty() {
+            return Ok(VerificationStatus::Failed { failing_key_ids });
+        }
+
         // One signature per key by construction, so a key cannot pad the
         // total by signing twice.
-        let total = signatures
-            .iter()
-            .try_fold(0u64, |total, (key_id, signature)| {
-                keys.get(key_id)
-                    .filter(|key| key.verify(signature, &digest).is_ok())
-                    .map(|key| total + u64::from(key.weight()))
-            });
+        let total: u64 = signatures
+            .keys()
+            .filter_map(|key_id| keys.get(key_id))
+            .map(|key| u64::from(key.weight()))
+            .sum();
 
-        Ok(match total {
-            // Saturating: weights are set by the ledger's own config, but
-            // a wrapped total would decide forks differently in a release
-            // build than a debug one.
-            Some(total) => VerificationStatus::AllMatched {
-                total_weight: u32::try_from(total).unwrap_or(u32::MAX),
-            },
-            None => VerificationStatus::Failed,
+        // Saturating: weights are set by the ledger's own config, but a
+        // wrapped total would decide forks differently in a release build
+        // than a debug one.
+        Ok(VerificationStatus::AllMatched {
+            total_weight: u32::try_from(total).unwrap_or(u32::MAX),
         })
     }
 
@@ -2049,7 +2066,9 @@ mod tests {
         let unknown = sign(envelope.clone(), &mallory);
         assert_eq!(
             ledger.verify_envelope(&store, &unknown).unwrap(),
-            VerificationStatus::Failed
+            VerificationStatus::Failed {
+                failing_key_ids: [public_key(&mallory).id()].into()
+            }
         );
 
         // A trusted key, but a signature over something else.
@@ -2060,15 +2079,68 @@ mod tests {
         );
         assert_eq!(
             ledger.verify_envelope(&store, &forged).unwrap(),
-            VerificationStatus::Failed
+            VerificationStatus::Failed {
+                failing_key_ids: [public_key(&alice).id()].into()
+            }
         );
 
-        // One good signature does not rescue one bad one.
+        // One good signature does not rescue one bad one, and only the
+        // bad one is named.
         let mixed = sign(sign(envelope.clone(), &alice), &mallory);
         assert_eq!(
             ledger.verify_envelope(&store, &mixed).unwrap(),
-            VerificationStatus::Failed
+            VerificationStatus::Failed {
+                failing_key_ids: [public_key(&mallory).id()].into()
+            }
         );
+    }
+
+    /// A signature that verified when it was made and had a byte flipped
+    /// on the way is forged, not weak: applying it is refused outright,
+    /// the key whose signature no longer checks out is named, and the
+    /// ledger stays where it stood.
+    #[test]
+    fn apply_refuses_an_envelope_whose_signature_was_tampered_with() {
+        let alice = signing_key(1);
+        let (mut store, mut ledger) = verifying_ledger([Key::new(public_key(&alice), 3)]);
+        let head = ledger.head();
+
+        let signed = sign(unsigned(head), &alice);
+        assert_eq!(
+            ledger.verify_envelope(&store, &signed).unwrap(),
+            VerificationStatus::AllMatched { total_weight: 3 },
+            "the signature being corrupted has to be a good one first",
+        );
+
+        // The same key over the same bytes, one bit of the signature
+        // itself flipped — what a peer can do to an envelope in flight.
+        let Signature::Ed25519(signature) = *signed.signatures().values().next().unwrap();
+        let mut bytes = *signature.as_bytes();
+        bytes[0] ^= 1;
+        let mut tampered = signed.with_signature(
+            public_key(&alice).id(),
+            Signature::Ed25519(Ed25519Signature::from_bytes(bytes)),
+        );
+
+        let status = ledger.verify_envelope(&store, &tampered).unwrap();
+        assert_eq!(
+            status,
+            VerificationStatus::Failed {
+                failing_key_ids: [public_key(&alice).id()].into()
+            }
+        );
+
+        tampered.set_verification_status(status);
+        let refused = ledger.apply(&mut store, &tampered).unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                ApplyError::InvalidSignatures { failing_key_ids }
+                    if *failing_key_ids == [public_key(&alice).id()].into()
+            ),
+            "got {refused:?}",
+        );
+        assert_eq!(ledger.head(), head, "the head stayed where it stood");
     }
 
     /// Weights come from the ledger's own config, so a total that
@@ -2151,7 +2223,9 @@ mod tests {
         let signed_after = sign(after.clone(), &alice);
         assert_eq!(
             ledger.verify_envelope(&store, &signed_after).unwrap(),
-            VerificationStatus::Failed
+            VerificationStatus::Failed {
+                failing_key_ids: [public_key(&alice).id()].into()
+            }
         );
     }
 

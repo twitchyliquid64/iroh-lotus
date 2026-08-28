@@ -56,11 +56,16 @@
 //!
 //! [`MemStorage`]: crate::MemStorage
 
-use std::{collections::BTreeMap, path::Path, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    time::Duration,
+};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use wire::{
     Envelope, EnvelopeDigest, VerificationStatus,
+    keys::KeyId,
     msg::{AmendOp, IncrementDecrement, Namespace, NamespaceKey, Value},
     subkey::Subkey,
 };
@@ -103,6 +108,9 @@ CREATE TABLE IF NOT EXISTS envelopes (
     prev      BLOB,
     status    INTEGER NOT NULL,
     weight    INTEGER,
+    -- The ids of the keys whose signatures did not verify, concatenated,
+    -- for a failed status and nothing else.
+    bad_keys  BLOB,
     -- Unix milliseconds off this node's clock, and nothing but a note to
     -- whoever is reading the log.
     stored_at INTEGER NOT NULL
@@ -242,20 +250,37 @@ const UNCHECKED: i64 = 0;
 const FAILED: i64 = 1;
 const ALL_MATCHED: i64 = 2;
 
-fn status_columns(status: &VerificationStatus) -> (i64, Option<i64>) {
+fn status_columns(status: &VerificationStatus) -> (i64, Option<i64>, Option<Vec<u8>>) {
     match status {
-        VerificationStatus::Unchecked => (UNCHECKED, None),
-        VerificationStatus::Failed => (FAILED, None),
+        VerificationStatus::Unchecked => (UNCHECKED, None, None),
+        VerificationStatus::Failed { failing_key_ids } => (
+            FAILED,
+            None,
+            Some(
+                failing_key_ids
+                    .iter()
+                    .flat_map(|id| *id.as_bytes())
+                    .collect(),
+            ),
+        ),
         VerificationStatus::AllMatched { total_weight } => {
-            (ALL_MATCHED, Some(i64::from(*total_weight)))
+            (ALL_MATCHED, Some(i64::from(*total_weight)), None)
         }
     }
 }
 
-fn status_from(code: i64, weight: Option<i64>) -> Result<VerificationStatus, Error> {
+fn status_from(
+    code: i64,
+    weight: Option<i64>,
+    bad_keys: Option<Vec<u8>>,
+) -> Result<VerificationStatus, Error> {
     match code {
         UNCHECKED => Ok(VerificationStatus::Unchecked),
-        FAILED => Ok(VerificationStatus::Failed),
+        FAILED => Ok(VerificationStatus::Failed {
+            failing_key_ids: key_ids_from(
+                &bad_keys.ok_or(Error::Corrupt("failed status without its keys"))?,
+            )?,
+        }),
         ALL_MATCHED => Ok(VerificationStatus::AllMatched {
             total_weight: weight
                 .ok_or(Error::Corrupt("all-matched status without a weight"))?
@@ -263,6 +288,16 @@ fn status_from(code: i64, weight: Option<i64>) -> Result<VerificationStatus, Err
                 .map_err(|_| Error::Corrupt("verification weight out of range"))?,
         }),
         _ => Err(Error::Corrupt("unknown verification status")),
+    }
+}
+
+/// The key ids [`status_columns`] concatenated, one 32-byte id after
+/// another.
+fn key_ids_from(blob: &[u8]) -> Result<BTreeSet<KeyId>, Error> {
+    let (ids, rest) = blob.as_chunks::<32>();
+    match rest.is_empty() {
+        true => Ok(ids.iter().copied().map(KeyId::from_bytes).collect()),
+        false => Err(Error::Corrupt("failing key ids are not whole ids")),
     }
 }
 
@@ -787,19 +822,20 @@ impl Storage for SqliteStorage {
             .payload()
             .prev_digest()
             .map(EnvelopeDigest::as_slice);
-        let (status, weight) = status_columns(envelope.verification_status());
+        let (status, weight, bad_keys) = status_columns(envelope.verification_status());
         // An upsert rather than INSERT OR REPLACE: the row being replaced
         // holds the time this node first saw the envelope, and a status
         // upgraded an hour later must not restamp it.
         self.conn
             .prepare_cached(
-                "INSERT INTO envelopes (digest, bytes, prev, status, weight, stored_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "INSERT INTO envelopes (digest, bytes, prev, status, weight, bad_keys, stored_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT (digest) DO UPDATE SET
                      bytes = excluded.bytes,
                      prev = excluded.prev,
                      status = excluded.status,
-                     weight = excluded.weight",
+                     weight = excluded.weight,
+                     bad_keys = excluded.bad_keys",
             )?
             .execute(params![
                 digest.as_slice(),
@@ -807,6 +843,7 @@ impl Storage for SqliteStorage {
                 prev,
                 status,
                 weight,
+                bad_keys,
                 StoredAt::now().timestamp_millis(),
             ])?;
         Ok(())
@@ -815,20 +852,21 @@ impl Storage for SqliteStorage {
     fn logged_envelope(&self, digest: EnvelopeDigest) -> Result<Option<LogEntry>, Error> {
         self.conn
             .prepare_cached(
-                "SELECT bytes, status, weight, stored_at FROM envelopes WHERE digest = ?1",
+                "SELECT bytes, status, weight, bad_keys, stored_at FROM envelopes WHERE digest = ?1",
             )?
             .query_row([digest.as_slice()], |row| {
                 Ok((
                     row.get::<_, Vec<u8>>(0)?,
                     row.get(1)?,
                     row.get(2)?,
-                    row.get::<_, i64>(3)?,
+                    row.get(3)?,
+                    row.get::<_, i64>(4)?,
                 ))
             })
             .optional()?
-            .map(|(bytes, status, weight, stored_at)| {
+            .map(|(bytes, status, weight, bad_keys, stored_at)| {
                 let mut envelope: Envelope = wire::decode(&bytes)?;
-                envelope.set_verification_status(status_from(status, weight)?);
+                envelope.set_verification_status(status_from(status, weight, bad_keys)?);
                 Ok(LogEntry {
                     envelope,
                     stored_at: StoredAt::from_timestamp_millis(stored_at)

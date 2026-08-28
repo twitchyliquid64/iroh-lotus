@@ -196,7 +196,19 @@ fn one_envelope_renders_unnumbered() {
 fn verification_is_reported_as_the_envelope_holds_it() {
     let statuses = [
         (VerificationStatus::Unchecked, "unchecked"),
-        (VerificationStatus::Failed, "failed"),
+        (
+            VerificationStatus::Failed {
+                failing_key_ids: [KeyId::from_bytes([3u8; 32])].into(),
+            },
+            "failed, 1 bad signature",
+        ),
+        (
+            VerificationStatus::Failed {
+                failing_key_ids: [KeyId::from_bytes([3u8; 32]), KeyId::from_bytes([4u8; 32])]
+                    .into(),
+            },
+            "failed, 2 bad signatures",
+        ),
         (
             VerificationStatus::AllMatched { total_weight: 5 },
             "all matched, weight 5",

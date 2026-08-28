@@ -541,28 +541,33 @@ mod tests {
         );
     }
 
-    /// A signature that does not verify is not a refusal: the envelope is
-    /// stored, worth nothing, and loses every fork it is in.
+    /// A signature that does not verify is a refusal, not a weightless
+    /// envelope: it never reaches the log, so no fork can be fought over
+    /// it, and the error names the keys that failed.
     #[test]
-    fn a_failed_signature_stores_at_zero_weight() {
+    fn a_failed_signature_is_refused() {
         let alice = SigningKey::from([1u8; 32]);
         let mallory = SigningKey::from([9u8; 32]);
         let (mut store, mut chain) = signed_setup([Key::new(public_key(&alice), 3)]);
+        let head = chain.head();
 
-        let envelope = set(chain.head(), "a", "1");
-        let signed = sign(envelope.clone(), &mallory);
+        let signed = sign(set(head, "a", "1"), &mallory);
         let digest = digest(&signed);
 
-        chain.insert(&mut store, signed).unwrap();
+        let refused = chain.insert(&mut store, signed).unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                Error::Apply(ApplyError::InvalidSignatures { failing_key_ids })
+                    if *failing_key_ids == [public_key(&mallory).id()].into()
+            ),
+            "got {refused:?}",
+        );
 
-        assert_eq!(chain.head(), digest, "unopposed, it is still canonical");
-        assert_eq!(
-            store
-                .envelope(digest)
-                .unwrap()
-                .unwrap()
-                .verification_status(),
-            &VerificationStatus::Failed
+        assert_eq!(chain.head(), head, "the head stayed where it stood");
+        assert!(
+            store.envelope(digest).unwrap().is_none(),
+            "a refused envelope is not stored",
         );
     }
 

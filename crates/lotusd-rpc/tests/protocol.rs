@@ -14,6 +14,7 @@ use std::time::Duration;
 use tokio::io::{AsyncWriteExt, DuplexStream, duplex};
 use wire::{
     Envelope, EnvelopeDigest, Msg, VerificationStatus,
+    keys::KeyId,
     msg::{FullCheckpoint, InitMsg, NamespaceKey},
     subkey::SubkeyPath,
 };
@@ -389,6 +390,22 @@ async fn an_envelope_frame_carries_the_verification_status_beside_the_envelope()
         envelope.verification_status(),
         &VerificationStatus::AllMatched { total_weight: 3 }
     );
+}
+
+/// A failed status is not just a verdict: which keys failed travels with
+/// it, or a client is told an envelope failed and never which signatures.
+#[test]
+fn a_failed_verification_carries_the_keys_that_failed() {
+    let status = VerificationStatus::Failed {
+        failing_key_ids: [KeyId::from_bytes([7u8; 32]), KeyId::from_bytes([9u8; 32])].into(),
+    };
+
+    let carried = Verification::from(&status);
+    assert_eq!(
+        carried,
+        Verification::Failed([KeyId::from_bytes([7u8; 32]), KeyId::from_bytes([9u8; 32])].into()),
+    );
+    assert_eq!(VerificationStatus::from(carried), status);
 }
 
 /// Every selector survives the round trip, limit and digest list included.
