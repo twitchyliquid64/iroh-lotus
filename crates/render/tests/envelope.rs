@@ -3,7 +3,7 @@
 //! One rendering serves the daemon and the CLI both, so the stanza is a
 //! contract between them rather than each one's private taste.
 
-use chrono::NaiveDate;
+use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
 use render::{ColorChoice, Entry, Palette, Render};
 use wire::{
     Envelope, EnvelopeDigest, Msg, VerificationStatus,
@@ -18,11 +18,12 @@ fn digest(byte: u8) -> EnvelopeDigest {
 }
 
 /// A fixed reading, so what is rendered doesn't move with the clock.
-fn stored_at() -> chrono::NaiveDateTime {
+fn stored_at() -> DateTime<Utc> {
     NaiveDate::from_ymd_opt(2026, 8, 27)
         .unwrap()
         .and_hms_milli_opt(12, 43, 1, 250)
         .unwrap()
+        .and_utc()
 }
 
 fn hex(byte: u8) -> String {
@@ -295,12 +296,24 @@ fn auto_does_not_colour_what_is_not_a_terminal() {
 
 /// The time the log took an envelope is shown where it is known, and reads
 /// as absent where it is not — a log written before anything recorded one.
+///
+/// Read back through the offset it carries rather than compared against a
+/// fixed string: the zone is the one the machine running this is in, so
+/// the digits move with the host while the instant may not.
 #[test]
 fn the_time_the_log_took_an_envelope_is_shown_where_it_is_known() {
     let stamped = Render::new().envelope(&entry(1, genesis()).with_stored_at(Some(stored_at())));
-    assert!(
-        stamped.contains("   stored         2026-08-27 12:43:01.250\n"),
-        "got {stamped}",
+    let shown = stamped
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("stored"))
+        .expect("the stanza carries a stored field")
+        .trim();
+
+    assert_eq!(
+        DateTime::<FixedOffset>::parse_from_str(shown, "%Y-%m-%d %H:%M:%S%.3f %:z")
+            .unwrap_or_else(|e| panic!("{shown:?} is not a zoned reading: {e}"))
+            .to_utc(),
+        stored_at(),
     );
 
     let unstamped = Render::new().envelope(&entry(1, genesis()));

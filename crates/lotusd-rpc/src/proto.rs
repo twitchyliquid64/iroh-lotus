@@ -10,7 +10,7 @@ use std::{
 };
 
 use cbor2::Cbor;
-use chrono::NaiveDateTime;
+use chrono::{DateTime, Utc};
 use wire::{Envelope, EnvelopeDigest, VerificationStatus, msg::NamespaceKey, subkey::SubkeyPath};
 
 /// A request on the local control socket.
@@ -174,10 +174,11 @@ impl EnvelopeFrame {
     /// `None` only for a number no datetime can hold, which is a peer
     /// sending nonsense rather than anything a log produces.
     ///
-    /// Naive UTC, because there is no zone on it: the reading came off
-    /// another machine's clock and means nothing beside a local one.
-    pub fn stored_at(&self) -> Option<NaiveDateTime> {
-        chrono::DateTime::from_timestamp_millis(self.stored_at_millis).map(|at| at.naive_utc())
+    /// The instant the number names, which is UTC by construction: it
+    /// crosses as milliseconds since the epoch, so whoever shows it can
+    /// put it into whatever zone their reader is in.
+    pub fn stored_at(&self) -> Option<DateTime<Utc>> {
+        DateTime::from_timestamp_millis(self.stored_at_millis)
     }
 
     /// The envelope as the sending node holds it: the verification status

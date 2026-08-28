@@ -447,8 +447,8 @@ fn a_window_crosses_as_milliseconds() {
     );
 }
 
-/// The stored-at reading is the node's own clock and has no zone on it, so
-/// it crosses as a plain number of milliseconds and reads back the same.
+/// The stored-at reading is the node's own clock, and it crosses as a
+/// plain number of milliseconds since the epoch that reads back the same.
 #[tokio::test]
 async fn an_envelope_frame_carries_when_the_node_stored_it() {
     let frame = call(connect(Fake::new()), GetEnvelopes::newest(1))
@@ -458,7 +458,7 @@ async fn an_envelope_frame_carries_when_the_node_stored_it() {
     assert_eq!(frame.stored_at_millis, STORED_AT_MILLIS);
     assert_eq!(
         frame.stored_at(),
-        chrono::DateTime::from_timestamp_millis(STORED_AT_MILLIS).map(|at| at.naive_utc()),
+        chrono::DateTime::from_timestamp_millis(STORED_AT_MILLIS),
     );
 
     // A number no datetime can hold is a peer sending nonsense, not a

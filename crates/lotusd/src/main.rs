@@ -171,7 +171,7 @@ async fn async_main() -> Result<(), MainError> {
                 .into_iter()
                 .map(|(digest, entry)| {
                     Entry::new(digest, entry.envelope)
-                        .with_stored_at(Some(entry.stored_at.naive_utc()))
+                        .with_stored_at(Some(entry.stored_at.naive_utc().and_utc()))
                 })
                 .collect();
 

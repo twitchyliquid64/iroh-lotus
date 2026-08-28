@@ -2,7 +2,7 @@
 
 use core::fmt;
 
-use chrono::NaiveDateTime;
+use chrono::{DateTime, Local, Utc};
 use wire::{Envelope, EnvelopeDigest, Msg, VerificationStatus, msg::AmendOp};
 
 use crate::style::{Palette, Style};
@@ -21,7 +21,12 @@ pub struct Entry {
     /// When that node's log first stored it, where that is known. Local
     /// bookkeeping off one machine's clock — shown because an operator
     /// reading a log wants it, never because anything acts on it.
-    pub stored_at: Option<NaiveDateTime>,
+    ///
+    /// Held as the instant it names and shown in the zone the reader's
+    /// machine is in, offset and all: an operator comparing a log against
+    /// their own wall clock should not have to do the arithmetic, and the
+    /// offset says which clock the reading was put into.
+    pub stored_at: Option<DateTime<Utc>>,
 }
 
 impl Entry {
@@ -35,7 +40,7 @@ impl Entry {
     }
 
     /// The same entry, stamped with when its node first stored it.
-    pub fn with_stored_at(mut self, stored_at: Option<NaiveDateTime>) -> Self {
+    pub fn with_stored_at(mut self, stored_at: Option<DateTime<Utc>>) -> Self {
         self.stored_at = stored_at;
         self
     }
@@ -191,7 +196,11 @@ impl Render {
         self.field_list(
             out,
             "stored",
-            stored_at.map(|at| at.format("%Y-%m-%d %H:%M:%S%.3f").to_string()),
+            stored_at.map(|at| {
+                at.with_timezone(&Local)
+                    .format("%Y-%m-%d %H:%M:%S%.3f %:z")
+                    .to_string()
+            }),
         )?;
         writeln!(out)
     }
