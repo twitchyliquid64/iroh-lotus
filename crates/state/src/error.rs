@@ -152,6 +152,8 @@ pub enum ValueError {
     MinEnvelopeSignatures,
     /// The trusted key set could not be read.
     TrustedKeys(TrustedKeysError),
+    /// The set of nodes in the cluster could not be read.
+    ClusterNodes(String),
 }
 
 impl fmt::Display for ValueError {
@@ -167,6 +169,7 @@ impl fmt::Display for ValueError {
                 "the minimum envelope signature count must be a non-negative whole number",
             ),
             ValueError::TrustedKeys(err) => write!(f, "{err}"),
+            ValueError::ClusterNodes(err) => write!(f, "cluster nodes: {err}"),
         }
     }
 }
@@ -176,7 +179,8 @@ impl core::error::Error for ValueError {
         match self {
             ValueError::MinKeepMinutes
             | ValueError::MinEnvelopeWeight
-            | ValueError::MinEnvelopeSignatures => None,
+            | ValueError::MinEnvelopeSignatures
+            | ValueError::ClusterNodes(_) => None,
             ValueError::TrustedKeys(err) => Some(err),
         }
     }

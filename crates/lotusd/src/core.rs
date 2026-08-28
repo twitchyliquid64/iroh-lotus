@@ -1,7 +1,7 @@
 //! The initialized internals for a lotus node.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     path::{Path, PathBuf},
 };
@@ -9,7 +9,7 @@ use std::{
 use ed25519_zebra::SigningKey;
 use iroh::SecretKey;
 use rand::{TryRng, rngs::SysRng};
-use state::{Chain, ChangeDiffer, Insert, TRUSTED_KEYS_KEY};
+use state::{CLUSTER_NODES_KEY, Chain, ChangeDiffer, Insert, TRUSTED_KEYS_KEY};
 use storage::{LogEntry, SqliteStorage, Storage, StoredAt};
 use tokio::{fs, io::AsyncWriteExt};
 use wire::{
@@ -118,21 +118,42 @@ impl Core {
         }
 
         let signing_key = gen_signing_key(&state_dir).await?;
-        gen_iroh_secret(&state_dir).await?;
         let trusted = Key::new(public_key(&signing_key), ROOT_KEY_WEIGHT);
         let key_id = trusted.id();
+        gen_iroh_secret(&state_dir).await?;
+        let iroh_secret = load_iroh_secret(&state_dir).await?;
 
         let envelope = Envelope::new(Msg::Init(InitMsg {
             state: FullCheckpoint {
-                namespaces: BTreeMap::from_iter([(
-                    NamespaceKey::try_new(TRUSTED_KEYS_KEY).expect("the reserved key is static"),
-                    Namespace {
-                        value: Value::Map(BTreeMap::from_iter([(
-                            key_id.to_hex().as_ref().to_owned(),
-                            Value::Key(trusted),
-                        )])),
-                    },
-                )]),
+                namespaces: BTreeMap::from_iter([
+                    (
+                        NamespaceKey::try_new(TRUSTED_KEYS_KEY)
+                            .expect("the reserved key is static"),
+                        Namespace {
+                            value: Value::Map(BTreeMap::from_iter([(
+                                key_id.to_hex().as_ref().to_owned(),
+                                Value::Key(trusted),
+                            )])),
+                        },
+                    ),
+                    (
+                        NamespaceKey::try_new(CLUSTER_NODES_KEY)
+                            .expect("the reserved key is static"),
+                        Namespace {
+                            value: Value::Map(BTreeMap::from_iter([(
+                                key_id.to_hex().as_ref().to_owned(),
+                                Value::Map(BTreeMap::from_iter([(
+                                    "iroh".to_string(),
+                                    Value::try_from(&iroh::EndpointAddr::from_parts(
+                                        iroh_secret.public(),
+                                        BTreeSet::new(),
+                                    ))
+                                    .expect("infallible converting a valid EndpointAddr"),
+                                )])),
+                            )])),
+                        },
+                    ),
+                ]),
             },
         }));
         let envelope = sign(&signing_key, key_id, envelope)?;
@@ -151,7 +172,6 @@ impl Core {
         // Read back rather than assembled from the keys just generated, so a
         // core is the same whichever way it was reached.
         let signing_key = load_signing_key(&state_dir).await?;
-        let iroh_secret = load_iroh_secret(&state_dir).await?;
 
         Ok(Self {
             storage,
@@ -512,13 +532,21 @@ async fn write_secret(
     #[cfg(unix)]
     options.mode(0o600);
 
-    options
+    let mut file = options
         .open(path)
         .await
-        .map_err(|e| InitError::IO(e, creating))?
-        .write_all(secret)
+        .map_err(|e| InitError::IO(e, creating))?;
+    file.write_all(secret)
         .await
-        .map_err(|e| InitError::IO(e, saving))
+        .map_err(|e| InitError::IO(e, saving))?;
+
+    // `write_all` only queues the bytes onto tokio's blocking pool, and a
+    // dropped `File` never waits for them: without this the read that
+    // follows can find the file still empty — or, on a rewrite, truncated
+    // back to nothing. `sync_all` waits, and puts the key somewhere a
+    // crash cannot take it: a node that loses this file loses the endpoint
+    // peers dial it at.
+    file.sync_all().await.map_err(|e| InitError::IO(e, saving))
 }
 
 #[derive(Debug)]

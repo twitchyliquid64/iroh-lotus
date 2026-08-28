@@ -3391,6 +3391,7 @@ name = "state"
 version = "0.0.1"
 dependencies = [
  "ed25519-zebra",
+ "iroh",
  "storage",
  "wire",
 ]
@@ -4432,6 +4433,7 @@ dependencies = [
  "blake3",
  "cbor2",
  "ed25519-zebra",
+ "iroh",
  "nutype",
  "serde",
  "serde_json",

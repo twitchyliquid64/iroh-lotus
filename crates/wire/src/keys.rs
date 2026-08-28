@@ -168,6 +168,11 @@ impl KeyId {
         self.0.to_hex()
     }
 
+    /// Decodes a key id from a hex representation, of either case.
+    pub fn from_hex(hex: impl AsRef<[u8]>) -> Result<Self, blake3::HexError> {
+        Ok(Self(blake3::Hash::from_hex(hex)?))
+    }
+
     /// Decodes a key id from a bytes representation. Real ones come from
     /// [`Key::id`]; this is for tooling and decoding.
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
@@ -401,6 +406,28 @@ mod tests {
             &KeyId::from_bytes([0xef; 32]),
             &format!("5820{}", "ef".repeat(32)),
         );
+    }
+
+    #[test]
+    fn key_id_hex_roundtrips() {
+        let id = KeyId::from_bytes([0xab; 32]);
+        let round = KeyId::from_hex(id.to_hex().as_ref()).unwrap();
+        assert_eq!(round, id);
+        assert_eq!(round.as_bytes(), &[0xab; 32]);
+    }
+
+    /// Ids reach this from anything a person can type — an argument, a
+    /// config file — so uppercase decodes, and only the shape is refused.
+    #[test]
+    fn key_id_hex_takes_either_case_and_refuses_the_rest() {
+        assert_eq!(
+            KeyId::from_hex("AB".repeat(32)).unwrap(),
+            KeyId::from_bytes([0xab; 32]),
+        );
+        assert!(KeyId::from_hex("ab".repeat(31)).is_err());
+        assert!(KeyId::from_hex("ab".repeat(33)).is_err());
+        assert!(KeyId::from_hex(format!("{}zz", "ab".repeat(31))).is_err());
+        assert!(KeyId::from_hex("").is_err());
     }
 
     /// Ids are derived, never assigned: the same key always yields the

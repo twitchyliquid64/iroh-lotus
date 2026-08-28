@@ -61,6 +61,9 @@ pub const MIN_ENVELOPE_SIGNATURES_KEY: &str = "_lotus_min_envelope_signatures";
 /// the same on every node and can never go stale.
 pub const TRUSTED_KEYS_KEY: &str = "_lotus_trusted_keys";
 
+/// The reserved namespace describing nodes known to the cluster.
+pub const CLUSTER_NODES_KEY: &str = "_lotus_nodes";
+
 /// The ledger, as of some position in the chain.
 ///
 /// A ledger is a cursor: nothing but the head it stands at. State lives
@@ -402,6 +405,33 @@ impl Ledger {
         )
     }
 
+    /// Returns how to reach each node the cluster knows of, under the
+    /// reserved [`CLUSTER_NODES_KEY`] namespace. Absent, it knows of none.
+    ///
+    /// A set that is present but unreadable is an error, not an empty
+    /// set. Validation refuses malformed sets at the boundary,
+    /// so this fires only on one written by something that did
+    /// not enforce those rules.
+    pub fn peer_addresses<S: Storage>(
+        &self,
+        storage: &S,
+    ) -> Result<BTreeMap<KeyId, iroh::EndpointAddr>, ApplyError<S::Error>> {
+        let key = NamespaceKey::try_new(CLUSTER_NODES_KEY).expect("the reserved key is static");
+        self.namespace(storage, &key)
+            .map_err(ApplyError::Storage)?
+            .map_or_else(
+                || Ok(BTreeMap::new()),
+                |namespace| {
+                    parse_cluster_nodes(&namespace.value).map_err(|reason| {
+                        ApplyError::InvalidValue {
+                            key: key.clone(),
+                            reason: ValueError::ClusterNodes(reason),
+                        }
+                    })
+                },
+            )
+    }
+
     /// Reads a `u32` threshold out of a reserved namespace.
     ///
     /// Absent is no threshold; present but unreadable is an error, never
@@ -551,6 +581,11 @@ impl Ledger {
                     .map(|_| ())
                     .map_err(ValueError::TrustedKeys)
             }),
+            CLUSTER_NODES_KEY => Some(|value| {
+                parse_cluster_nodes(value)
+                    .map(|_| ())
+                    .map_err(ValueError::ClusterNodes)
+            }),
             _ => None,
         }
     }
@@ -684,6 +719,36 @@ fn parse_trusted_keys(value: &Value) -> Result<BTreeMap<KeyId, Key>, TrustedKeys
         .collect()
 }
 
+/// Parses the set of cluster nodes: a map from a nodes keyID to metadata
+/// about it including how to reach it over the network.
+///
+/// Ids are spelled the one way `KeyId::to_hex` writes them. Two spellings
+/// of one id are two entries in the ledger but one key here, and the
+/// second would silently displace the first.
+fn parse_cluster_nodes(value: &Value) -> Result<BTreeMap<KeyId, iroh::EndpointAddr>, String> {
+    let Value::Map(entries) = value else {
+        return Err("not a map".to_string());
+    };
+    entries
+        .iter()
+        .map(|(id, entry)| {
+            let node_id = KeyId::from_hex(id).map_err(|e| format!("{id}: {e}"))?;
+            if id.as_str() != node_id.to_hex().as_ref() {
+                return Err(format!("{id}: not the canonical spelling of a key id"));
+            }
+            Ok((node_id, {
+                let Value::Map(inner) = entry else {
+                    return Err(format!("{id}: not a map"));
+                };
+                let Some(iroh) = inner.get("iroh") else {
+                    return Err(format!("{id}: missing or invalid `iroh` value"));
+                };
+                iroh::EndpointAddr::try_from(iroh).map_err(|e| format!("{id}: {e}"))?
+            }))
+        })
+        .collect()
+}
+
 /// A reserved namespace's rule: what its value must satisfy, and why it
 /// doesn't when it doesn't.
 type Rule = fn(&Value) -> Result<(), ValueError>;
@@ -713,7 +778,7 @@ mod tests {
     use storage::MemStorage;
     use wire::{
         keys::{Ed25519PublicKey, Ed25519Signature, PublicKey, Signature},
-        msg::{DeleteNamespace, IncrementDecrement, InitMsg, SetNamespace},
+        msg::{AddrError, DeleteNamespace, IncrementDecrement, InitMsg, SetNamespace},
     };
 
     use super::*;
@@ -2499,6 +2564,424 @@ mod tests {
             key: key(k),
             namespace: Namespace { value },
         }))
+    }
+
+    fn node_key(byte: u8) -> KeyId {
+        KeyId::from_bytes([byte; 32])
+    }
+
+    /// A node id as the namespace files it: the one spelling
+    /// [`KeyId::to_hex`] writes.
+    fn node_id(byte: u8) -> String {
+        node_key(byte).to_hex().as_ref().to_string()
+    }
+
+    /// An endpoint id, spelled the way an address writes one.
+    fn node_z32(seed: u8) -> String {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public().to_z32()
+    }
+
+    fn endpoint(seed: u8) -> iroh::EndpointAddr {
+        iroh::EndpointAddr::from_parts(
+            iroh::SecretKey::from_bytes(&[seed; 32]).public(),
+            [iroh::TransportAddr::Ip("192.0.2.1:4433".parse().unwrap())],
+        )
+    }
+
+    /// An iroh address, as `wire` writes one into a value.
+    fn iroh_addr(seed: u8) -> Value {
+        Value::try_from(&endpoint(seed)).unwrap()
+    }
+
+    /// What the cluster knows about one node: an address, and whatever
+    /// else it publishes.
+    fn node(seed: u8) -> Value {
+        map([("iroh", iroh_addr(seed))])
+    }
+
+    /// The node set as it is stored: each node filed under its hex key id.
+    fn nodes(entries: impl IntoIterator<Item = (String, Value)>) -> Value {
+        Value::Map(entries.into_iter().collect())
+    }
+
+    fn set_nodes(prev: EnvelopeDigest, value: Value) -> Envelope {
+        set_reserved(prev, CLUSTER_NODES_KEY, value)
+    }
+
+    /// The reason a write to the node set was refused.
+    fn refusal(err: &ApplyError<Infallible>) -> &str {
+        match err {
+            ApplyError::InvalidValue {
+                key: k,
+                reason: ValueError::ClusterNodes(reason),
+            } if *k == key(CLUSTER_NODES_KEY) => reason,
+            other => panic!("expected a cluster-nodes refusal, got {other:?}"),
+        }
+    }
+
+    /// A node needs an address; what else it publishes is its own
+    /// business, and rides along unread.
+    #[test]
+    fn cluster_nodes_accepts_a_node_with_an_address() {
+        let (mut store, mut ledger) = setup(&init());
+        let value = nodes([
+            (node_id(0xaa), node(1)),
+            (
+                node_id(0xbb),
+                map([
+                    ("iroh", iroh_addr(2)),
+                    ("name", Value::String("bob".into())),
+                    ("since", Value::Int(7)),
+                ]),
+            ),
+        ]);
+
+        ledger
+            .apply(&mut store, &set_nodes(ledger.head(), value.clone()))
+            .unwrap();
+
+        assert_eq!(
+            ledger
+                .namespace(&store, &key(CLUSTER_NODES_KEY))
+                .unwrap()
+                .map(|namespace| namespace.value),
+            Some(value),
+        );
+        // What validation accepts is what the reader hands back.
+        assert_eq!(
+            ledger.peer_addresses(&store).unwrap(),
+            BTreeMap::from([(node_key(0xaa), endpoint(1)), (node_key(0xbb), endpoint(2)),]),
+        );
+    }
+
+    /// An empty set is legal — a cluster that knows of no node yet is not
+    /// a corrupt one.
+    #[test]
+    fn cluster_nodes_accepts_an_empty_set() {
+        let (mut store, mut ledger) = setup(&init());
+
+        ledger
+            .apply(&mut store, &set_nodes(ledger.head(), map([])))
+            .unwrap();
+    }
+
+    /// Every way a whole-value write can leave the namespace holding
+    /// something no reader could use, refused before it is stored.
+    #[test]
+    fn apply_rejects_an_invalid_cluster_nodes_set() {
+        let id = node_id(0xaa);
+        let bad_addr = |addrs: Value| {
+            map([
+                ("endpoint_id", Value::String(node_z32(1))),
+                ("addrs", addrs),
+            ])
+        };
+        let invalid = [
+            // The namespace itself is a map of nodes, nothing else.
+            (Value::String("nodes".into()), "not a map".to_string()),
+            (Value::Int(1), "not a map".to_string()),
+            (Value::Array(vec![]), "not a map".to_string()),
+            // Filed under something that is not a key id.
+            (
+                nodes([("nope".to_string(), node(1))]),
+                format!("nope: {}", KeyId::from_hex("nope").unwrap_err()),
+            ),
+            (
+                nodes([(node_id(0xaa).replace('a', "z"), node(1))]),
+                format!(
+                    "{}: {}",
+                    node_id(0xaa).replace('a', "z"),
+                    KeyId::from_hex(node_id(0xaa).replace('a', "z")).unwrap_err(),
+                ),
+            ),
+            // Its own id, uppercased — the id is right, the spelling
+            // isn't, and both spellings would fold into one entry.
+            (
+                nodes([(node_id(0xaa).to_uppercase(), node(1))]),
+                format!(
+                    "{}: not the canonical spelling of a key id",
+                    node_id(0xaa).to_uppercase(),
+                ),
+            ),
+            (
+                nodes([
+                    (node_id(0xaa), node(1)),
+                    (node_id(0xaa).to_uppercase(), node(2)),
+                ]),
+                format!(
+                    "{}: not the canonical spelling of a key id",
+                    node_id(0xaa).to_uppercase(),
+                ),
+            ),
+            // A node is a map of what is known about it.
+            (
+                nodes([(id.clone(), Value::String("192.0.2.1:4433".into()))]),
+                format!("{id}: not a map"),
+            ),
+            // Known, but not how to reach it.
+            (
+                nodes([(id.clone(), map([("name", Value::String("alice".into()))]))]),
+                format!("{id}: missing or invalid `iroh` value"),
+            ),
+            // An address that is not one, at three depths: not a map at
+            // all, an unreadable id, an unreadable transport.
+            (
+                nodes([(id.clone(), map([("iroh", Value::Int(1))]))]),
+                format!("{id}: {}", AddrError::NotAMap("endpoint address")),
+            ),
+            (
+                nodes([(
+                    id.clone(),
+                    map([(
+                        "iroh",
+                        map([
+                            ("endpoint_id", Value::String("nope".into())),
+                            ("addrs", Value::Array(vec![])),
+                        ]),
+                    )]),
+                )]),
+                format!("{id}: {}", AddrError::BadEndpointId("nope".into())),
+            ),
+            (
+                nodes([(
+                    id.clone(),
+                    map([(
+                        "iroh",
+                        bad_addr(Value::Array(vec![map([
+                            ("type", Value::String("ip".into())),
+                            // A host with no port is not a socket address.
+                            ("addr", Value::String("192.0.2.1".into())),
+                        ])])),
+                    )]),
+                )]),
+                format!(
+                    "{id}: {}",
+                    AddrError::BadAddr {
+                        kind: "ip".into(),
+                        text: "192.0.2.1".into(),
+                    },
+                ),
+            ),
+        ];
+
+        for (value, reason) in invalid {
+            let (mut store, mut ledger) = setup(&init());
+            let head = ledger.head();
+
+            let err = ledger
+                .apply(&mut store, &set_nodes(head, value))
+                .unwrap_err();
+
+            assert_eq!(refusal(&err), reason);
+            assert_eq!(ledger.head(), head, "head must not move");
+            assert_eq!(
+                ledger.namespace(&store, &key(CLUSTER_NODES_KEY)).unwrap(),
+                None,
+                "nothing may be stored",
+            );
+        }
+    }
+
+    /// A nested write is judged by the same rule as a whole-value write:
+    /// a path must not be able to leave behind a node the cluster cannot
+    /// reach.
+    #[test]
+    fn a_nested_write_cannot_corrupt_the_cluster_nodes() {
+        let id = node_id(0xaa);
+        let corrupting = [
+            // Garbage in place of the address.
+            (
+                path([sub(&id), sub("iroh")]),
+                Some(Value::Int(1)),
+                format!("{id}: {}", AddrError::NotAMap("endpoint address")),
+            ),
+            // The address cleared away, leaving a node no one can reach.
+            (
+                path([sub(&id), sub("iroh")]),
+                None,
+                format!("{id}: missing or invalid `iroh` value"),
+            ),
+            // Reached into: the id inside the address is still judged.
+            (
+                path([sub(&id), sub("iroh"), sub("endpoint_id")]),
+                Some(Value::Int(1)),
+                format!("{id}: {}", AddrError::MissingField("endpoint_id")),
+            ),
+            // A whole node under an id that is not one.
+            (
+                path([sub("nope")]),
+                Some(node(2)),
+                format!("nope: {}", KeyId::from_hex("nope").unwrap_err()),
+            ),
+            // A second spelling of an id already in the set: stored it
+            // would be two entries the reader folds into one.
+            (
+                path([sub(&node_id(0xaa).to_uppercase())]),
+                Some(node(2)),
+                format!(
+                    "{}: not the canonical spelling of a key id",
+                    node_id(0xaa).to_uppercase(),
+                ),
+            ),
+            // A node that is only metadata.
+            (
+                path([sub(&node_id(0xbb))]),
+                Some(map([("name", Value::String("bob".into()))])),
+                format!("{}: missing or invalid `iroh` value", node_id(0xbb)),
+            ),
+        ];
+
+        for (p, value, reason) in corrupting {
+            let (mut store, mut ledger) = setup(&init());
+            let stored = nodes([(id.clone(), node(1))]);
+            ledger
+                .apply(&mut store, &set_nodes(ledger.head(), stored.clone()))
+                .unwrap();
+            let head = ledger.head();
+
+            let err = ledger
+                .apply(&mut store, &set_key_in(head, CLUSTER_NODES_KEY, p, value))
+                .unwrap_err();
+
+            assert_eq!(refusal(&err), reason);
+            assert_eq!(ledger.head(), head, "head must not move");
+            assert_eq!(
+                ledger
+                    .namespace(&store, &key(CLUSTER_NODES_KEY))
+                    .unwrap()
+                    .map(|namespace| namespace.value),
+                Some(stored),
+                "the set must be left as it was",
+            );
+        }
+    }
+
+    /// The same guard on the amend path, where the shape of the write is
+    /// legal and only the namespace's rule catches what it leaves behind.
+    #[test]
+    fn a_nested_amend_cannot_corrupt_the_cluster_nodes() {
+        let id = node_id(0xaa);
+        let amend_nodes = |prev, p| {
+            Envelope::new(Msg::AmendNamespaceKey(AmendNamespaceKey {
+                prev,
+                key: key(CLUSTER_NODES_KEY),
+                path: Some(p),
+                op: append("x"),
+            }))
+        };
+
+        let (mut store, mut ledger) = setup(&init());
+        let stored = nodes([(id.clone(), node(1))]);
+        ledger
+            .apply(&mut store, &set_nodes(ledger.head(), stored.clone()))
+            .unwrap();
+        let head = ledger.head();
+
+        // Onto the endpoint id: a leaf is not an array.
+        let err = ledger
+            .apply(
+                &mut store,
+                &amend_nodes(head, path([sub(&id), sub("iroh"), sub("endpoint_id")])),
+            )
+            .unwrap_err();
+        assert!(matches!(err, ApplyError::AmendTypeMismatch { .. }));
+
+        // Onto the transport list: a legal append, an unreadable address.
+        let err = ledger
+            .apply(
+                &mut store,
+                &amend_nodes(head, path([sub(&id), sub("iroh"), sub("addrs")])),
+            )
+            .unwrap_err();
+        assert_eq!(
+            refusal(&err),
+            format!("{id}: {}", AddrError::NotAMap("transport address")),
+        );
+
+        // Under an id holding nothing: shapes fine, conjures a one-entry
+        // array where a node belongs.
+        let fresh = node_id(0xbb);
+        let err = ledger
+            .apply(&mut store, &amend_nodes(head, path([sub(&fresh)])))
+            .unwrap_err();
+        assert_eq!(refusal(&err), format!("{fresh}: not a map"));
+
+        assert_eq!(ledger.head(), head, "head must not move");
+        assert_eq!(
+            ledger
+                .namespace(&store, &key(CLUSTER_NODES_KEY))
+                .unwrap()
+                .map(|namespace| namespace.value),
+            Some(stored),
+        );
+    }
+
+    /// What the check above is for: every id in a stored set reads back
+    /// as its own entry, so a node can never be displaced by another
+    /// spelling of its id.
+    #[test]
+    fn every_stored_node_reads_back() {
+        let (mut store, mut ledger) = setup(&init());
+        let stored = nodes([(node_id(0xaa), node(1)), (node_id(0xbb), node(2))]);
+
+        ledger
+            .apply(&mut store, &set_nodes(ledger.head(), stored.clone()))
+            .unwrap();
+
+        let Value::Map(entries) = stored else {
+            unreachable!("the set is a map");
+        };
+        assert_eq!(ledger.peer_addresses(&store).unwrap().len(), entries.len());
+    }
+
+    /// Absence is not corruption: a cluster may forget every node it knew.
+    #[test]
+    fn the_cluster_nodes_namespace_can_be_deleted() {
+        let (mut store, mut ledger) = setup(&init());
+        ledger
+            .apply(
+                &mut store,
+                &set_nodes(ledger.head(), nodes([(node_id(0xaa), node(1))])),
+            )
+            .unwrap();
+
+        ledger
+            .apply(&mut store, &delete(ledger.head(), CLUSTER_NODES_KEY))
+            .unwrap();
+
+        assert_eq!(
+            ledger.namespace(&store, &key(CLUSTER_NODES_KEY)).unwrap(),
+            None,
+        );
+        // Absent is the empty set, not an error.
+        assert!(ledger.peer_addresses(&store).unwrap().is_empty());
+    }
+
+    /// The boundary covers genesis: a checkpoint cannot install a node
+    /// set an update would be refused for.
+    #[test]
+    fn init_rejects_an_invalid_cluster_nodes_set() {
+        let mut store = MemStorage::default();
+        let envelope = Envelope::new(Msg::Init(InitMsg {
+            state: FullCheckpoint {
+                namespaces: [(
+                    key(CLUSTER_NODES_KEY),
+                    Namespace {
+                        value: nodes([(node_id(0xaa), map([("name", Value::String("a".into()))]))]),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            },
+        }));
+
+        assert!(matches!(
+            Ledger::init(&mut store, &envelope),
+            Err(Error::Apply(ApplyError::InvalidValue {
+                reason: ValueError::ClusterNodes(_),
+                ..
+            })),
+        ));
     }
 
     /// Both thresholds read the reserved namespace, default to nothing

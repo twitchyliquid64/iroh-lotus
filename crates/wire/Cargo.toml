@@ -10,6 +10,7 @@ publish.workspace = true
 blake3.workspace = true
 cbor2.workspace = true
 ed25519-zebra.workspace = true
+iroh.workspace = true
 nutype.workspace = true
 serde.workspace = true
 
