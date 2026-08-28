@@ -1,6 +1,6 @@
 //! What ties a request to the answers it draws back.
 
-use crate::{ChainRange, Error, GetChainRange, GetVersion, Request, Response};
+use crate::{ChainRange, Error, GetChainRange, GetVersion, Request, Response, Watch, WatchEvent};
 
 /// One method of the local control protocol.
 ///
@@ -57,4 +57,5 @@ macro_rules! methods {
 methods! {
     "version": GetVersion => Version(String),
     "chain range": GetChainRange => ChainRange(ChainRange),
+    "watch": Watch => Watch(WatchEvent),
 }

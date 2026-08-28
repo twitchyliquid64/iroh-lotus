@@ -5,9 +5,10 @@
 //! variants so a method can grow a field without changing shape.
 
 use core::fmt;
+use std::collections::{BTreeMap, BTreeSet};
 
 use cbor2::Cbor;
-use wire::EnvelopeDigest;
+use wire::{EnvelopeDigest, msg::NamespaceKey, subkey::SubkeyPath};
 
 /// A request on the local control socket.
 #[derive(Debug, Clone, Cbor, PartialEq, Eq)]
@@ -18,6 +19,9 @@ pub enum Request {
     /// See [`GetChainRange`].
     #[serde(rename = "c")]
     GetChainRange(GetChainRange),
+    /// See [`Watch`].
+    #[serde(rename = "w")]
+    Watch(Watch),
 }
 
 /// Asks the daemon for its version.
@@ -28,6 +32,89 @@ pub struct GetVersion {}
 #[derive(Debug, Clone, Cbor, PartialEq, Eq)]
 pub struct GetChainRange {}
 
+/// Asks the daemon to report every movement of the chain that `selector`
+/// picks out, until the connection is dropped.
+///
+/// One selector per watch: a connection carries one request, so a client
+/// watching several things opens several connections.
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+pub struct Watch {
+    #[cbor(key = 1)]
+    pub selector: WatchSelector,
+}
+
+/// What a [`Watch`] asks to hear about.
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+pub enum WatchSelector {
+    /// Every movement of the canonical head, whatever it changed.
+    #[serde(rename = "h")]
+    Head,
+    /// Any change anywhere under a namespace.
+    #[serde(rename = "n")]
+    Namespace(NamespaceKey),
+    /// A change to what a path addresses in a namespace.
+    #[serde(rename = "p")]
+    Path(WatchPath),
+    /// One envelope leaving the canonical chain.
+    #[serde(rename = "o")]
+    Orphaned(EnvelopeDigest),
+}
+
+/// The path a [`WatchSelector::Path`] watches.
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+pub struct WatchPath {
+    #[cbor(key = 1)]
+    pub key: NamespaceKey,
+    #[cbor(key = 2)]
+    pub path: SubkeyPath,
+}
+
+/// One frame of a [`Watch`]'s answer.
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+pub enum WatchEvent {
+    /// The chain moved in a way the watch selects.
+    #[serde(rename = "c")]
+    Changed(Changed),
+    /// A digest the watch asked about is already off the chain. An
+    /// orphaned envelope never returns, so there is nothing further to
+    /// say and the stream ends here.
+    #[serde(rename = "o")]
+    AlreadyOrphaned(EnvelopeDigest),
+}
+
+/// One movement of the chain, as a watcher is told about it.
+///
+/// A movement the watcher slept through is merged into the next one, so
+/// `from` is where it was last told the head stood rather than the head
+/// immediately before `head`.
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+pub struct Changed {
+    /// The head the chain stood at before these changes.
+    #[cbor(key = 1)]
+    pub from: EnvelopeDigest,
+    /// The head it stands at now.
+    #[cbor(key = 2)]
+    pub head: EnvelopeDigest,
+    /// What changed, by namespace. Everything the movement did, not only
+    /// the part the selector picked out.
+    #[cbor(key = 3)]
+    pub changes: BTreeMap<NamespaceKey, NamespaceChange>,
+    /// The envelopes that left the canonical chain on the way.
+    #[cbor(key = 4)]
+    pub orphaned: BTreeSet<EnvelopeDigest>,
+}
+
+/// What changed inside one namespace.
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+pub enum NamespaceChange {
+    /// The namespace was written, removed, or amended at its root.
+    #[serde(rename = "w")]
+    Whole,
+    /// Only these paths were touched. No path here is a prefix of another.
+    #[serde(rename = "p")]
+    Paths(BTreeSet<SubkeyPath>),
+}
+
 /// One frame of the answer to a request.
 #[derive(Debug, Clone, Cbor, PartialEq, Eq)]
 pub enum Response {
@@ -37,6 +124,9 @@ pub enum Response {
     /// Answers [`GetChainRange`].
     #[serde(rename = "c")]
     ChainRange(ChainRange),
+    /// Answers [`Watch`], as many times as the chain moves.
+    #[serde(rename = "w")]
+    Watch(WatchEvent),
     /// Ends the stream: the request could not be served to completion.
     #[serde(rename = "e")]
     Failed(Failure),
@@ -49,6 +139,7 @@ impl Response {
         match self {
             Response::Version(_) => "version",
             Response::ChainRange(_) => "chain range",
+            Response::Watch(_) => "watch event",
             Response::Failed(_) => "failure",
         }
     }

@@ -7,12 +7,17 @@ use tokio::sync::oneshot;
 
 mod core;
 pub use crate::core::{
-    Core, IfInitialized, InitError, OLDEST_ENVELOPE_FILENAME, SIGNING_KEY_EXTENSION,
+    ChainError, Core, IfInitialized, InitError, OLDEST_ENVELOPE_FILENAME, SIGNING_KEY_EXTENSION,
     SQLITE_DB_FILENAME,
 };
 
 mod server;
-pub use server::{Server, ServerHandle};
+pub use server::{RequestError, Server, ServerHandle};
+
+mod subscribe;
+pub use subscribe::{
+    ChangeFilter, ChangeNotification, ChangeSelector, SubscriptionHandle, Subscriptions,
+};
 
 /// The version this daemon reports over the control socket.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

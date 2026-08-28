@@ -30,6 +30,7 @@ clap_complete = { version = "4.6" }
 dirs = "6"
 # ZIP 215 verification: see "Signature verification" in AGENTS.md.
 ed25519-zebra = "4"
+generational-arena = "0.2"
 
 nutype = { version = "0.7", features = ["serde"] }
 rand = "0.10"
@@ -49,6 +50,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.24", features = ["v4", "v7", "serde"] }
 
 # Our crates
+lotusd = { path = "crates/lotusd" }
 lotusd-rpc = { path = "crates/lotusd-rpc" }
 state = { path = "crates/state" }
 storage = { path = "crates/storage" }

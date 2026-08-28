@@ -1,6 +1,6 @@
 //! Serving one request per connection.
 
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
 use crate::{Error, Failure, Request, Response, frame};
 
@@ -40,6 +40,12 @@ impl Responses<'_> {
 /// The connection carries this one request. Its answer ends where the
 /// caller drops `stream`, so a handler that has said all it has to say
 /// simply returns.
+///
+/// A client hanging up ends the answer too, and is watched for rather than
+/// discovered on the next write. A handler streaming something long-lived —
+/// a subscription that may have nothing to say for hours — would otherwise
+/// hold whatever it is streaming from until the client's departure finally
+/// broke a send.
 pub async fn serve<S, H>(stream: &mut S, handler: &mut H) -> Result<(), Error>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -59,10 +65,40 @@ where
         Err(e) => return Err(e),
     };
 
-    let mut responses = Responses { writer: stream };
-    match handler.handle(request, &mut responses).await {
-        Ok(()) => Ok(()),
-        Err(Error::Failed(failure)) => responses.send(Response::Failed(failure)).await,
-        Err(e) => Err(e),
+    let (mut reader, mut writer) = tokio::io::split(stream);
+
+    // Scoped so the handler's borrow of the writer ends with the race, and
+    // a failure can still be reported on it below.
+    let answered = {
+        let mut responses = Responses {
+            writer: &mut writer,
+        };
+        tokio::select! {
+            answered = handler.handle(request, &mut responses) => Some(answered),
+            () = hung_up(&mut reader) => None,
+        }
+    };
+
+    match answered {
+        // Nobody left to tell.
+        None => Ok(()),
+        Some(Ok(())) => Ok(()),
+        Some(Err(Error::Failed(failure))) => {
+            Responses {
+                writer: &mut writer,
+            }
+            .send(Response::Failed(failure))
+            .await
+        }
+        Some(Err(e)) => Err(e),
     }
+}
+
+/// Resolves once the client has nothing more to say on this connection:
+/// it closed, the connection broke, or — one request per connection — it
+/// sent bytes that cannot belong to the request already being served.
+async fn hung_up<R: AsyncRead + Unpin>(reader: &mut R) {
+    let mut scratch = [0u8; 1];
+    // Every outcome ends the answer, so none of them is an error here.
+    let _ = reader.read(&mut scratch).await;
 }

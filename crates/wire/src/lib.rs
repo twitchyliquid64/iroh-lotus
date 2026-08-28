@@ -18,7 +18,7 @@ pub mod msg;
 pub use msg::Msg;
 
 pub mod subkey;
-pub use subkey::{Subkey, SubkeyPath};
+pub use subkey::{PathParseError, Subkey, SubkeyPath};
 
 #[cfg(test)]
 mod testutil;

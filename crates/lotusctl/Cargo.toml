@@ -17,3 +17,9 @@ tokio.workspace = true
 # Our crates
 lotusd-rpc.workspace = true
 wire.workspace = true
+
+# The end-to-end tests drive this CLI against a real daemon.
+[dev-dependencies]
+lotusd.workspace = true
+state.workspace = true
+tempfile.workspace = true

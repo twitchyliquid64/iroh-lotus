@@ -16,6 +16,9 @@
 mod chain;
 pub use chain::{Chain, Insert};
 
+mod change;
+pub use change::{Change, ChangeDiffer, ChangeSet, Movement};
+
 mod error;
 pub use error::{ApplyError, Error, TrustedKeysError, ValueError};
 

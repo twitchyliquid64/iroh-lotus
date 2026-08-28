@@ -24,6 +24,15 @@ pub enum Error<E> {
     /// hold — never seen, or pruned. Sync delivers parent-first, so this
     /// is a protocol breach, not a gap to buffer around.
     UnknownParent(EnvelopeDigest),
+    /// Two heads share no ancestor the log still holds, so what lies
+    /// between them cannot be determined — they belong to different
+    /// chains, or the log has been compacted past where they last agreed.
+    Diverged {
+        /// The head the walk started from.
+        from: EnvelopeDigest,
+        /// The head the walk was trying to reach.
+        to: EnvelopeDigest,
+    },
     /// An envelope could not be applied.
     Apply(ApplyError<E>),
     /// The storage backend failed.
@@ -221,6 +230,12 @@ impl<E> fmt::Display for Error<E> {
             Error::UnknownParent(prev) => {
                 write!(f, "log holds no parent envelope {}", prev.to_hex().as_ref())
             }
+            Error::Diverged { from, to } => write!(
+                f,
+                "{} and {} share no ancestor in the log",
+                from.to_hex().as_ref(),
+                to.to_hex().as_ref(),
+            ),
             Error::Apply(_) => f.write_str("could not apply an envelope"),
             Error::Storage(_) => f.write_str("storage backend failed"),
         }
@@ -303,7 +318,8 @@ impl<E: core::error::Error + 'static> core::error::Error for Error<E> {
             Error::NotInit
             | Error::EmptyChain
             | Error::UnknownHead(_)
-            | Error::UnknownParent(_) => None,
+            | Error::UnknownParent(_)
+            | Error::Diverged { .. } => None,
         }
     }
 }

@@ -8,7 +8,7 @@ use std::{
 
 use ed25519_zebra::SigningKey;
 use rand::{TryRng, rngs::SysRng};
-use state::{Chain, TRUSTED_KEYS_KEY};
+use state::{Chain, ChangeDiffer, Insert, TRUSTED_KEYS_KEY};
 use storage::{SqliteStorage, Storage};
 use tokio::{fs, io::AsyncWriteExt};
 use wire::{
@@ -16,6 +16,8 @@ use wire::{
     keys::{Ed25519PublicKey, Ed25519Signature, PublicKey},
     msg::{FullCheckpoint, InitMsg, Namespace, NamespaceKey, Value},
 };
+
+use crate::{ChangeFilter, SubscriptionHandle, Subscriptions};
 
 pub const SQLITE_DB_FILENAME: &str = "db.sqlite";
 pub const OLDEST_ENVELOPE_FILENAME: &str = "oldest_envelope";
@@ -26,17 +28,23 @@ pub const SIGNING_KEY_EXTENSION: &str = "ed25519";
 /// The weight given to the key a new cluster is founded on.
 const ROOT_KEY_WEIGHT: u32 = 2;
 
+/// What advancing the chain can fail with, over this node's backend.
+pub type ChainError = state::Error<storage::sqlite::Error>;
+
 /// The initialized internals of lotusd.
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct Core {
     storage: SqliteStorage,
+    /// Never handed out mutably: the core owns every advance of the head so
+    /// that one place can say what changed.
     chain: Chain,
     oldest: EnvelopeDigest,
     state_dir: PathBuf,
     /// Every key this node can sign with, by the id the ledger's trusted
     /// key set refers to it by.
     signing_keys: BTreeMap<KeyId, SigningKey>,
+    subscriptions: Subscriptions,
 }
 
 impl fmt::Display for Core {
@@ -81,6 +89,7 @@ impl Core {
             oldest,
             state_dir,
             signing_keys,
+            subscriptions: Subscriptions::default(),
         })
     }
 
@@ -143,12 +152,76 @@ impl Core {
             oldest,
             state_dir,
             signing_keys,
+            subscriptions: Subscriptions::default(),
         })
     }
 
     /// The canonical head this core stands at.
     pub fn head(&self) -> EnvelopeDigest {
         self.chain.head()
+    }
+
+    /// Ingests a parent-first run of envelopes, telling every matching
+    /// subscriber what the head movement changed.
+    ///
+    /// The one path that advances the chain. Everything a subscriber is
+    /// promised rests on that: a head that moved anywhere else would move
+    /// without anyone being told.
+    pub fn insert(
+        &mut self,
+        envelopes: impl IntoIterator<Item = Envelope>,
+    ) -> Result<Insert, ChainError> {
+        let differ = ChangeDiffer::opened_at(self.chain.head());
+        let insert = self.chain.insert_batch(&mut self.storage, envelopes);
+
+        // Published before the refusal is returned, never instead of it: a
+        // run the chain refuses part-way keeps the valid prefix it already
+        // stored, so the head can have moved even as this fails.
+        let head = self.chain.head();
+        if head != differ.from() {
+            let movement = differ.diff(&self.storage, head)?;
+            self.subscriptions.publish(differ.from(), head, &movement);
+        }
+        insert
+    }
+
+    /// Registers a subscription for the changes `filter` selects.
+    ///
+    /// The head it opens at is read under the same borrow that registers
+    /// it, so nothing can move in between: a subscriber that reads the
+    /// state at [`SubscriptionHandle::opened_at`] is certain every later
+    /// change reaches it as a notification.
+    pub fn subscribe(&self, filter: ChangeFilter) -> SubscriptionHandle {
+        self.subscriptions.register(filter, self.chain.head())
+    }
+
+    /// Whether `digest` lies on the canonical chain this core stands on.
+    ///
+    /// O(chain): the walk back from the head, envelope by envelope. What a
+    /// woken watcher asks to confirm what it was told.
+    pub fn contains(&self, digest: EnvelopeDigest) -> Result<bool, ChainError> {
+        self.chain.contains(&self.storage, digest)
+    }
+
+    /// Registers a subscription that fires when `digest` leaves the
+    /// canonical chain, or `None` when it is not on it to begin with.
+    ///
+    /// The check and the registration happen under one borrow, which is the
+    /// whole point of it living here: checked separately, the envelope
+    /// could be orphaned in the gap and the subscription would then wait on
+    /// an event that had already passed.
+    pub fn watch_orphaned(
+        &self,
+        digest: EnvelopeDigest,
+    ) -> Result<Option<SubscriptionHandle>, ChainError> {
+        Ok(self
+            .contains(digest)?
+            .then(|| self.subscribe(ChangeFilter::orphaned(digest))))
+    }
+
+    /// The subscriptions registered against this core.
+    pub fn subscriptions(&self) -> &Subscriptions {
+        &self.subscriptions
     }
 
     /// The oldest stored envelope.

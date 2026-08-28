@@ -1,12 +1,15 @@
 //! The shape a method has to hold to: one request in, a stream of typed
 //! responses out, and a failure the client can tell apart from a hangup.
 
+use std::collections::BTreeMap;
+
 use lotusd_rpc::{
-    Call, ChainRange, Error, Failure, FailureKind, GetChainRange, GetVersion, Handler,
-    MAX_FRAME_LEN, Request, Response, Responses, call, serve,
+    Call, ChainRange, Changed, Error, Failure, FailureKind, GetChainRange, GetVersion, Handler,
+    MAX_FRAME_LEN, NamespaceChange, Request, Response, Responses, Watch, WatchEvent, WatchPath,
+    WatchSelector, call, serve,
 };
 use tokio::io::{AsyncWriteExt, DuplexStream, duplex};
-use wire::EnvelopeDigest;
+use wire::{EnvelopeDigest, msg::NamespaceKey, subkey::SubkeyPath};
 
 /// A range to answer `GetChainRange` with, distinct from any real chain's.
 fn range() -> ChainRange {
@@ -16,11 +19,38 @@ fn range() -> ChainRange {
     }
 }
 
+/// A change to answer a watch with, exercising both shapes a namespace
+/// change takes.
+fn changed() -> Changed {
+    Changed {
+        from: EnvelopeDigest::from_bytes([3u8; 32]),
+        head: EnvelopeDigest::from_bytes([7u8; 32]),
+        changes: BTreeMap::from([
+            (key("a"), NamespaceChange::Whole),
+            (
+                key("b"),
+                NamespaceChange::Paths([path("servers[0].host"), path("name")].into()),
+            ),
+        ]),
+        orphaned: [EnvelopeDigest::from_bytes([9u8; 32])].into(),
+    }
+}
+
+fn key(k: &str) -> NamespaceKey {
+    NamespaceKey::try_new(k).unwrap()
+}
+
+fn path(text: &str) -> SubkeyPath {
+    text.parse().unwrap()
+}
+
 /// A handler that answers each method the way the daemon does, plus a
 /// `GetChainRange` that streams so the multi-response path is exercised.
 struct Fake {
     /// How many times `GetChainRange` answers before ending its stream.
     ranges: usize,
+    /// The watch selector the last request carried, for a test to read back.
+    watched: Option<WatchSelector>,
     /// Fails every request with this, rather than answering.
     fail: Option<Failure>,
 }
@@ -29,6 +59,7 @@ impl Fake {
     fn new() -> Self {
         Self {
             ranges: 1,
+            watched: None,
             fail: None,
         }
     }
@@ -51,6 +82,22 @@ impl Handler for Fake {
                     responses.send(Response::ChainRange(range())).await?;
                 }
                 Ok(())
+            }
+            Request::Watch(watch) => {
+                self.watched = Some(watch.selector.clone());
+                match watch.selector {
+                    // The one selector that can answer without waiting.
+                    WatchSelector::Orphaned(digest) => {
+                        responses
+                            .send(Response::Watch(WatchEvent::AlreadyOrphaned(digest)))
+                            .await
+                    }
+                    _ => {
+                        responses
+                            .send(Response::Watch(WatchEvent::Changed(changed())))
+                            .await
+                    }
+                }
             }
         }
     }
@@ -178,4 +225,76 @@ async fn a_frame_past_the_limit_is_refused_before_it_is_read() {
     let mut stream: Call<_, GetChainRange> = Call::send(client, GetChainRange {}).await.unwrap();
     // The server tore the connection down rather than allocating the body.
     assert!(stream.next().await.unwrap().is_none());
+}
+
+/// Every selector survives the round trip to the daemon and back, the
+/// nested path shape included.
+#[tokio::test]
+async fn a_watch_carries_its_selector_across() {
+    for selector in [
+        WatchSelector::Head,
+        WatchSelector::Namespace(key("a")),
+        WatchSelector::Path(WatchPath {
+            key: key("a"),
+            path: path("servers[0].host"),
+        }),
+        WatchSelector::Orphaned(EnvelopeDigest::from_bytes([5u8; 32])),
+    ] {
+        let (client, mut server) = duplex(64 * 1024);
+        let served = tokio::spawn(async move {
+            let mut handler = Fake::new();
+            serve(&mut server, &mut handler).await.unwrap();
+            handler.watched
+        });
+
+        let mut call = Call::send(
+            client,
+            Watch {
+                selector: selector.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        call.next().await.unwrap().unwrap();
+        drop(call);
+
+        assert_eq!(served.await.unwrap(), Some(selector));
+    }
+}
+
+/// A change survives the round trip whole: both namespace shapes and the
+/// orphan set.
+#[tokio::test]
+async fn a_watch_event_carries_the_whole_change_across() {
+    let event = call(
+        connect(Fake::new()),
+        Watch {
+            selector: WatchSelector::Head,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(event, WatchEvent::Changed(changed()));
+}
+
+/// A watch on an envelope already off the chain is answered and closed
+/// rather than left open on an event that can never come.
+#[tokio::test]
+async fn an_already_orphaned_watch_is_answered_and_ended() {
+    let digest = EnvelopeDigest::from_bytes([5u8; 32]);
+    let mut call = Call::send(
+        connect(Fake::new()),
+        Watch {
+            selector: WatchSelector::Orphaned(digest),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        call.next().await.unwrap(),
+        Some(WatchEvent::AlreadyOrphaned(digest))
+    );
+    assert_eq!(call.next().await.unwrap(), None);
 }

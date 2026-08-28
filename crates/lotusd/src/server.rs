@@ -1,22 +1,35 @@
 //! The server actor: one mainloop task owning the [`Core`], reached only by
 //! the messages a [`ServerHandle`] sends it.
 
+use core::fmt;
 use std::ops::ControlFlow;
 
 use lotusd_rpc as rpc;
+use state::Insert;
 use tokio::{
     net::{UnixListener, UnixStream},
-    sync::mpsc,
+    sync::{mpsc, oneshot},
     task::JoinHandle,
 };
-use wire::EnvelopeDigest;
+use wire::{Envelope, EnvelopeDigest};
 
-use crate::{Core, InitError, Responder, VERSION};
+use crate::{
+    ChainError, ChangeFilter, ChangeSelector, Core, InitError, Responder, SubscriptionHandle,
+    VERSION,
+};
 
 #[derive(Debug)]
 enum ServerMsg {
     Shutdown(Responder<(), ()>),
     ChainRange(Responder<rpc::ChainRange, ()>),
+    Insert(Vec<Envelope>, Responder<Insert, ChainError>),
+    Subscribe(ChangeFilter, Responder<SubscriptionHandle, ()>),
+    Contains(EnvelopeDigest, Responder<bool, ChainError>),
+    Watchers(Responder<usize, ()>),
+    WatchOrphaned(
+        EnvelopeDigest,
+        Responder<Option<SubscriptionHandle>, ChainError>,
+    ),
 }
 
 /// The server actor, encapsulates all running/server state.
@@ -85,6 +98,15 @@ impl Server {
         match msg {
             ServerMsg::Shutdown(r) => return ControlFlow::Break(r),
             ServerMsg::ChainRange(r) => Self::handle_chain_range(core, r).await,
+            // Both run to completion here on the mainloop: advancing the
+            // chain and registering against it are the operations whose
+            // ordering against each other is the whole guarantee, so
+            // neither may be handed to a task that could reorder them.
+            ServerMsg::Insert(envelopes, r) => r.respond(core.insert(envelopes)),
+            ServerMsg::Subscribe(filter, r) => r.respond(Ok(core.subscribe(filter))),
+            ServerMsg::Contains(digest, r) => r.respond(core.contains(digest)),
+            ServerMsg::Watchers(r) => r.respond(Ok(core.subscriptions().count())),
+            ServerMsg::WatchOrphaned(digest, r) => r.respond(core.watch_orphaned(digest)),
         }
 
         ControlFlow::Continue(())
@@ -139,8 +161,71 @@ impl rpc::Handler for Rpc {
                     .map_err(|()| rpc::Failure::internal("the server is shutting down"))?;
                 responses.send(rpc::Response::ChainRange(range)).await
             }
+            rpc::Request::Watch(watch) => self.watch(watch.selector, responses).await,
         }
     }
+}
+
+impl Rpc {
+    /// Streams what `selector` picks out until the client hangs up or the
+    /// daemon stops.
+    ///
+    /// Returning is what ends the stream: the connection closes, and with it
+    /// the subscription, which deregisters itself as it drops.
+    async fn watch(
+        &self,
+        selector: rpc::WatchSelector,
+        responses: &mut rpc::Responses<'_>,
+    ) -> Result<(), rpc::Error> {
+        let mut subscription = match self.subscribe(selector).await? {
+            Watching::Subscribed(subscription) => subscription,
+            // Nothing further can ever be said about it, so say that and go.
+            Watching::AlreadyOrphaned(digest) => {
+                return responses
+                    .send(rpc::Response::Watch(rpc::WatchEvent::AlreadyOrphaned(
+                        digest,
+                    )))
+                    .await;
+            }
+        };
+
+        while let Some(notification) = subscription.next().await {
+            responses
+                .send(rpc::Response::Watch(rpc::WatchEvent::Changed(
+                    notification.to_wire(),
+                )))
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Registers `selector`, taking the orphan case through the check that
+    /// makes registering it race-free.
+    async fn subscribe(&self, selector: rpc::WatchSelector) -> Result<Watching, rpc::Error> {
+        let gone = || rpc::Failure::internal("the server is shutting down");
+
+        match selector {
+            rpc::WatchSelector::Orphaned(digest) => Ok(self
+                .0
+                .watch_orphaned(digest)
+                .await
+                .map_err(|err| rpc::Failure::internal(err.to_string()))?
+                .map_or(Watching::AlreadyOrphaned(digest), Watching::Subscribed)),
+            other => Ok(Watching::Subscribed(
+                self.0
+                    .subscribe(ChangeSelector::from(other))
+                    .await
+                    .map_err(|()| gone())?,
+            )),
+        }
+    }
+}
+
+/// What registering a watch came to.
+enum Watching {
+    Subscribed(SubscriptionHandle),
+    /// The envelope asked about is already off the chain.
+    AlreadyOrphaned(EnvelopeDigest),
 }
 
 /// A handle to a running lotusd server.
@@ -184,5 +269,122 @@ impl ServerHandle {
     /// until compaction moves it forward.
     pub async fn root(&self) -> Result<EnvelopeDigest, ()> {
         self.chain_range().await.map(|range| range.root)
+    }
+
+    /// Ingests a parent-first run of envelopes, waking every subscriber the
+    /// head movement concerns.
+    ///
+    /// The run must be continuous, as [`Chain::insert_batch`] requires: each
+    /// envelope chains onto the one before it, and the first one's parent is
+    /// already stored.
+    ///
+    /// [`Chain::insert_batch`]: state::Chain::insert_batch
+    pub async fn insert(
+        &self,
+        envelopes: impl IntoIterator<Item = Envelope>,
+    ) -> Result<Insert, RequestError> {
+        let (send, recv) = Responder::channel();
+        let _ = self
+            .0
+            .send(ServerMsg::Insert(envelopes.into_iter().collect(), send))
+            .await;
+        Self::answer(recv.await)
+    }
+
+    /// Registers a subscription for the changes `filter` selects.
+    ///
+    /// Takes a bare [`ChangeSelector`] too, for watching just one thing.
+    /// Registering happens on the mainloop, so the head the subscription
+    /// [opened at](SubscriptionHandle::opened_at) is one nothing can have
+    /// moved past before it was registered.
+    ///
+    /// [`ChangeSelector`]: crate::ChangeSelector
+    pub async fn subscribe(
+        &self,
+        filter: impl Into<ChangeFilter>,
+    ) -> Result<SubscriptionHandle, ()> {
+        let (send, recv) = Responder::channel();
+        let _ = self.0.send(ServerMsg::Subscribe(filter.into(), send)).await;
+        match recv.await {
+            Ok(Ok(subscription)) => Ok(subscription),
+            _ => Err(()),
+        }
+    }
+
+    /// How many subscriptions are registered against the core.
+    ///
+    /// Every local watch holds one, so this counts the clients currently
+    /// being told about the chain.
+    pub async fn watchers(&self) -> Result<usize, ()> {
+        let (send, recv) = Responder::channel();
+        let _ = self.0.send(ServerMsg::Watchers(send)).await;
+        match recv.await {
+            Ok(Ok(count)) => Ok(count),
+            _ => Err(()),
+        }
+    }
+
+    /// Whether `digest` lies on the canonical chain.
+    ///
+    /// O(chain) in the daemon: this walks the head back to the root.
+    pub async fn contains(&self, digest: EnvelopeDigest) -> Result<bool, RequestError> {
+        let (send, recv) = Responder::channel();
+        let _ = self.0.send(ServerMsg::Contains(digest, send)).await;
+        Self::answer(recv.await)
+    }
+
+    /// Registers a subscription that fires when `digest` leaves the
+    /// canonical chain, or `None` when it is not on the chain already.
+    ///
+    /// `None` is the answer, not a failure: an envelope that is already off
+    /// the chain will never be taken off it again, so there is nothing left
+    /// to wait for. The check and the registration share one trip to the
+    /// mainloop, so no reorg can slip between them.
+    pub async fn watch_orphaned(
+        &self,
+        digest: EnvelopeDigest,
+    ) -> Result<Option<SubscriptionHandle>, RequestError> {
+        let (send, recv) = Responder::channel();
+        let _ = self.0.send(ServerMsg::WatchOrphaned(digest, send)).await;
+        Self::answer(recv.await)
+    }
+
+    /// Unwraps what came back down a responder, reading a dropped sender as
+    /// the server having gone away.
+    fn answer<T>(
+        received: Result<Result<T, ChainError>, oneshot::error::RecvError>,
+    ) -> Result<T, RequestError> {
+        match received {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(err)) => Err(RequestError::Chain(err)),
+            Err(_) => Err(RequestError::ServerGone),
+        }
+    }
+}
+
+/// Why a request that touches the chain could not be answered.
+#[derive(Debug)]
+pub enum RequestError {
+    /// The server is not running, or is on its way down.
+    ServerGone,
+    /// The chain refused the request, or could not answer it.
+    Chain(ChainError),
+}
+
+impl fmt::Display for RequestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RequestError::ServerGone => f.write_str("the server is not running"),
+            RequestError::Chain(_) => f.write_str("the chain could not answer"),
+        }
+    }
+}
+
+impl core::error::Error for RequestError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            RequestError::ServerGone => None,
+            RequestError::Chain(err) => Some(err),
+        }
     }
 }

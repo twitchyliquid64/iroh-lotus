@@ -4,7 +4,7 @@
 //! [`SubkeyPath`] addresses one value inside it, so an update can amend a
 //! branch without republishing the trunk.
 
-use core::fmt;
+use core::{fmt, str::FromStr};
 
 use nutype::nutype;
 
@@ -14,7 +14,7 @@ use crate::codec::dual_repr;
 ///
 /// `dual_repr!` below defines the serde representations: integer wire
 /// tags, adjacently tagged full names in JSON.
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Subkey {
     /// A key of a [`Value::Map`](crate::msg::Value::Map).
     Key(String),
@@ -44,7 +44,7 @@ impl fmt::Display for Subkey {
 /// which is [`SetNamespace`](crate::msg::SetNamespace)'s job.
 #[nutype(
     validate(predicate = |path| !path.is_empty()),
-    derive(Debug, Clone, PartialEq, Eq, Hash, AsRef, Serialize, Deserialize)
+    derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, AsRef, Serialize, Deserialize)
 )]
 pub struct SubkeyPath(Vec<Subkey>);
 
@@ -64,6 +64,85 @@ impl fmt::Display for SubkeyPath {
             })
     }
 }
+
+impl FromStr for SubkeyPath {
+    type Err = PathParseError;
+
+    /// Reads back what [`Display`](SubkeyPath::fmt) writes: dotted keys and
+    /// bracketed indices, `servers[0].host`.
+    ///
+    /// The textual form cannot express a key containing `.`, `[` or `]` —
+    /// such a key parses as several segments. It is an input format for
+    /// people to type, not a round trip for arbitrary paths.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let mut segments = Vec::new();
+        let mut rest = text;
+
+        while !rest.is_empty() {
+            rest = match rest.strip_prefix('[') {
+                Some(after) => {
+                    let (index, after) = after
+                        .split_once(']')
+                        .ok_or_else(|| PathParseError::UnclosedIndex(text.to_string()))?;
+                    segments.push(Subkey::Index(
+                        index
+                            .parse()
+                            .map_err(|_| PathParseError::BadIndex(index.to_string()))?,
+                    ));
+                    after
+                }
+                None => {
+                    let end = rest.find(['.', '[']).unwrap_or(rest.len());
+                    let (key, after) = rest.split_at(end);
+                    if key.is_empty() {
+                        return Err(PathParseError::EmptyKey(text.to_string()));
+                    }
+                    segments.push(Subkey::Key(key.to_string()));
+                    after
+                }
+            };
+            // A dot only ever separates; anything else carries on as its
+            // own segment, and a trailing one leaves an empty key behind.
+            if let Some(after) = rest.strip_prefix('.') {
+                if after.is_empty() {
+                    return Err(PathParseError::EmptyKey(text.to_string()));
+                }
+                rest = after;
+            }
+        }
+
+        Self::try_new(segments).map_err(|_| PathParseError::Empty)
+    }
+}
+
+/// Why a path could not be read from text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathParseError {
+    /// The text was empty; a path addresses at least one segment.
+    Empty,
+    /// A key was empty — a leading, doubled, or trailing dot. Holds the
+    /// text it was read from.
+    EmptyKey(String),
+    /// An index was opened and never closed. Holds the text.
+    UnclosedIndex(String),
+    /// An index was not a `u32`. Holds what stood between the brackets.
+    BadIndex(String),
+}
+
+impl fmt::Display for PathParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PathParseError::Empty => f.write_str("a path needs at least one segment"),
+            PathParseError::EmptyKey(text) => write!(f, "{text} has an empty key"),
+            PathParseError::UnclosedIndex(text) => write!(f, "{text} has an unclosed ["),
+            PathParseError::BadIndex(index) => {
+                write!(f, "[{index}] is not a whole number under 2^32")
+            }
+        }
+    }
+}
+
+impl core::error::Error for PathParseError {}
 
 #[cfg(test)]
 mod tests {
@@ -115,6 +194,63 @@ mod tests {
     fn subkey_displays_keys_bare_and_indices_bracketed() {
         assert_eq!(key("host").to_string(), "host");
         assert_eq!(Subkey::Index(0).to_string(), "[0]");
+    }
+
+    /// What `Display` writes, `FromStr` reads back.
+    #[test]
+    fn a_path_round_trips_through_its_text() {
+        for original in [
+            path([key("a")]),
+            path([key("a"), key("b")]),
+            path([key("servers"), Subkey::Index(0), key("host")]),
+            path([Subkey::Index(7)]),
+            path([Subkey::Index(1), Subkey::Index(2)]),
+            path([key("a"), Subkey::Index(0)]),
+        ] {
+            let text = original.to_string();
+            assert_eq!(text.parse::<SubkeyPath>(), Ok(original), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_path_is_read_from_its_written_form() {
+        assert_eq!(
+            "servers[0].host".parse::<SubkeyPath>(),
+            Ok(path([key("servers"), Subkey::Index(0), key("host")])),
+        );
+        assert_eq!("[12]".parse::<SubkeyPath>(), Ok(path([Subkey::Index(12)])));
+    }
+
+    #[test]
+    fn a_malformed_path_is_refused() {
+        assert_eq!("".parse::<SubkeyPath>(), Err(PathParseError::Empty));
+        for text in [".a", "a..b", "a."] {
+            assert_eq!(
+                text.parse::<SubkeyPath>(),
+                Err(PathParseError::EmptyKey(text.to_string())),
+                "{text}",
+            );
+        }
+        assert_eq!(
+            "a[0".parse::<SubkeyPath>(),
+            Err(PathParseError::UnclosedIndex("a[0".to_string())),
+        );
+        assert_eq!(
+            "a[-1]".parse::<SubkeyPath>(),
+            Err(PathParseError::BadIndex("-1".to_string())),
+        );
+        assert_eq!(
+            "a[4294967296]".parse::<SubkeyPath>(),
+            Err(PathParseError::BadIndex("4294967296".to_string())),
+        );
+    }
+
+    /// The documented limit of the textual form: a key with a separator in
+    /// it comes back as several segments.
+    #[test]
+    fn a_key_containing_a_separator_does_not_round_trip() {
+        assert_eq!("a.b".parse::<SubkeyPath>(), Ok(path([key("a"), key("b")])),);
+        assert_ne!("a.b".parse::<SubkeyPath>(), Ok(path([key("a.b")])),);
     }
 
     #[test]

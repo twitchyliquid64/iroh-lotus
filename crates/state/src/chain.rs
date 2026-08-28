@@ -271,6 +271,19 @@ impl Chain {
         self.root
     }
 
+    /// Whether `digest` lies on the canonical path — the walk back from
+    /// the head to the root, which is O(chain) in envelope reads.
+    ///
+    /// A digest the log never held answers `false` the same as one that
+    /// lost a fork: to a reader, off the chain is off the chain.
+    pub fn contains<S: Storage>(
+        &self,
+        storage: &S,
+        digest: EnvelopeDigest,
+    ) -> Result<bool, Error<S::Error>> {
+        descends(storage, self.head(), digest)
+    }
+
     /// The compaction floor in force at the canonical head. Config is
     /// namespace data, so it follows the canonical branch like the rest
     /// of the state.

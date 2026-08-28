@@ -449,6 +449,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1944426bf7d03f1d14f708785e4b33efd750b36d48a157b836b3efc15ede8e1d"
 
 [[package]]
+name = "generational-arena"
+version = "0.2.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "877e94aff08e743b651baaea359664321055749b398adff8740a7399af7796e7"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -619,9 +628,12 @@ dependencies = [
  "clap",
  "clap_complete",
  "dirs",
+ "lotusd",
  "lotusd-rpc",
  "serde",
  "serde_json",
+ "state",
+ "tempfile",
  "tokio",
  "wire",
 ]
@@ -636,6 +648,7 @@ dependencies = [
  "clap_complete",
  "dirs",
  "ed25519-zebra",
+ "generational-arena",
  "lotusd-rpc",
  "nutype",
  "rand",
