@@ -3,7 +3,7 @@ use std::{path::PathBuf, process::ExitCode};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use iroh::{Endpoint, endpoint::presets};
-use lotusd::{Core, IfInitialized, Server, peer_ingress::Protocol};
+use lotusd::{Core, IfInitialized, Server, bootstrap, invite::Invite, peer_ingress::Protocol};
 use render::{ColorChoice, Entry, Render};
 use tokio::net::UnixListener;
 use tokio::runtime::Builder;
@@ -32,6 +32,16 @@ enum Command {
     Run,
     /// Initializes a new cluster
     Init(InitArgs),
+    /// Joins an existing cluster with an invite from `lotusctl invite`
+    #[command(
+        long_about = "Joins an existing cluster with an invite from `lotusctl invite`.\n\n\
+        Generates this node's keys, dials the node that issued the invite, \
+        pulls the whole chain, and waits to be admitted — its key trusted and \
+        its endpoint listed by the inviting node. Then it exits: run `lotusd \
+        run` to serve. A join that fails leaves nothing behind but the keys, \
+        and the next attempt replaces those."
+    )]
+    Bootstrap(BootstrapArgs),
     /// Inspects what this node has on disk
     #[command(subcommand)]
     Debug(DebugCommand),
@@ -72,6 +82,25 @@ struct InitArgs {
     /// Init is potentially destructive to data if this is set.
     #[arg(long = "overwrite_existing")]
     overwrite_existing: bool,
+}
+
+/// The arguments for the bootstrap subcommand.
+#[derive(Debug, clap::Args)]
+struct BootstrapArgs {
+    /// The invite, as `lotusctl invite` printed it on the inviting node
+    #[arg(value_parser = parse_invite)]
+    invite: Invite,
+
+    /// Join even if this state directory is already initialized.
+    ///
+    /// Destructive: the cluster already here is replaced.
+    #[arg(long = "overwrite_existing")]
+    overwrite_existing: bool,
+}
+
+/// Reads an invite, for clap.
+fn parse_invite(text: &str) -> Result<Invite, String> {
+    Invite::decode(text).map_err(|e| e.to_string())
 }
 
 /// Shared arguments for all subcommands.
@@ -162,6 +191,41 @@ async fn async_main() -> Result<(), MainError> {
 
             println!("Initialized cluster {core}");
         }
+        Command::Bootstrap(a) => {
+            let state_dir = cli.global_args.state_dir()?;
+            let keys = Core::prepare_join(
+                state_dir.clone(),
+                if a.overwrite_existing {
+                    IfInitialized::Overwrite
+                } else {
+                    IfInitialized::Fail
+                },
+            )
+            .await
+            .map_err(MainError::Init)?;
+            tracing::info!("Node ID:     {}", keys.key_id().to_hex().as_ref());
+            tracing::info!("Endpoint ID: {}", keys.iroh_secret().public().to_z32());
+
+            // Bound with the daemon's ALPNs even though nothing is served
+            // yet: the inviting node lists this endpoint the moment it
+            // admits it, and its dial should fail on nobody accepting
+            // rather than on the handshake.
+            let endpoint = Endpoint::builder(presets::N0)
+                .secret_key(keys.iroh_secret().clone())
+                .alpns(Protocol::alpns())
+                .bind()
+                .await
+                .map_err(MainError::Bind)?;
+            let joined = bootstrap::join(state_dir, &keys, &a.invite, &endpoint).await;
+            endpoint.close().await;
+            let joined = joined.map_err(MainError::Join)?;
+
+            println!(
+                "Joined cluster {} (admitted by {}); run `lotusd run` to serve",
+                joined.core,
+                joined.admitted.to_hex().as_ref()
+            );
+        }
         Command::Debug(DebugCommand::Chain(args)) => {
             let core = Core::init_with_state_dir(cli.global_args.state_dir()?)
                 .await
@@ -237,6 +301,8 @@ pub enum MainError {
     Init(lotusd::InitError),
     /// The iroh endpoint could not be bound.
     Bind(iroh::endpoint::BindError),
+    /// The join did not complete.
+    Join(bootstrap::JoinError),
     /// The envelope log could not be read.
     Storage(storage::sqlite::Error),
     Other(String),

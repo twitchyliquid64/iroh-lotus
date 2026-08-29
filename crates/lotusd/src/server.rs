@@ -2,9 +2,11 @@
 //! the messages a [`ServerHandle`] sends it.
 
 use core::fmt;
-use std::ops::ControlFlow;
-
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    ops::ControlFlow,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use iroh::{Endpoint, EndpointAddr};
 use lotusd_rpc as rpc;
@@ -24,11 +26,26 @@ use wire::{
 };
 
 use crate::{
-    ChainError, ChangeFilter, ChangeSelector, Core, InitError, Responder, SubscriptionHandle,
-    VERSION,
+    AdmitError, ChainError, ChangeFilter, ChangeSelector, Core, InitError, Responder,
+    SubscriptionHandle, VERSION,
+    bootstrap::{InviteError, Invites, Welcomed},
+    invite::{self, Invite, Token},
     peer_egress::{PeerEgress, PeerEgressHandle, PeerState, PeerStatus},
     peer_ingress::{PeerIngress, PeerIngressHandle},
 };
+
+/// The longest an invite may be good for. A token is a bearer secret:
+/// one that outlives the operator's attention is one they forgot.
+pub const MAX_INVITE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// A freshly issued invite and the window the sponsor will honour it for.
+/// `ttl` is the granted window, capped at [`MAX_INVITE_TTL`], not a clock
+/// reading: it is what the invite book enforces, so it is what to report.
+#[derive(Debug, Clone)]
+pub struct Issued {
+    pub invite: Invite,
+    pub ttl: Duration,
+}
 
 #[derive(Debug)]
 enum ServerMsg {
@@ -53,6 +70,13 @@ enum ServerMsg {
     Identity(Responder<Identity, ()>),
     Read(rpc::Read, Responder<rpc::ValueAt, ChainError>),
     WeakWrite(WeakWrite, Responder<rpc::Written, ChainError>),
+    CreateInvite(u32, Duration, Responder<Issued, InviteError>),
+    RedeemInvite(Token, Responder<Welcomed, InviteError>),
+    Admit(
+        wire::Key,
+        EndpointAddr,
+        Responder<EnvelopeDigest, AdmitError>,
+    ),
 }
 
 /// A write a local client asks for, to be signed by this node onto its
@@ -237,6 +261,7 @@ impl Server {
                 egress,
                 endpoint,
             };
+            let mut invites = Invites::default();
             loop {
                 tokio::select! {
                     // Control messages win over new connections, so a shutdown is not held
@@ -248,7 +273,7 @@ impl Server {
                         let Some(msg) = msg else {
                             return peers.close().await;
                         };
-                        if let ControlFlow::Break(r) = Self::handle_message(&mut core, &peers, msg).await {
+                        if let ControlFlow::Break(r) = Self::handle_message(&mut core, &peers, &mut invites, msg).await {
                             // Shutdown, r is to respond when we are done shutting down.
                             peers.close().await;
                             r.respond(Ok(()));
@@ -281,6 +306,7 @@ impl Server {
     async fn handle_message(
         core: &mut Core,
         peers: &Peers,
+        invites: &mut Invites,
         msg: ServerMsg,
     ) -> ControlFlow<Responder<(), ()>> {
         match msg {
@@ -321,9 +347,72 @@ impl Server {
                         outcome: outcome(insert),
                     }),
             ),
+            ServerMsg::CreateInvite(weight, ttl, r) => {
+                r.respond(Self::create_invite(core, peers, invites, weight, ttl));
+            }
+            ServerMsg::RedeemInvite(token, r) => r.respond(
+                invites
+                    .redeem(&token, Instant::now())
+                    .map_err(InviteError::Redeem)
+                    .and_then(|redeemed| {
+                        core.root_envelope()
+                            .map(|root| Welcomed {
+                                root,
+                                weight: redeemed.weight,
+                            })
+                            .map_err(|e| InviteError::Chain(ChainError::Storage(e)))
+                    }),
+            ),
+            // On the mainloop like any write: signed onto the head the core
+            // stands at right now, both envelopes before anything else runs.
+            ServerMsg::Admit(key, addr, r) => r.respond(core.admit(key, &addr)),
         }
 
         ControlFlow::Continue(())
+    }
+
+    /// Issues an invite admitting one node at `weight`, good for `ttl`.
+    ///
+    /// Refused up front when this node could not sign the admission
+    /// alone: the joiner would otherwise pull the whole chain and only
+    /// then learn nothing could let it in.
+    fn create_invite(
+        core: &Core,
+        peers: &Peers,
+        invites: &mut Invites,
+        weight: u32,
+        ttl: Duration,
+    ) -> Result<Issued, InviteError> {
+        let endpoint = peers
+            .endpoint
+            .as_ref()
+            .map(Endpoint::addr)
+            .ok_or(InviteError::NoEndpoint)?;
+        core.signs_alone()
+            .map_err(InviteError::Chain)?
+            .map_err(InviteError::CannotSignAlone)?;
+
+        let ttl = ttl.min(MAX_INVITE_TTL);
+        let token = Token::from_bytes(crate::core::draw_token().map_err(InviteError::Entropy)?);
+        invites.issue(token, weight, ttl, Instant::now());
+
+        let expires_at = SystemTime::now()
+            .checked_add(ttl)
+            .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
+            .map_or(i64::MAX, |since| {
+                i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
+            });
+        Ok(Issued {
+            invite: Invite {
+                version: invite::VERSION,
+                sponsor: core.key_id(),
+                endpoint,
+                root: core.root(),
+                token,
+                expires_at_millis: expires_at,
+            },
+            ttl,
+        })
     }
 
     /// Reads how much of the chain the core holds.
@@ -463,6 +552,27 @@ impl rpc::Handler for Rpc {
             rpc::Request::WeakPush(push) => self.write(push, responses).await,
             rpc::Request::WeakDelete(delete) => self.write(delete, responses).await,
             rpc::Request::WeakIncrement(increment) => self.write(increment, responses).await,
+            rpc::Request::CreateInvite(create) => {
+                let Issued { invite, ttl } = self
+                    .0
+                    .create_invite(create.weight, Duration::from_millis(create.ttl_millis))
+                    .await
+                    .map_err(|err| match err {
+                        InviteError::ServerGone | InviteError::Chain(_) => {
+                            rpc::Failure::internal(err.to_string())
+                        }
+                        other => rpc::Failure::rejected(other.to_string()),
+                    })?;
+                let text = invite
+                    .encode()
+                    .map_err(|e| rpc::Failure::internal(format!("encoding the invite: {e}")))?;
+                responses
+                    .send(rpc::Response::Invite(rpc::InviteCode {
+                        text,
+                        expires_in_millis: u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX),
+                    }))
+                    .await
+            }
         }
     }
 }
@@ -835,6 +945,38 @@ impl ServerHandle {
         let (send, recv) = Responder::channel();
         let _ = self.0.send(ServerMsg::WeakWrite(write.into(), send)).await;
         Self::answer(recv.await)
+    }
+
+    /// Issues an invite admitting one node at `weight`, honoured for `ttl`
+    /// (capped at [`MAX_INVITE_TTL`]). The token lives in the mainloop's
+    /// memory only.
+    pub async fn create_invite(&self, weight: u32, ttl: Duration) -> Result<Issued, InviteError> {
+        let (send, recv) = Responder::channel();
+        let _ = self
+            .0
+            .send(ServerMsg::CreateInvite(weight, ttl, send))
+            .await;
+        recv.await.map_err(|_| InviteError::ServerGone)?
+    }
+
+    /// Consumes the invite `token` names, handing back what a joiner is
+    /// owed for it: the root to build on and the weight it will hold.
+    pub(crate) async fn redeem_invite(&self, token: Token) -> Result<Welcomed, InviteError> {
+        let (send, recv) = Responder::channel();
+        let _ = self.0.send(ServerMsg::RedeemInvite(token, send)).await;
+        recv.await.map_err(|_| InviteError::ServerGone)?
+    }
+
+    /// Trusts `key` and lists `addr` under its id, signed by this node —
+    /// see [`Core::admit`]. Returns the digest of the listing.
+    pub async fn admit(
+        &self,
+        key: wire::Key,
+        addr: EndpointAddr,
+    ) -> Result<EnvelopeDigest, AdmitError> {
+        let (send, recv) = Responder::channel();
+        let _ = self.0.send(ServerMsg::Admit(key, addr, send)).await;
+        recv.await.map_err(|_| AdmitError::ServerGone)?
     }
 
     /// Unwraps what came back down a responder, reading a dropped sender as

@@ -1,9 +1,9 @@
 //! What ties a request to the answers it draws back.
 
 use crate::{
-    ChainRange, EnvelopeFrame, Error, GetChainRange, GetEnvelopes, GetStatus, GetVersion,
-    NodeStatus, Read, Request, Response, ValueAt, Watch, WatchEvent, WeakDelete, WeakIncrement,
-    WeakPush, WeakSet, Written,
+    ChainRange, CreateInvite, EnvelopeFrame, Error, GetChainRange, GetEnvelopes, GetStatus,
+    GetVersion, InviteCode, NodeStatus, Read, Request, Response, ValueAt, Watch, WatchEvent,
+    WeakDelete, WeakIncrement, WeakPush, WeakSet, Written,
 };
 
 /// One method of the local control protocol.
@@ -69,4 +69,5 @@ methods! {
     "weak push": WeakPush => Written(Written),
     "weak delete": WeakDelete => Written(Written),
     "weak increment": WeakIncrement => Written(Written),
+    "create invite": CreateInvite => Invite(InviteCode),
 }

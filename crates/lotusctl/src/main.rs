@@ -3,9 +3,9 @@ use std::{collections::BTreeMap, fmt, path::PathBuf, process::ExitCode, time::Du
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use lotusd_rpc::{
-    Call, ChainWalk, EnvelopeFrame, GetChainRange, GetEnvelopes, GetStatus, GetVersion,
-    NamespaceChange, NodeStatus, Read, ValueAt, Watch, WatchEvent, WatchSelector, WeakDelete,
-    WeakIncrement, WeakPush, WeakSet, WriteOutcome, Written, call,
+    Call, ChainWalk, CreateInvite, EnvelopeFrame, GetChainRange, GetEnvelopes, GetStatus,
+    GetVersion, InviteCode, NamespaceChange, NodeStatus, Read, ValueAt, Watch, WatchEvent,
+    WatchSelector, WeakDelete, WeakIncrement, WeakPush, WeakSet, WriteOutcome, Written, call,
 };
 use render::{ColorChoice, Entry, Render};
 use tokio::net::UnixStream;
@@ -88,6 +88,16 @@ enum Command {
         --min and down to --max where they are given."
     )]
     WeakIncrement(WeakIncrementCommand),
+    /// Invites a new node into the cluster, printing the word it joins with
+    #[command(
+        long_about = "Invites a new node into the cluster, printing the word it joins with.\n\n\
+        Run `lotusd bootstrap <word>` on a blank node: it dials this daemon, \
+        pulls the chain, and is then admitted — its key trusted at --weight and \
+        its endpoint listed — by this daemon's signature alone. The word carries \
+        a one-time secret the daemon keeps in memory until it is used or --ttl \
+        passes, so treat it as a credential and hand it over privately."
+    )]
+    Invite(InviteCommand),
     /// Reports who the daemon is, how much of the chain it holds, and how
     /// it stands with its peers
     Status,
@@ -458,6 +468,60 @@ fn parse_digest(text: &str) -> Result<EnvelopeDigest, String> {
     EnvelopeDigest::from_hex(text).map_err(|e| e.to_string())
 }
 
+/// The arguments for the invite subcommand.
+#[derive(Debug, Args)]
+struct InviteCommand {
+    /// The weight the new node's key is trusted at
+    #[arg(long, default_value_t = 1)]
+    weight: u32,
+
+    /// How long the invite stays good, written like `90s`, `15m` or `2h`;
+    /// the daemon caps it
+    #[arg(long, value_parser = parse_window, default_value = "10m")]
+    ttl: Duration,
+}
+
+/// What `invite` reports.
+#[derive(Debug, serde::Serialize)]
+struct InviteLine {
+    invite: String,
+    expires_in_millis: u64,
+}
+
+impl From<InviteCode> for InviteLine {
+    fn from(code: InviteCode) -> Self {
+        Self {
+            invite: code.text,
+            expires_in_millis: code.expires_in_millis,
+        }
+    }
+}
+
+impl fmt::Display for InviteLine {
+    /// The word on a line of its own, so a double-click selects exactly it.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "On the new node, run:")?;
+        writeln!(f)?;
+        writeln!(f, "    lotusd bootstrap {}", self.invite)?;
+        writeln!(f)?;
+        writeln!(
+            f,
+            "The invite admits one node and expires in {}.",
+            window(Duration::from_millis(self.expires_in_millis))
+        )
+    }
+}
+
+/// A duration as a person would write it: `10m`, `90s`, `2h`.
+fn window(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    match secs {
+        s if s % 3600 == 0 && s > 0 => format!("{}h", s / 3600),
+        s if s % 60 == 0 && s > 0 => format!("{}m", s / 60),
+        s => format!("{s}s"),
+    }
+}
+
 /// The arguments for the completions subcommand.
 #[derive(Debug, clap::Args)]
 struct CompletionsArgs {
@@ -746,6 +810,24 @@ async fn async_main() -> Result<(), MainError> {
             )
             .await?
         }
+        Command::Invite(args) => {
+            let path = cli.global_args.local_sock_path()?;
+            let code = call(
+                connect(&path).await?,
+                CreateInvite {
+                    weight: args.weight,
+                    ttl_millis: u64::try_from(args.ttl.as_millis()).unwrap_or(u64::MAX),
+                },
+            )
+            .await
+            .map_err(MainError::Rpc)?;
+            let line = InviteLine::from(code);
+
+            match cli.global_args.format {
+                Format::Text => print!("{line}"),
+                Format::Json => print_json(&line)?,
+            }
+        }
         Command::Status => {
             let path = cli.global_args.local_sock_path()?;
             let status = call(connect(&path).await?, GetStatus {})
@@ -970,6 +1052,14 @@ pub enum MainError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_window_prints_in_its_largest_whole_unit() {
+        assert_eq!(window(Duration::from_secs(600)), "10m");
+        assert_eq!(window(Duration::from_secs(7200)), "2h");
+        assert_eq!(window(Duration::from_secs(90)), "90s");
+        assert_eq!(window(Duration::ZERO), "0s");
+    }
 
     #[test]
     fn a_window_reads_in_whichever_unit_it_was_written() {

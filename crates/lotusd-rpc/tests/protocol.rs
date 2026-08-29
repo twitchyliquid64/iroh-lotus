@@ -5,10 +5,10 @@ use std::collections::BTreeMap;
 
 use lotusd_rpc::{
     Call, ChainRange, ChainWalk, Changed, EnvelopeFrame, EnvelopeSelector, Error, Failure,
-    FailureKind, GetChainRange, GetEnvelopes, GetVersion, Handler, MAX_FRAME_LEN, NamespaceChange,
-    NodeStatus, Read, Reorged, Request, Response, Responses, ValueAt, Verification, Watch,
-    WatchEvent, WatchPath, WatchSelector, WeakDelete, WeakIncrement, WeakPush, WeakSet,
-    WriteOutcome, Written, call, serve,
+    FailureKind, GetChainRange, GetEnvelopes, GetVersion, Handler, InviteCode, MAX_FRAME_LEN,
+    NamespaceChange, NodeStatus, Read, Reorged, Request, Response, Responses, ValueAt,
+    Verification, Watch, WatchEvent, WatchPath, WatchSelector, WeakDelete, WeakIncrement, WeakPush,
+    WeakSet, WriteOutcome, Written, call, serve,
 };
 use std::time::Duration;
 
@@ -230,6 +230,14 @@ impl Handler for Fake {
             Request::WeakIncrement(increment) => {
                 self.increment = Some(increment);
                 responses.send(Response::Written(written())).await
+            }
+            Request::CreateInvite(create) => {
+                responses
+                    .send(Response::Invite(InviteCode {
+                        text: format!("lotus1weight{}", create.weight),
+                        expires_in_millis: create.ttl_millis,
+                    }))
+                    .await
             }
         }
     }

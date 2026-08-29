@@ -2116,6 +2116,7 @@ dependencies = [
  "chrono",
  "clap",
  "clap_complete",
+ "data-encoding",
  "dirs",
  "ed25519-zebra",
  "iroh",

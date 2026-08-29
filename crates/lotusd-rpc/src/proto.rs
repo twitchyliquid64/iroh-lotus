@@ -42,6 +42,36 @@ pub enum Request {
     WeakDelete(WeakDelete),
     /// See [`WeakIncrement`].
     WeakIncrement(WeakIncrement),
+    /// See [`CreateInvite`].
+    CreateInvite(CreateInvite),
+}
+
+/// Asks the daemon for an invite: one word a blank node joins the cluster
+/// by, with `lotusd bootstrap`. The daemon remembers the token in it until
+/// it is redeemed or `ttl_millis` pass, whichever comes first.
+///
+/// Answered with one [`InviteCode`]. Refused as [`FailureKind::Rejected`]
+/// when the daemon serves no peers or could not sign an admission alone.
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+pub struct CreateInvite {
+    /// The weight the joiner's key is trusted at.
+    #[cbor(key = 1)]
+    pub weight: u32,
+    /// How long the invite stays good, on the daemon's clock. The daemon
+    /// caps it.
+    #[cbor(key = 2)]
+    pub ttl_millis: u64,
+}
+
+/// Answers [`CreateInvite`].
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+pub struct InviteCode {
+    /// The invite, ready to paste into `lotusd bootstrap`.
+    #[cbor(key = 1)]
+    pub text: String,
+    /// How long it stays good from when it was issued, after any cap.
+    #[cbor(key = 2)]
+    pub expires_in_millis: u64,
 }
 
 /// Asks the daemon for the value a path addresses in a namespace, at the
@@ -577,6 +607,8 @@ pub enum Response {
     Value(ValueAt),
     /// Answers every weak write, [`WeakSet`] and its siblings.
     Written(Written),
+    /// Answers [`CreateInvite`].
+    Invite(InviteCode),
     /// Ends the stream: the request could not be served to completion.
     Failed(Failure),
 }
@@ -593,6 +625,7 @@ impl Response {
             Response::Watch(_) => "watch event",
             Response::Value(_) => "value",
             Response::Written(_) => "write outcome",
+            Response::Invite(_) => "invite",
             Response::Failed(_) => "failure",
         }
     }

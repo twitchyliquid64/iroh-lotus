@@ -15,8 +15,8 @@ use tokio::{fs, io::AsyncWriteExt};
 use wire::{
     Envelope, EnvelopeDigest, Key, KeyId, Msg, Signature,
     keys::{Ed25519PublicKey, Ed25519Signature, PublicKey},
-    msg::{FullCheckpoint, InitMsg, Namespace, NamespaceKey, Value},
-    subkey::SubkeyPath,
+    msg::{FullCheckpoint, InitMsg, Namespace, NamespaceKey, SetNamespaceKey, Value},
+    subkey::{Subkey, SubkeyPath},
 };
 
 use crate::{ChangeFilter, SubscriptionHandle, Subscriptions};
@@ -42,12 +42,7 @@ pub struct Core {
     chain: Chain,
     oldest: EnvelopeDigest,
     state_dir: PathBuf,
-    /// The one key this node signs ledger envelopes with.
-    signing_key: SigningKey,
-    /// The one key this node's iroh endpoint is identified by. Nothing to
-    /// do with the ledger: peers dial it, the trusted key set never names
-    /// it, and it signs no envelope.
-    iroh_secret: SecretKey,
+    keys: NodeKeys,
     subscriptions: Subscriptions,
 }
 
@@ -85,16 +80,14 @@ impl Core {
             .map_err(|_| InitError::OldestDigestLength(oldest_envelope.len()))?;
 
         let chain = Chain::open(&mut storage, oldest).map_err(InitError::Chain)?;
-        let signing_key = load_signing_key(&state_dir).await?;
-        let iroh_secret = load_iroh_secret(&state_dir).await?;
+        let keys = NodeKeys::load(&state_dir).await?;
 
         Ok(Self {
             storage,
             chain,
             oldest,
             state_dir,
-            signing_key,
-            iroh_secret,
+            keys,
             subscriptions: Subscriptions::default(),
         })
     }
@@ -110,19 +103,11 @@ impl Core {
             .await
             .map_err(|e| InitError::IO(e, "creating state-dir"))?;
 
-        if if_initialized == IfInitialized::Fail
-            && fs::try_exists(state_dir.join(OLDEST_ENVELOPE_FILENAME))
-                .await
-                .map_err(|e| InitError::IO(e, "reading oldest-envelope"))?
-        {
-            return Err(InitError::AlreadyInitialized(state_dir));
-        }
+        Self::refuse_initialized(&state_dir, if_initialized).await?;
 
-        let signing_key = gen_signing_key(&state_dir).await?;
-        let trusted = Key::new(public_key(&signing_key), ROOT_KEY_WEIGHT);
+        let keys = NodeKeys::generate(&state_dir).await?;
+        let trusted = Key::new(keys.public_key(), ROOT_KEY_WEIGHT);
         let key_id = trusted.id();
-        gen_iroh_secret(&state_dir).await?;
-        let iroh_secret = load_iroh_secret(&state_dir).await?;
 
         let envelope = Envelope::new(Msg::Init(InitMsg {
             state: FullCheckpoint {
@@ -146,7 +131,7 @@ impl Core {
                                 Value::Map(BTreeMap::from_iter([(
                                     "iroh".to_string(),
                                     Value::try_from(&iroh::EndpointAddr::from_parts(
-                                        iroh_secret.public(),
+                                        keys.iroh_secret().public(),
                                         BTreeSet::new(),
                                     ))
                                     .expect("infallible converting a valid EndpointAddr"),
@@ -157,7 +142,7 @@ impl Core {
                 ]),
             },
         }));
-        let envelope = sign(&signing_key, key_id, envelope).map_err(InitError::Wire)?;
+        let envelope = keys.sign(envelope).map_err(InitError::Wire)?;
 
         let mut storage =
             SqliteStorage::open(state_dir.join(SQLITE_DB_FILENAME)).map_err(InitError::Storage)?;
@@ -170,19 +155,79 @@ impl Core {
             .await
             .map_err(|e| InitError::IO(e, "writing oldest-envelope"))?;
 
-        // Read back rather than assembled from the keys just generated, so a
-        // core is the same whichever way it was reached.
-        let signing_key = load_signing_key(&state_dir).await?;
+        Ok(Self {
+            storage,
+            chain,
+            oldest,
+            state_dir,
+            keys,
+            subscriptions: Subscriptions::default(),
+        })
+    }
+
+    /// Lays down a node's keys in `state_dir` without a chain — the first
+    /// half of joining an existing cluster, done before the node has
+    /// anything to say to it. [`Core::join_in_state_dir`] is the second.
+    ///
+    /// Leaves the directory uninitialized: a join that fails after this
+    /// can be retried, and generates fresh keys when it is.
+    pub async fn prepare_join(
+        state_dir: PathBuf,
+        if_initialized: IfInitialized,
+    ) -> Result<NodeKeys, InitError> {
+        fs::create_dir_all(&state_dir)
+            .await
+            .map_err(|e| InitError::IO(e, "creating state-dir"))?;
+        Self::refuse_initialized(&state_dir, if_initialized).await?;
+
+        NodeKeys::generate(&state_dir).await
+    }
+
+    /// Opens a cluster in `state_dir` from `root`, the oldest envelope a
+    /// peer holds, and returns it standing there — the second half of a
+    /// join, for the keys [`Core::prepare_join`] left behind. Everything
+    /// after the root is pulled from the peer like any other sync.
+    ///
+    /// The root is taken on trust: whoever handed it over vouched for it,
+    /// and its digest is what they vouched by. Checking that the digest is
+    /// the one expected is the caller's job.
+    pub async fn join_in_state_dir(state_dir: PathBuf, root: Envelope) -> Result<Self, InitError> {
+        let keys = NodeKeys::load(&state_dir).await?;
+        let mut storage =
+            SqliteStorage::open(state_dir.join(SQLITE_DB_FILENAME)).map_err(InitError::Storage)?;
+        let chain = Chain::init(&mut storage, root).map_err(InitError::Chain)?;
+        let oldest = chain.root();
+
+        // Written only once the root is durable, so the file never names an
+        // envelope the store is missing.
+        fs::write(state_dir.join(OLDEST_ENVELOPE_FILENAME), oldest.as_bytes())
+            .await
+            .map_err(|e| InitError::IO(e, "writing oldest-envelope"))?;
 
         Ok(Self {
             storage,
             chain,
             oldest,
             state_dir,
-            signing_key,
-            iroh_secret,
+            keys,
             subscriptions: Subscriptions::default(),
         })
+    }
+
+    /// Fails when `state_dir` already holds a cluster and `if_initialized`
+    /// says to leave it alone.
+    async fn refuse_initialized(
+        state_dir: &Path,
+        if_initialized: IfInitialized,
+    ) -> Result<(), InitError> {
+        if if_initialized == IfInitialized::Fail
+            && fs::try_exists(state_dir.join(OLDEST_ENVELOPE_FILENAME))
+                .await
+                .map_err(|e| InitError::IO(e, "reading oldest-envelope"))?
+        {
+            return Err(InitError::AlreadyInitialized(state_dir.to_path_buf()));
+        }
+        Ok(())
     }
 
     /// The canonical head this core stands at.
@@ -244,8 +289,10 @@ impl Core {
         build: impl FnOnce(EnvelopeDigest) -> Msg,
     ) -> Result<(EnvelopeDigest, Insert), ChainError> {
         let msg = build(self.chain.head());
-        let envelope =
-            sign(&self.signing_key, self.key_id(), Envelope::new(msg)).map_err(ChainError::Wire)?;
+        let envelope = self
+            .keys
+            .sign(Envelope::new(msg))
+            .map_err(ChainError::Wire)?;
         let digest = envelope.digest().map_err(ChainError::Wire)?;
         let insert = self.insert([envelope])?;
         Ok((digest, insert))
@@ -354,19 +401,24 @@ impl Core {
             .collect()
     }
 
+    /// This node's keys: the one it signs with and the one it is dialled by.
+    pub fn keys(&self) -> &NodeKeys {
+        &self.keys
+    }
+
     /// The key this node signs ledger envelopes with.
     pub fn signing_key(&self) -> &SigningKey {
-        &self.signing_key
+        self.keys.signing_key()
     }
 
     /// The secret key this node's iroh endpoint is identified by.
     pub fn iroh_secret(&self) -> &SecretKey {
-        &self.iroh_secret
+        self.keys.iroh_secret()
     }
 
     /// The id the ledger's trusted key set refers to this node's key by.
     pub fn key_id(&self) -> KeyId {
-        public_key(&self.signing_key).id()
+        self.keys.key_id()
     }
 
     /// How to reach each node the cluster lists, keyed by node id. Reads
@@ -376,6 +428,87 @@ impl Core {
             .ledger()
             .peer_addresses(&self.storage)
             .map_err(ChainError::from)
+    }
+
+    /// The envelope this node's chain is rooted at — what a joining node
+    /// is handed to build on.
+    pub fn root_envelope(&self) -> Result<Envelope, storage::sqlite::Error> {
+        Ok(self
+            .storage
+            .envelope(self.oldest)?
+            .expect("the oldest-envelope file names an envelope the store holds"))
+    }
+
+    /// The keys the ledger trusts at the current head.
+    pub fn trusted_keys(&self) -> Result<BTreeMap<KeyId, Key>, ChainError> {
+        self.chain
+            .ledger()
+            .trusted_keys(&self.storage)
+            .map_err(ChainError::from)
+    }
+
+    /// Returns true if this nodes' key is sufficient to sign an envelope that will
+    /// get accepted by the ledger.
+    pub fn signs_alone(&self) -> Result<Result<(), CannotSignAlone>, ChainError> {
+        let ledger = self.chain.ledger();
+        let weight = self
+            .trusted_keys()?
+            .get(&self.key_id())
+            .map_or(0, Key::weight);
+        let min_weight = ledger.min_envelope_weight(&self.storage)?;
+        let min_signatures = ledger.min_envelope_signatures(&self.storage)?;
+        Ok(if weight < min_weight {
+            Err(CannotSignAlone::Weight {
+                own: weight,
+                min: min_weight,
+            })
+        } else if min_signatures > 1 {
+            Err(CannotSignAlone::Signatures {
+                min: min_signatures,
+            })
+        } else {
+            Ok(())
+        })
+    }
+
+    /// Admits a node to the cluster: trusts `key` under its own id, then
+    /// lists `addr` under that id in `cluster-nodes`, each as one envelope
+    /// signed by this node. Returns the digest of the listing — the one
+    /// the joiner watches for, since it lands last.
+    ///
+    /// Two writes rather than one: a message touches one namespace.
+    /// Trusting first, so an envelope the new node signs in between
+    /// already verifies.
+    pub fn admit(
+        &mut self,
+        key: Key,
+        addr: &iroh::EndpointAddr,
+    ) -> Result<EnvelopeDigest, AdmitError> {
+        let id = key.id().to_hex().as_ref().to_owned();
+        let entry = |namespace: &str, value: Value| {
+            let key = NamespaceKey::try_new(namespace).expect("the reserved key is static");
+            let path = SubkeyPath::try_new(vec![Subkey::Key(id.clone())])
+                .expect("one segment is not empty");
+            move |prev| {
+                Msg::SetNamespaceKey(SetNamespaceKey {
+                    prev,
+                    key,
+                    path,
+                    value: Some(value),
+                })
+            }
+        };
+        let listing = Value::Map(BTreeMap::from_iter([(
+            "iroh".to_owned(),
+            Value::try_from(addr).map_err(AdmitError::Addr)?,
+        )]));
+
+        self.sign_write(entry(TRUSTED_KEYS_KEY, Value::Key(key)))
+            .map_err(AdmitError::Chain)?;
+        let (digest, _) = self
+            .sign_write(entry(CLUSTER_NODES_KEY, listing))
+            .map_err(AdmitError::Chain)?;
+        Ok(digest)
     }
 
     /// Answers one sync-machine query against this node's chain — the
@@ -469,11 +602,6 @@ impl Core {
     }
 }
 
-/// The public half of `key`, in the form the ledger's key set holds.
-fn public_key(key: &SigningKey) -> PublicKey {
-    PublicKey::Ed25519(Ed25519PublicKey::from_bytes(key.verification_key().into()))
-}
-
 /// Loads the node's ledger signing key from `state_dir`.
 async fn load_signing_key(state_dir: &Path) -> Result<SigningKey, InitError> {
     load_secret(
@@ -510,45 +638,113 @@ async fn load_secret(
     <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| wrong_length(path, bytes.len()))
 }
 
-/// Attaches `key_id`'s signature over `envelope` to it.
-///
-/// Every part of the envelope but its signatures must already be in place —
-/// timestamps included — since the digest signed here covers them.
-fn sign(key: &SigningKey, key_id: KeyId, envelope: Envelope) -> Result<Envelope, wire::Error> {
-    let digest = envelope.signature_digest()?;
-    let signature = Signature::Ed25519(Ed25519Signature::from_bytes(
-        key.sign(digest.as_bytes()).to_bytes(),
-    ));
-    Ok(envelope.with_signature(key_id, signature))
+/// The two keys that make a node: what [`Core`] runs on, and what
+/// [`Core::prepare_join`] lays down before there is a chain to run.
+#[derive(Debug)]
+pub struct NodeKeys {
+    /// The one key this node signs ledger envelopes with.
+    signing_key: SigningKey,
+    /// The one key this node's iroh endpoint is identified by. Nothing to
+    /// do with the ledger: peers dial it, the trusted key set never names
+    /// it, and it signs no envelope.
+    iroh_secret: SecretKey,
 }
 
-/// Generates this node's ledger signing key and saves it under `state_dir`,
-/// replacing whatever key was there: a node has exactly one.
-async fn gen_signing_key(state_dir: &Path) -> Result<SigningKey, InitError> {
-    let secret = draw_secret()?;
-    write_secret(
-        &state_dir.join(SIGNING_KEY_FILENAME),
-        &secret,
-        ("creating signing-key", "saving signing-key"),
-    )
-    .await?;
+impl NodeKeys {
+    /// Reads both keys from `state_dir`.
+    async fn load(state_dir: &Path) -> Result<Self, InitError> {
+        Ok(Self {
+            signing_key: load_signing_key(state_dir).await?,
+            iroh_secret: load_iroh_secret(state_dir).await?,
+        })
+    }
 
-    // Not `SigningKey::new`: ed25519-zebra takes rand_core 0.6's traits while
-    // the workspace is on rand 0.10, so no RNG here satisfies it. `new` only
-    // fills 32 bytes and calls `from`, which is what this does.
-    Ok(SigningKey::from(secret))
+    /// Draws both keys fresh and saves them under `state_dir`, replacing
+    /// whatever was there: a node has exactly one of each. Returned as
+    /// read back from disk, so a core is the same whichever way it was
+    /// reached.
+    ///
+    /// Not `SigningKey::new`: ed25519-zebra takes rand_core 0.6's traits
+    /// while the workspace is on rand 0.10, so no RNG here satisfies it.
+    /// `new` only fills 32 bytes and calls `from`, which `load` does.
+    async fn generate(state_dir: &Path) -> Result<Self, InitError> {
+        write_secret(
+            &state_dir.join(SIGNING_KEY_FILENAME),
+            &draw_secret()?,
+            ("creating signing-key", "saving signing-key"),
+        )
+        .await?;
+        write_secret(
+            &state_dir.join(IROH_SECRET_FILENAME),
+            &draw_secret()?,
+            ("creating iroh-secret", "saving iroh-secret"),
+        )
+        .await?;
+        Self::load(state_dir).await
+    }
+
+    /// The key this node signs ledger envelopes with.
+    pub fn signing_key(&self) -> &SigningKey {
+        &self.signing_key
+    }
+
+    /// The public half of the signing key, in the form the ledger's key
+    /// set holds.
+    pub fn public_key(&self) -> PublicKey {
+        PublicKey::Ed25519(Ed25519PublicKey::from_bytes(
+            self.signing_key.verification_key().into(),
+        ))
+    }
+
+    /// The id the ledger refers to this node by.
+    pub fn key_id(&self) -> KeyId {
+        self.public_key().id()
+    }
+
+    /// The secret the node's iroh endpoint is identified by.
+    pub fn iroh_secret(&self) -> &SecretKey {
+        &self.iroh_secret
+    }
+
+    /// Attaches this node's signature over `envelope` to it.
+    ///
+    /// Every part of the envelope but its signatures must already be in
+    /// place — timestamps included — since the digest signed here covers
+    /// them.
+    fn sign(&self, envelope: Envelope) -> Result<Envelope, wire::Error> {
+        let digest = envelope.signature_digest()?;
+        let signature = Signature::Ed25519(Ed25519Signature::from_bytes(
+            self.signing_key.sign(digest.as_bytes()).to_bytes(),
+        ));
+        Ok(envelope.with_signature(self.key_id(), signature))
+    }
 }
 
-/// Generates this node's iroh secret key and saves it under `state_dir`,
-/// replacing whatever key was there: a node has exactly one, and its
-/// endpoint is that key.
-async fn gen_iroh_secret(state_dir: &Path) -> Result<(), InitError> {
-    write_secret(
-        &state_dir.join(IROH_SECRET_FILENAME),
-        &draw_secret()?,
-        ("creating iroh-secret", "saving iroh-secret"),
-    )
-    .await
+/// Why a node could not be admitted.
+#[derive(Debug, thiserror::Error)]
+pub enum AdmitError {
+    #[error("the endpoint address has no ledger encoding")]
+    Addr(#[source] wire::msg::AddrError),
+    #[error("writing the admission")]
+    Chain(#[source] ChainError),
+    #[error("the server is shutting down")]
+    ServerGone,
+}
+
+/// Why an envelope signed by this node alone would not apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum CannotSignAlone {
+    #[error("this node's key weighs {own}, below the ledger's floor of {min}")]
+    Weight { own: u32, min: u32 },
+    #[error("the ledger requires {min} signatures per envelope")]
+    Signatures { min: u32 },
+}
+
+/// Draws 32 bytes for an invite token, from the same source as a key.
+pub(crate) fn draw_token() -> Result<[u8; 32], rand::rngs::SysError> {
+    let mut token = [0u8; 32];
+    SysRng.try_fill_bytes(&mut token)?;
+    Ok(token)
 }
 
 /// Draws 32 bytes of key material.
@@ -616,4 +812,51 @@ pub enum InitError {
     Storage(storage::sqlite::Error),
     /// Error when replaying the chain back to head.
     Chain(state::Error<storage::sqlite::Error>),
+}
+
+impl fmt::Display for InitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            InitError::IO(_, what) => write!(f, "{what}"),
+            InitError::AlreadyInitialized(dir) => {
+                write!(f, "{} already holds a cluster", dir.display())
+            }
+            InitError::Entropy(_) => f.write_str("the OS could not supply entropy for a key"),
+            InitError::Wire(_) => f.write_str("encoding the genesis envelope"),
+            InitError::SigningKeyLength(path, len) => {
+                write!(f, "{} holds {len} bytes, not a 32-byte key", path.display())
+            }
+            InitError::IrohSecretLength(path, len) => {
+                write!(
+                    f,
+                    "{} holds {len} bytes, not a 32-byte secret",
+                    path.display()
+                )
+            }
+            InitError::OldestDigestLength(len) => {
+                write!(
+                    f,
+                    "the oldest-envelope file holds {len} bytes, not a 32-byte digest"
+                )
+            }
+            InitError::Storage(_) => f.write_str("opening the store"),
+            InitError::Chain(_) => f.write_str("opening the chain"),
+        }
+    }
+}
+
+impl core::error::Error for InitError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            InitError::IO(err, _) => Some(err),
+            InitError::Entropy(err) => Some(err),
+            InitError::Wire(err) => Some(err),
+            InitError::Storage(err) => Some(err),
+            InitError::Chain(err) => Some(err),
+            InitError::AlreadyInitialized(_)
+            | InitError::SigningKeyLength(..)
+            | InitError::IrohSecretLength(..)
+            | InitError::OldestDigestLength(_) => None,
+        }
+    }
 }

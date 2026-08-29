@@ -7,18 +7,20 @@ use tokio::sync::oneshot;
 
 mod core;
 pub use crate::core::{
-    ChainError, Core, IROH_SECRET_FILENAME, IfInitialized, InitError, OLDEST_ENVELOPE_FILENAME,
-    SIGNING_KEY_FILENAME, SQLITE_DB_FILENAME,
+    AdmitError, CannotSignAlone, ChainError, Core, IROH_SECRET_FILENAME, IfInitialized, InitError,
+    NodeKeys, OLDEST_ENVELOPE_FILENAME, SIGNING_KEY_FILENAME, SQLITE_DB_FILENAME,
 };
 
 mod server;
-pub use server::{Identity, RequestError, Server, ServerHandle, WeakWrite};
+pub use server::{Identity, Issued, RequestError, Server, ServerHandle, WeakWrite};
 
 mod subscribe;
 pub use subscribe::{
     ChangeFilter, ChangeNotification, ChangeSelector, SubscriptionHandle, Subscriptions,
 };
 
+pub mod bootstrap;
+pub mod invite;
 pub mod peer_egress;
 pub mod peer_ingress;
 pub mod peer_link;

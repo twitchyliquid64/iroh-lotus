@@ -27,7 +27,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
-use crate::{Responder, ServerHandle, peer_link::Link, server::WeakServerHandle};
+use crate::{Responder, ServerHandle, bootstrap, peer_link::Link, server::WeakServerHandle};
 
 /// How many peer connections are served at once; further attempts are
 /// refused at the handshake.
@@ -46,16 +46,19 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 pub enum Protocol {
     /// A peer pulling our canonical path: the [`sync`] crate's protocol.
     Sync,
+    /// A blank node joining by invite: [`bootstrap`](crate::bootstrap).
+    Bootstrap,
 }
 
 impl Protocol {
     /// Every protocol this daemon accepts.
-    pub const ALL: [Protocol; 1] = [Protocol::Sync];
+    pub const ALL: [Protocol; 2] = [Protocol::Sync, Protocol::Bootstrap];
 
     /// The ALPN identifying this protocol at the handshake.
     pub fn alpn(self) -> &'static [u8] {
         match self {
             Protocol::Sync => sync::ALPN,
+            Protocol::Bootstrap => bootstrap::ALPN,
         }
     }
 
@@ -262,6 +265,7 @@ impl PeerIngress {
         };
         match protocol {
             Protocol::Sync => Self::serve_sync(server, conn).await,
+            Protocol::Bootstrap => bootstrap::serve(server, conn).await,
         }
     }
 

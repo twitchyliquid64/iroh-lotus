@@ -11,6 +11,7 @@ blake3.workspace = true
 cbor2.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
+data-encoding.workspace = true
 dirs.workspace = true
 ed25519-zebra.workspace = true
 iroh.workspace = true

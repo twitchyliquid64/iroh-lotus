@@ -2,9 +2,11 @@
 //!
 //! The [`sync`] crate's machines emit effects; this module is the thin
 //! async edge that resolves them: `Send` goes out the transport through
-//! the framing codec, `Ask` and `Ingest` round-trip through the server
-//! actor via a [`ServerHandle`], and the next frame is read only once the
-//! effect queue is drained — the driver contract the machines panic on.
+//! the framing codec, `Ask` and `Ingest` round-trip through whatever
+//! [`SyncCore`] the session runs against — the server actor via a
+//! [`ServerHandle`] in the daemon, a bare [`Core`] while bootstrapping —
+//! and the next frame is read only once the effect queue is drained: the
+//! driver contract the machines panic on.
 //!
 //! The transport is anything `AsyncRead + AsyncWrite`: a duplex pipe in
 //! tests, an iroh stream between machines later. Time lives here too — a
@@ -22,8 +24,9 @@ use tokio_util::{
     bytes::BytesMut,
     codec::{Decoder, Encoder},
 };
+use wire::{Envelope, EnvelopeDigest};
 
-use crate::{ChainError, RequestError, ServerHandle};
+use crate::{ChainError, Core, RequestError, ServerHandle};
 
 /// How long a quiet peer gets between frames before the session fails.
 pub const FRAME_TIMEOUT: Duration = Duration::from_secs(30);
@@ -61,42 +64,96 @@ pub enum SyncError {
     TimedOut,
 }
 
+/// The chain a session runs against: what resolves its `Ask` and
+/// `Ingest` effects.
+///
+/// Implemented on `&ServerHandle` — every session in the running daemon
+/// goes through the mainloop — and on `&mut Core`, for a node with no
+/// server yet: bootstrap pulls the chain before there is anything to
+/// serve.
+pub trait SyncCore {
+    /// The canonical head this side stands at.
+    fn head(&mut self) -> impl Future<Output = Result<EnvelopeDigest, SyncError>>;
+
+    /// Answers one machine query against the chain.
+    fn answer(
+        &mut self,
+        query: sync::Query,
+    ) -> impl Future<Output = Result<sync::Answer, SyncError>>;
+
+    /// Inserts a parent-first run through the chain.
+    fn ingest(&mut self, run: Vec<Envelope>) -> impl Future<Output = Result<(), SyncError>>;
+}
+
+impl SyncCore for &ServerHandle {
+    async fn head(&mut self) -> Result<EnvelopeDigest, SyncError> {
+        ServerHandle::head(self)
+            .await
+            .map_err(|()| SyncError::ServerGone)
+    }
+
+    async fn answer(&mut self, query: sync::Query) -> Result<sync::Answer, SyncError> {
+        self.sync_answer(query)
+            .await
+            .map_err(|err| err.classify(SyncError::Answer))
+    }
+
+    async fn ingest(&mut self, run: Vec<Envelope>) -> Result<(), SyncError> {
+        self.insert(run)
+            .await
+            .map(|_| ())
+            .map_err(|err| err.classify(SyncError::Ingest))
+    }
+}
+
+impl SyncCore for &mut Core {
+    async fn head(&mut self) -> Result<EnvelopeDigest, SyncError> {
+        Ok(Core::head(self))
+    }
+
+    async fn answer(&mut self, query: sync::Query) -> Result<sync::Answer, SyncError> {
+        self.sync_answer(query)
+            .map_err(|err| SyncError::Answer(ChainError::Storage(err)))
+    }
+
+    async fn ingest(&mut self, run: Vec<Envelope>) -> Result<(), SyncError> {
+        self.insert(run).map(|_| ()).map_err(SyncError::Ingest)
+    }
+}
+
 /// Pulls this node up to date from the peer on `transport`.
-pub async fn pull<T>(transport: T, handle: &ServerHandle) -> Result<PullOutcome, SyncError>
+pub async fn pull<T, C>(transport: T, mut core: C) -> Result<PullOutcome, SyncError>
 where
     T: AsyncRead + AsyncWrite + Unpin,
+    C: SyncCore,
 {
-    let head = handle.head().await.map_err(|()| SyncError::ServerGone)?;
+    let head = core.head().await?;
     let (mut puller, opening) = Puller::new(head);
-    drive(
-        transport,
-        handle,
-        |input| puller.handle(input),
-        Some(opening),
-    )
-    .await
+    drive(transport, core, |input| puller.handle(input), Some(opening)).await
 }
 
 /// Serves the pull of the peer on `transport`.
-pub async fn serve<T>(transport: T, handle: &ServerHandle) -> Result<ServeOutcome, SyncError>
+pub async fn serve<T, C>(transport: T, mut core: C) -> Result<ServeOutcome, SyncError>
 where
     T: AsyncRead + AsyncWrite + Unpin,
+    C: SyncCore,
 {
-    let head = handle.head().await.map_err(|()| SyncError::ServerGone)?;
+    let head = core.head().await?;
     let mut server = sync::Server::new(head);
-    drive(transport, handle, |input| server.handle(input), None).await
+    drive(transport, core, |input| server.handle(input), None).await
 }
 
 /// The effect loop both sessions share: resolve every pending effect in
 /// order, and only then read the peer's next frame.
-async fn drive<T, O>(
+async fn drive<T, C, O>(
     mut transport: T,
-    handle: &ServerHandle,
+    mut core: C,
     mut machine: impl FnMut(Input) -> Vec<Effect<O>>,
     opening: Option<Effect<O>>,
 ) -> Result<O, SyncError>
 where
     T: AsyncRead + AsyncWrite + Unpin,
+    C: SyncCore,
 {
     let mut codec = Codec;
     let mut inbound = BytesMut::new();
@@ -129,17 +186,11 @@ where
                 transport.flush().await.map_err(sync::Error::Io)?;
             }
             Effect::Ask(query) => {
-                let answer = handle
-                    .sync_answer(query)
-                    .await
-                    .map_err(|err| err.classify(SyncError::Answer))?;
+                let answer = core.answer(query).await?;
                 effects.extend(machine(Input::Answer(answer)));
             }
             Effect::Ingest(run) => {
-                handle
-                    .insert(run)
-                    .await
-                    .map_err(|err| err.classify(SyncError::Ingest))?;
+                core.ingest(run).await?;
                 effects.extend(machine(Input::Ingested));
             }
             Effect::Done(outcome) => return Ok(outcome),
