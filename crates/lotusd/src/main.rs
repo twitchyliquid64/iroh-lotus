@@ -2,7 +2,8 @@ use std::{path::PathBuf, process::ExitCode};
 
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
-use lotusd::{Core, IfInitialized, Server};
+use iroh::{Endpoint, endpoint::presets};
+use lotusd::{Core, IfInitialized, Server, peer_ingress::Protocol};
 use render::{ColorChoice, Entry, Render};
 use tokio::net::UnixListener;
 use tokio::runtime::Builder;
@@ -206,8 +207,16 @@ async fn async_main() -> Result<(), MainError> {
         tracing::info!("Node ID:     {}", core.key_id().to_hex().as_ref());
         tracing::info!("Endpoint ID: {}", core.iroh_secret().public().to_z32());
 
+        let endpoint = Endpoint::builder(presets::N0)
+            .secret_key(core.iroh_secret().clone())
+            .alpns(Protocol::alpns())
+            .bind()
+            .await
+            .map_err(MainError::Bind)?;
+
         let (serv, join_hnd) = Server::new(core, listener)
             .map_err(MainError::Init)?
+            .with_endpoint(endpoint)
             .run()
             .await;
 
@@ -226,6 +235,8 @@ async fn async_main() -> Result<(), MainError> {
 pub enum MainError {
     IO(std::io::Error, &'static str),
     Init(lotusd::InitError),
+    /// The iroh endpoint could not be bound.
+    Bind(iroh::endpoint::BindError),
     /// The envelope log could not be read.
     Storage(storage::sqlite::Error),
     Other(String),

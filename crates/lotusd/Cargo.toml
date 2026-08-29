@@ -35,4 +35,6 @@ wire.workspace = true
 
 [dev-dependencies]
 chrono.workspace = true
+# In-memory iroh transport for multi-node tests.
+iroh = { workspace = true, features = ["test-utils", "unstable-custom-transports"] }
 tempfile.workspace = true

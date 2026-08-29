@@ -12,13 +12,16 @@ pub use crate::core::{
 };
 
 mod server;
-pub use server::{RequestError, Server, ServerHandle};
+pub use server::{Identity, RequestError, Server, ServerHandle};
 
 mod subscribe;
 pub use subscribe::{
     ChangeFilter, ChangeNotification, ChangeSelector, SubscriptionHandle, Subscriptions,
 };
 
+pub mod peer_egress;
+pub mod peer_ingress;
+pub mod peer_link;
 pub mod sync_driver;
 
 /// The version this daemon reports over the control socket.

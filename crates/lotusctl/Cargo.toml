@@ -22,6 +22,8 @@ wire.workspace = true
 # The end-to-end tests drive this CLI against a real daemon.
 [dev-dependencies]
 chrono.workspace = true
+# In-memory iroh transport, so status can be read off a node with peers.
+iroh = { workspace = true, features = ["test-utils", "unstable-custom-transports"] }
 lotusd.workspace = true
 state.workspace = true
 tempfile.workspace = true

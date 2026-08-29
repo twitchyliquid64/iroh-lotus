@@ -20,9 +20,10 @@ pub use frame::MAX_FRAME_LEN;
 
 mod proto;
 pub use proto::{
-    ChainRange, ChainWalk, Changed, EnvelopeFrame, EnvelopeSelector, Failure, FailureKind,
-    GetChainRange, GetEnvelopes, GetVersion, NamespaceChange, Request, Response, Verification,
-    Watch, WatchEvent, WatchPath, WatchSelector,
+    Attempt, ChainRange, ChainWalk, Changed, Connected, EndpointInfo, EnvelopeFrame,
+    EnvelopeSelector, Failure, FailureKind, GetChainRange, GetEnvelopes, GetStatus, GetVersion,
+    NamespaceChange, NodeStatus, PeerInfo, PeerState, Request, Response, Verification, Watch,
+    WatchEvent, WatchPath, WatchSelector,
 };
 
 mod method;

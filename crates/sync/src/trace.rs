@@ -59,6 +59,7 @@ impl fmt::Display for MessageSummary<'_> {
                 write!(f, "Envelopes({})", envelopes.batch.len())
             }
             Message::CaughtUp(_) => f.write_str("CaughtUp"),
+            Message::Announce(announce) => write!(f, "Announce({})", Short(announce.head)),
         }
     }
 }

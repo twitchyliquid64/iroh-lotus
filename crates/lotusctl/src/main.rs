@@ -3,8 +3,8 @@ use std::{collections::BTreeMap, fmt, path::PathBuf, process::ExitCode, time::Du
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use lotusd_rpc::{
-    Call, ChainWalk, EnvelopeFrame, GetChainRange, GetEnvelopes, GetVersion, NamespaceChange,
-    Watch, WatchEvent, WatchSelector, call,
+    Call, ChainWalk, EnvelopeFrame, GetChainRange, GetEnvelopes, GetStatus, GetVersion,
+    NamespaceChange, NodeStatus, Watch, WatchEvent, WatchSelector, call,
 };
 use render::{ColorChoice, Entry, Render};
 use tokio::net::UnixStream;
@@ -36,7 +36,8 @@ enum Command {
     Chain(ChainCommand),
     /// Prints the envelopes named, wherever they sit in the daemon's log
     Show(ShowCommand),
-    /// Reports the daemon's version and how much of the chain it holds
+    /// Reports who the daemon is, how much of the chain it holds, and how
+    /// it stands with its peers
     Status,
     /// Reports this CLI's version alongside the daemon's
     Version,
@@ -232,14 +233,6 @@ impl GlobalArgs {
     }
 }
 
-/// What `status` reports.
-#[derive(Debug, serde::Serialize)]
-struct Status {
-    version: String,
-    root: EnvelopeDigest,
-    head: EnvelopeDigest,
-}
-
 /// What `version` reports.
 #[derive(Debug, serde::Serialize)]
 struct Versions {
@@ -405,27 +398,12 @@ async fn async_main() -> Result<(), MainError> {
         }
         Command::Status => {
             let path = cli.global_args.local_sock_path()?;
-
-            // One request per connection, so each method gets its own.
-            let version = call(connect(&path).await?, GetVersion {})
+            let status = call(connect(&path).await?, GetStatus {})
                 .await
                 .map_err(MainError::Rpc)?;
-            let range = call(connect(&path).await?, GetChainRange {})
-                .await
-                .map_err(MainError::Rpc)?;
-
-            let status = Status {
-                version,
-                root: range.root,
-                head: range.head,
-            };
 
             match cli.global_args.format {
-                Format::Text => {
-                    println!("version  {}", status.version);
-                    println!("root     {}", status.root.to_hex().as_ref());
-                    println!("head     {}", status.head.to_hex().as_ref());
-                }
+                Format::Text => print!("{}", StatusText(&status)),
                 Format::Json => print_json(&status)?,
             }
         }
@@ -485,6 +463,58 @@ async fn async_main() -> Result<(), MainError> {
     }
 
     Ok(())
+}
+
+/// `status` as labelled lines.
+///
+/// Ids are printed whole: an operator copies them into a ledger entry or
+/// another node's arguments, and a shortened id is one they cannot.
+struct StatusText<'a>(&'a NodeStatus);
+
+impl fmt::Display for StatusText<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let status = self.0;
+        writeln!(f, "version    {}", status.version)?;
+        writeln!(f, "node id    {}", status.node.to_hex().as_ref())?;
+        match &status.endpoint {
+            Some(endpoint) => {
+                writeln!(f, "endpoint   {}", endpoint.id)?;
+                match endpoint.addrs.as_slice() {
+                    [] => writeln!(f, "addresses  none known yet")?,
+                    [first, rest @ ..] => {
+                        writeln!(f, "addresses  {first}")?;
+                        for addr in rest {
+                            writeln!(f, "           {addr}")?;
+                        }
+                    }
+                }
+            }
+            None => writeln!(f, "endpoint   none (not serving peers)")?,
+        }
+        writeln!(f, "root       {}", status.chain.root.to_hex().as_ref())?;
+        writeln!(f, "head       {}", status.chain.head.to_hex().as_ref())?;
+        writeln!(
+            f,
+            "inbound    {} {}",
+            status.inbound,
+            plural(status.inbound as usize, "connection", "connections")
+        )?;
+        writeln!(f, "peers      {} kept", status.peers.len())?;
+        for peer in &status.peers {
+            writeln!(
+                f,
+                "           {}  {}  {}",
+                peer.node.to_hex().as_ref(),
+                peer.endpoint,
+                peer.state
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn plural(n: usize, one: &'static str, many: &'static str) -> &'static str {
+    if n == 1 { one } else { many }
 }
 
 /// Fetches whatever `request` selects, reading the stream to its end.

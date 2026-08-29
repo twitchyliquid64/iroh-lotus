@@ -141,7 +141,9 @@ async fn chain_prints_every_envelope_the_daemon_holds() {
 async fn chain_shows_when_the_daemon_stored_each_envelope() {
     let dir = TempDir::new().unwrap();
     let (_digests, _handle, _join) = chain_of_three(&dir).await;
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    // Local, as the renderer prints it: a UTC date is tomorrow's for part of
+    // every evening west of Greenwich.
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
     let text = output(&dir, &["chain"]).await;
 

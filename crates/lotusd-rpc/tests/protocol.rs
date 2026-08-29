@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 use lotusd_rpc::{
     Call, ChainRange, ChainWalk, Changed, EnvelopeFrame, EnvelopeSelector, Error, Failure,
     FailureKind, GetChainRange, GetEnvelopes, GetVersion, Handler, MAX_FRAME_LEN, NamespaceChange,
-    Request, Response, Responses, Verification, Watch, WatchEvent, WatchPath, WatchSelector, call,
-    serve,
+    NodeStatus, Request, Response, Responses, Verification, Watch, WatchEvent, WatchPath,
+    WatchSelector, call, serve,
 };
 use std::time::Duration;
 
@@ -104,6 +104,18 @@ impl Handler for Fake {
                     responses.send(Response::ChainRange(range())).await?;
                 }
                 Ok(())
+            }
+            Request::GetStatus(_) => {
+                responses
+                    .send(Response::Status(NodeStatus {
+                        version: "1.2.3".to_owned(),
+                        node: KeyId::from_bytes([7; 32]),
+                        endpoint: None,
+                        chain: range(),
+                        peers: Vec::new(),
+                        inbound: 0,
+                    }))
+                    .await
             }
             Request::GetEnvelopes(get) => {
                 self.selected = Some(get.select.clone());

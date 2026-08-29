@@ -4,6 +4,9 @@
 use core::fmt;
 use std::ops::ControlFlow;
 
+use std::collections::BTreeMap;
+
+use iroh::{Endpoint, EndpointAddr};
 use lotusd_rpc as rpc;
 use state::Insert;
 use storage::{LogEntry, StoredAt};
@@ -12,11 +15,13 @@ use tokio::{
     sync::{mpsc, oneshot},
     task::JoinHandle,
 };
-use wire::{Envelope, EnvelopeDigest};
+use wire::{Envelope, EnvelopeDigest, KeyId};
 
 use crate::{
     ChainError, ChangeFilter, ChangeSelector, Core, InitError, Responder, SubscriptionHandle,
     VERSION,
+    peer_egress::{PeerEgress, PeerEgressHandle, PeerState, PeerStatus},
+    peer_ingress::{PeerIngress, PeerIngressHandle},
 };
 
 #[derive(Debug)]
@@ -36,6 +41,20 @@ enum ServerMsg {
         EnvelopeDigest,
         Responder<Option<SubscriptionHandle>, ChainError>,
     ),
+    PeerConnections(Responder<usize, ()>),
+    PeerAddresses(Responder<BTreeMap<KeyId, EndpointAddr>, ChainError>),
+    Peers(Responder<Vec<PeerStatus>, ()>),
+    Identity(Responder<Identity, ()>),
+}
+
+/// Who a running node is: its id in the cluster, and the endpoint it
+/// serves peers on, if any.
+#[derive(Debug, Clone)]
+pub struct Identity {
+    pub node: KeyId,
+    /// The endpoint's id and the addresses it is reachable at right now —
+    /// what an operator compares against the ledger's entry for this node.
+    pub endpoint: Option<EndpointAddr>,
 }
 
 /// The server actor, encapsulates all running/server state.
@@ -43,25 +62,75 @@ enum ServerMsg {
 pub struct Server {
     core: Core,
     local_sock: UnixListener,
+    /// Bound by the caller, so a test can wire several nodes together
+    /// however it likes. Without one the node has no peers: local control
+    /// still works, nothing is served over the network.
+    endpoint: Option<Endpoint>,
+    peer_connection_limit: Option<usize>,
 }
 
 impl Server {
     pub fn new(core: Core, local_sock: UnixListener) -> Result<Self, InitError> {
-        Ok(Self { core, local_sock })
+        Ok(Self {
+            core,
+            local_sock,
+            endpoint: None,
+            peer_connection_limit: None,
+        })
+    }
+
+    /// Serves peers on `endpoint`. It must have been bound with the ALPNs
+    /// [`Protocol::alpns`] lists, or peers speaking them will be refused
+    /// at the handshake.
+    ///
+    /// [`Protocol::alpns`]: crate::peer_ingress::Protocol::alpns
+    pub fn with_endpoint(mut self, endpoint: Endpoint) -> Self {
+        self.endpoint = Some(endpoint);
+        self
+    }
+
+    /// Caps how many peer connections are served at once, overriding
+    /// [`DEFAULT_CONNECTION_LIMIT`](crate::peer_ingress::DEFAULT_CONNECTION_LIMIT).
+    pub fn with_peer_connection_limit(mut self, limit: usize) -> Self {
+        self.peer_connection_limit = Some(limit);
+        self
     }
 
     /// Consumes the initialized server and starts an async task for its mainloop, returning
     /// a handle that can be used to query and control the server.
+    ///
+    /// The peer ingress and egress are spawned here as the mainloop's
+    /// children, and are brought down before the mainloop returns by
+    /// either route out of it.
     pub async fn run(self) -> (ServerHandle, JoinHandle<()>) {
         let Self {
             mut core,
             local_sock,
+            endpoint,
+            peer_connection_limit,
         } = self;
         let (hnd_tx, mut hnd_recv) = mpsc::channel(8);
-        let weak = hnd_tx.downgrade();
         let handle = ServerHandle(hnd_tx);
+        let weak = handle.downgrade();
+
+        let ingress = endpoint.clone().map(|ep| {
+            let ingress = PeerIngress::new(ep, weak.clone());
+            match peer_connection_limit {
+                Some(limit) => ingress.with_connection_limit(limit),
+                None => ingress,
+            }
+            .spawn()
+        });
+        let egress = endpoint
+            .clone()
+            .map(|ep| PeerEgress::new(ep, weak.clone(), core.key_id()).spawn());
 
         let join_hnd = tokio::spawn(async move {
+            let mut peers = Peers {
+                ingress,
+                egress,
+                endpoint,
+            };
             loop {
                 tokio::select! {
                     // Control messages win over new connections, so a shutdown is not held
@@ -70,9 +139,12 @@ impl Server {
 
                     msg = hnd_recv.recv() => {
                         // Every handle dropped: nothing can drive us any more.
-                        let Some(msg) = msg else { return };
-                        if let ControlFlow::Break(r) = Self::handle_message(&mut core, msg).await {
+                        let Some(msg) = msg else {
+                            return peers.close().await;
+                        };
+                        if let ControlFlow::Break(r) = Self::handle_message(&mut core, &peers, msg).await {
                             // Shutdown, r is to respond when we are done shutting down.
+                            peers.close().await;
                             r.respond(Ok(()));
                             return;
                         }
@@ -80,8 +152,8 @@ impl Server {
                     conn = local_sock.accept() => match conn {
                         // Served on its own task via own handle to avoid blocking the mainloop
                         Ok((stream, _addr)) => match weak.upgrade() {
-                            Some(sender) => {
-                                tokio::spawn(Self::handle_connection(ServerHandle(sender), stream));
+                            Some(handle) => {
+                                tokio::spawn(Self::handle_connection(handle, stream));
                             }
                             // Server about to be garbage collected
                             None => drop(stream),
@@ -100,7 +172,11 @@ impl Server {
     /// Handlers take `&mut Core` rather than `&Core`: the SQLite connection is `Send` but not
     /// `Sync`, so only a unique borrow of the core can be held across an await in the spawned
     /// mainloop.
-    async fn handle_message(core: &mut Core, msg: ServerMsg) -> ControlFlow<Responder<(), ()>> {
+    async fn handle_message(
+        core: &mut Core,
+        peers: &Peers,
+        msg: ServerMsg,
+    ) -> ControlFlow<Responder<(), ()>> {
         match msg {
             ServerMsg::Shutdown(r) => return ControlFlow::Break(r),
             ServerMsg::ChainRange(r) => Self::handle_chain_range(core, r).await,
@@ -117,6 +193,13 @@ impl Server {
             ServerMsg::Contains(digest, r) => r.respond(core.contains(digest)),
             ServerMsg::Watchers(r) => r.respond(Ok(core.subscriptions().count())),
             ServerMsg::WatchOrphaned(digest, r) => r.respond(core.watch_orphaned(digest)),
+            ServerMsg::PeerConnections(r) => r.handle(peers.connections()).await,
+            ServerMsg::PeerAddresses(r) => r.respond(core.peer_addresses()),
+            ServerMsg::Peers(r) => r.handle(peers.statuses()).await,
+            ServerMsg::Identity(r) => r.respond(Ok(Identity {
+                node: core.key_id(),
+                endpoint: peers.endpoint.as_ref().map(Endpoint::addr),
+            })),
         }
 
         ControlFlow::Continue(())
@@ -163,6 +246,47 @@ impl Server {
     }
 }
 
+/// The mainloop's side of the network: the actors it owns and the
+/// endpoint they share.
+#[derive(Debug)]
+struct Peers {
+    ingress: Option<PeerIngressHandle>,
+    egress: Option<PeerEgressHandle>,
+    endpoint: Option<Endpoint>,
+}
+
+impl Peers {
+    /// How many peers are connected; none, when there is no endpoint.
+    async fn connections(&self) -> Result<usize, ()> {
+        match &self.ingress {
+            Some(ingress) => ingress.connections().await,
+            None => Ok(0),
+        }
+    }
+
+    /// Every peer the egress keeps; none, when there is no endpoint.
+    async fn statuses(&self) -> Result<Vec<PeerStatus>, ()> {
+        match &self.egress {
+            Some(egress) => egress.peers().await,
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Brings the actors down and then closes the endpoint, in that order:
+    /// closing first would pull the endpoint out from under them.
+    async fn close(&mut self) {
+        if let Some(egress) = self.egress.take() {
+            egress.shutdown().await;
+        }
+        if let Some(ingress) = self.ingress.take() {
+            ingress.shutdown().await;
+        }
+        if let Some(endpoint) = self.endpoint.take() {
+            endpoint.close().await;
+        }
+    }
+}
+
 /// Answers local control requests, asking the server for whatever they need.
 ///
 /// Holds a handle rather than the core: it runs off the mainloop, so the
@@ -190,6 +314,10 @@ impl rpc::Handler for Rpc {
                     .map_err(|()| rpc::Failure::internal("the server is shutting down"))?;
                 responses.send(rpc::Response::ChainRange(range)).await
             }
+            rpc::Request::GetStatus(_) => {
+                let status = self.status().await?;
+                responses.send(rpc::Response::Status(status)).await
+            }
             rpc::Request::GetEnvelopes(get) => self.envelopes(get.select, responses).await,
             rpc::Request::Watch(watch) => self.watch(watch.selector, responses).await,
         }
@@ -197,6 +325,47 @@ impl rpc::Handler for Rpc {
 }
 
 impl Rpc {
+    /// Gathers everything `status` reports.
+    ///
+    /// Several trips to the mainloop rather than one: none of these reads
+    /// needs to be consistent with the others, and a status is a glance,
+    /// not a snapshot.
+    async fn status(&self) -> Result<rpc::NodeStatus, rpc::Error> {
+        let gone = || rpc::Failure::internal("the server is shutting down");
+        let identity = self.0.identity().await.map_err(|()| gone())?;
+        let chain = self.0.chain_range().await.map_err(|()| gone())?;
+        let peers = self.0.peers().await.map_err(|()| gone())?;
+        let inbound = self.0.peer_connections().await.map_err(|()| gone())?;
+
+        Ok(rpc::NodeStatus {
+            version: VERSION.to_owned(),
+            node: identity.node,
+            endpoint: identity.endpoint.map(|addr| rpc::EndpointInfo {
+                id: addr.id.to_z32(),
+                addrs: addr.addrs.iter().map(ToString::to_string).collect(),
+            }),
+            chain,
+            peers: peers
+                .into_iter()
+                .map(|peer| rpc::PeerInfo {
+                    node: peer.node,
+                    endpoint: peer.addr.id.to_z32(),
+                    state: match peer.state {
+                        PeerState::Dialing { attempt } => {
+                            rpc::PeerState::Dialing(rpc::Attempt { attempt })
+                        }
+                        PeerState::Connected => rpc::PeerState::Connected(rpc::Connected {}),
+                        PeerState::Backoff { attempt } => {
+                            rpc::PeerState::Backoff(rpc::Attempt { attempt })
+                        }
+                    },
+                })
+                .collect(),
+            // More connections than fit a u32 is not a count anyone reads.
+            inbound: u32::try_from(inbound).unwrap_or(u32::MAX),
+        })
+    }
+
     /// Streams the envelopes `select` picks out, one response frame each.
     ///
     /// Read in one trip to the mainloop and then written out: a frame per
@@ -290,8 +459,28 @@ enum Watching {
 #[derive(Debug, Clone)]
 pub struct ServerHandle(mpsc::Sender<ServerMsg>);
 
+/// A handle that does not keep the server running.
+///
+/// The mainloop exits once every [`ServerHandle`] is gone, so anything the
+/// mainloop itself owns must hold one of these instead and upgrade when it
+/// has work: a strong handle there would be a cycle nothing could break.
+#[derive(Debug, Clone)]
+pub(crate) struct WeakServerHandle(mpsc::WeakSender<ServerMsg>);
+
+impl WeakServerHandle {
+    /// A strong handle, unless the server is already gone.
+    pub(crate) fn upgrade(&self) -> Option<ServerHandle> {
+        self.0.upgrade().map(ServerHandle)
+    }
+}
+
 #[allow(clippy::result_unit_err)]
 impl ServerHandle {
+    /// A handle that does not keep the server running.
+    pub(crate) fn downgrade(&self) -> WeakServerHandle {
+        WeakServerHandle(self.0.downgrade())
+    }
+
     /// Issues a server shutdown. If the server is running, this future resolves with
     /// and Ok value when shutdown is finished. If the server is not running or otherwise
     /// in a broken state, an Err value is returned immediately.
@@ -398,6 +587,47 @@ impl ServerHandle {
         let _ = self.0.send(ServerMsg::Watchers(send)).await;
         match recv.await {
             Ok(Ok(count)) => Ok(count),
+            _ => Err(()),
+        }
+    }
+
+    /// How many peers are connected to this node's endpoint.
+    ///
+    /// Zero when the server was started without an endpoint.
+    pub async fn peer_connections(&self) -> Result<usize, ()> {
+        let (send, recv) = Responder::channel();
+        let _ = self.0.send(ServerMsg::PeerConnections(send)).await;
+        match recv.await {
+            Ok(Ok(count)) => Ok(count),
+            _ => Err(()),
+        }
+    }
+
+    /// How to reach each node the cluster lists, as the ledger has it now.
+    pub async fn peer_addresses(&self) -> Result<BTreeMap<KeyId, EndpointAddr>, RequestError> {
+        let (send, recv) = Responder::channel();
+        let _ = self.0.send(ServerMsg::PeerAddresses(send)).await;
+        Self::answer(recv.await)
+    }
+
+    /// Who this node is: its id, and the endpoint it serves peers on.
+    pub async fn identity(&self) -> Result<Identity, ()> {
+        let (send, recv) = Responder::channel();
+        let _ = self.0.send(ServerMsg::Identity(send)).await;
+        match recv.await {
+            Ok(Ok(identity)) => Ok(identity),
+            _ => Err(()),
+        }
+    }
+
+    /// Every node the egress keeps a connection to, and where each stands.
+    ///
+    /// Empty when the server was started without an endpoint.
+    pub async fn peers(&self) -> Result<Vec<PeerStatus>, ()> {
+        let (send, recv) = Responder::channel();
+        let _ = self.0.send(ServerMsg::Peers(send)).await;
+        match recv.await {
+            Ok(Ok(peers)) => Ok(peers),
             _ => Err(()),
         }
     }

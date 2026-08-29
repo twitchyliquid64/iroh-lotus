@@ -331,6 +331,15 @@ impl Core {
         public_key(&self.signing_key).id()
     }
 
+    /// How to reach each node the cluster lists, keyed by node id. Reads
+    /// the reserved `cluster-nodes` namespace at the current head.
+    pub fn peer_addresses(&self) -> Result<BTreeMap<KeyId, iroh::EndpointAddr>, ChainError> {
+        self.chain
+            .ledger()
+            .peer_addresses(&self.storage)
+            .map_err(ChainError::from)
+    }
+
     /// Answers one sync-machine query against this node's chain — the
     /// core-side half of the `sync` crate's `Effect::Ask` contract.
     pub fn sync_answer(&self, query: sync::Query) -> Result<sync::Answer, storage::sqlite::Error> {

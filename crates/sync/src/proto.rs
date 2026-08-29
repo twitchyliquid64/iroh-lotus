@@ -60,6 +60,16 @@ pub struct Envelopes {
 #[derive(Debug, Copy, Clone, Default, Cbor, PartialEq, Eq)]
 pub struct CaughtUp {}
 
+/// A node telling a peer its canonical head moved. Not part of a pull
+/// session: it travels alone on a stream of its own, and a peer that finds
+/// the head differs from its own opens a session to catch up.
+#[derive(Debug, Copy, Clone, Cbor, PartialEq, Eq)]
+pub struct Announce {
+    /// The canonical head the announcing node now stands at.
+    #[cbor(key = 1)]
+    pub head: EnvelopeDigest,
+}
+
 /// A frame on the peer wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
@@ -69,6 +79,7 @@ pub enum Message {
     NoSplit(NoSplit),
     Envelopes(Envelopes),
     CaughtUp(CaughtUp),
+    Announce(Announce),
 }
 
 /// Implements the wire representation of an all-newtype-variant enum: a
@@ -141,6 +152,7 @@ wire_tags! {
         NoSplit(NoSplit) = 4,
         Envelopes(Envelopes) = 5,
         CaughtUp(CaughtUp) = 6,
+        Announce(Announce) = 7,
     }
 }
 
@@ -154,6 +166,7 @@ impl Message {
             Message::NoSplit(_) => MessageKind::NoSplit,
             Message::Envelopes(_) => MessageKind::Envelopes,
             Message::CaughtUp(_) => MessageKind::CaughtUp,
+            Message::Announce(_) => MessageKind::Announce,
         }
     }
 }
@@ -167,6 +180,7 @@ pub enum MessageKind {
     NoSplit,
     Envelopes,
     CaughtUp,
+    Announce,
 }
 
 impl fmt::Display for MessageKind {
@@ -178,6 +192,7 @@ impl fmt::Display for MessageKind {
             MessageKind::NoSplit => "NoSplit",
             MessageKind::Envelopes => "Envelopes",
             MessageKind::CaughtUp => "CaughtUp",
+            MessageKind::Announce => "Announce",
         })
     }
 }
@@ -203,6 +218,18 @@ mod tests {
         assert_wire(
             &Message::Hello(hello),
             &format!("a101a20101025820{}", "cd".repeat(32)),
+        );
+    }
+
+    /// `a1` (map, 1 pair): the head as a bare byte string, under tag 7 on
+    /// the wire.
+    #[test]
+    fn announce_pins_its_encoding() {
+        let announce = Announce { head: d(0xab) };
+        assert_wire(&announce, &format!("a1015820{}", "ab".repeat(32)));
+        assert_wire(
+            &Message::Announce(announce),
+            &format!("a107a1015820{}", "ab".repeat(32)),
         );
     }
 

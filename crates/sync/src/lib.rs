@@ -27,10 +27,14 @@
 //!   backoff, and peer scoring are driver business too — time is I/O.
 //!
 //! A peer that breaks the protocol surfaces as [`Effect::Violation`]
-//! carrying the [`Breach`]; the driver closes and scores. What this crate
-//! does not yet carry: the announce (live gossip) message and checkpoint
-//! sync for peers with no common history — both end the session cleanly
-//! today ([`PullOutcome::NoCommonHistory`]).
+//! carrying the [`Breach`]; the driver closes and scores.
+//!
+//! Live gossip is one message, [`Announce`], sent outside any session on
+//! a stream of its own: a node's head moved, and a peer that stands
+//! elsewhere opens a pull to catch up. Feeding it to a session machine is
+//! a breach like any other frame out of place. What this crate does not
+//! yet carry: checkpoint sync for peers with no common history, which
+//! ends the session cleanly today ([`PullOutcome::NoCommonHistory`]).
 
 mod error;
 pub use error::Error;
@@ -41,7 +45,9 @@ pub use frame::{Codec, MAX_FRAME_LEN};
 pub mod locator;
 
 mod proto;
-pub use proto::{CaughtUp, Envelopes, FindSplit, Hello, Message, MessageKind, NoSplit, Split};
+pub use proto::{
+    Announce, CaughtUp, Envelopes, FindSplit, Hello, Message, MessageKind, NoSplit, Split,
+};
 
 mod session;
 pub use session::{Answer, Breach, Effect, Input, PullOutcome, Query, ServeOutcome};
@@ -60,6 +66,14 @@ mod testutil;
 /// The protocol version spoken by this build. Exact match required: the
 /// wire format is unstable and no compatibility is promised.
 pub const PROTOCOL_VERSION: u32 = 1;
+
+/// The ALPN a peer opens a connection under to pull from this node.
+///
+/// One protocol per connection: a connection under this ALPN carries pull
+/// sessions and nothing else, so the listener dispatches once, at accept.
+/// Bumps with [`PROTOCOL_VERSION`], so mismatched builds fail the
+/// handshake instead of a session.
+pub const ALPN: &[u8] = b"iroh-lotus/sync/1";
 
 /// The most envelopes one [`Envelopes`] frame may carry — the count
 /// budget every [`Query::Segment`] answer must respect; a puller refuses

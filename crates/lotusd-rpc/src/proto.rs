@@ -24,6 +24,8 @@ pub enum Request {
     GetVersion(GetVersion),
     /// See [`GetChainRange`].
     GetChainRange(GetChainRange),
+    /// See [`GetStatus`].
+    GetStatus(GetStatus),
     /// See [`GetEnvelopes`].
     GetEnvelopes(GetEnvelopes),
     /// See [`Watch`].
@@ -37,6 +39,93 @@ pub struct GetVersion {}
 /// Asks the daemon how much of the chain it holds.
 #[derive(Debug, Clone, Cbor, PartialEq, Eq)]
 pub struct GetChainRange {}
+
+/// Asks the daemon who it is, how much of the chain it holds, and how it
+/// stands with its peers — everything `status` prints, in one answer.
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+pub struct GetStatus {}
+
+/// Answers [`GetStatus`].
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+pub struct NodeStatus {
+    #[cbor(key = 1)]
+    pub version: String,
+    /// The node's id in the cluster: the id of its signing key.
+    #[cbor(key = 2)]
+    pub node: KeyId,
+    /// The iroh endpoint it serves peers on; `None` when it runs without one.
+    #[cbor(key = 3)]
+    pub endpoint: Option<EndpointInfo>,
+    #[cbor(key = 4)]
+    pub chain: ChainRange,
+    /// Every node the daemon keeps a connection to, in node id order.
+    #[cbor(key = 5)]
+    pub peers: Vec<PeerInfo>,
+    /// How many connections from peers the daemon is serving.
+    #[cbor(key = 6)]
+    pub inbound: u32,
+}
+
+/// An iroh endpoint as the control protocol describes it: the endpoint id
+/// in z-base-32, and each transport address in iroh's own `kind:addr`
+/// spelling. Strings rather than iroh's types, so a client need not carry
+/// iroh to read a status.
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+pub struct EndpointInfo {
+    #[cbor(key = 1)]
+    pub id: String,
+    #[cbor(key = 2)]
+    pub addrs: Vec<String>,
+}
+
+/// One peer the daemon keeps a connection to.
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+pub struct PeerInfo {
+    /// The peer's node id, as `cluster-nodes` lists it.
+    #[cbor(key = 1)]
+    pub node: KeyId,
+    /// The endpoint id the ledger says to reach it at, in z-base-32.
+    #[cbor(key = 2)]
+    pub endpoint: String,
+    #[cbor(key = 3)]
+    pub state: PeerState,
+}
+
+/// Where a peer's connection stands.
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerState {
+    /// A dial is in progress; `attempt` counts the failures before it.
+    Dialing(Attempt),
+    /// The connection is up.
+    Connected(Connected),
+    /// The last dial failed; waiting before the next one.
+    Backoff(Attempt),
+}
+
+impl fmt::Display for PeerState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PeerState::Dialing(Attempt { attempt: 0 }) => f.write_str("dialing"),
+            PeerState::Dialing(Attempt { attempt }) => write!(f, "dialing (retry {attempt})"),
+            PeerState::Connected(_) => f.write_str("connected"),
+            PeerState::Backoff(Attempt { attempt }) => {
+                write!(f, "backing off after {attempt} failed dials")
+            }
+        }
+    }
+}
+
+/// How many dials have failed so far.
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+pub struct Attempt {
+    #[cbor(key = 1)]
+    pub attempt: u32,
+}
+
+/// A connected peer. Carries nothing yet; a struct so it can.
+#[derive(Debug, Clone, Cbor, Default, PartialEq, Eq)]
+pub struct Connected {}
 
 /// Asks the daemon for envelopes it holds.
 ///
@@ -322,6 +411,8 @@ pub enum Response {
     Version(String),
     /// Answers [`GetChainRange`].
     ChainRange(ChainRange),
+    /// Answers [`GetStatus`].
+    Status(NodeStatus),
     /// Answers [`GetEnvelopes`], once per envelope sent.
     Envelope(EnvelopeFrame),
     /// Answers [`Watch`], as many times as the chain moves.
@@ -337,6 +428,7 @@ impl Response {
         match self {
             Response::Version(_) => "version",
             Response::ChainRange(_) => "chain range",
+            Response::Status(_) => "status",
             Response::Envelope(_) => "envelope",
             Response::Watch(_) => "watch event",
             Response::Failed(_) => "failure",
