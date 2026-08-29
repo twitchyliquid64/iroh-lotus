@@ -1,6 +1,6 @@
 use std::{path::PathBuf, process::ExitCode};
 
-use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use iroh::{Endpoint, endpoint::presets};
 use lotusd::{Core, IfInitialized, Server, bootstrap, invite::Invite, peer_ingress::Protocol};
@@ -109,9 +109,31 @@ pub struct GlobalArgs {
     /// Override the directory where state is stored (default: $XDG_STATE_DIR/iroh-lotus)
     #[arg(long, alias = "sd")]
     state_dir: Option<PathBuf>,
+
+    /// Which relay infrastructure the iroh endpoint uses
+    #[arg(long, value_enum, global = true, default_value_t = Relay::None)]
+    relay: Relay,
+}
+
+/// The relay infrastructure an endpoint binds with, as `--relay` names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Relay {
+    /// No relays: direct connections only (iroh's `Minimal` preset)
+    None,
+    /// The n0 public relay network (iroh's `N0` preset)
+    N0,
 }
 
 impl GlobalArgs {
+    /// EndpointBuilder returns an iroh endpoint builder configured with the
+    /// preset `--relay` selected.
+    pub fn endpoint_builder(&self) -> iroh::endpoint::Builder {
+        match self.relay {
+            Relay::None => Endpoint::builder(presets::Minimal),
+            Relay::N0 => Endpoint::builder(presets::N0),
+        }
+    }
+
     /// StateDir returns the directory where daemon state is stored: the `--state-dir`
     /// override when given, otherwise `iroh-lotus` under the platform state directory
     /// (`$XDG_STATE_HOME`, falling back to `~/.local/state`, on Linux).
@@ -210,7 +232,9 @@ async fn async_main() -> Result<(), MainError> {
             // yet: the inviting node lists this endpoint the moment it
             // admits it, and its dial should fail on nobody accepting
             // rather than on the handshake.
-            let endpoint = Endpoint::builder(presets::N0)
+            let endpoint = cli
+                .global_args
+                .endpoint_builder()
                 .secret_key(keys.iroh_secret().clone())
                 .alpns(Protocol::alpns())
                 .bind()
@@ -271,7 +295,9 @@ async fn async_main() -> Result<(), MainError> {
         tracing::info!("Node ID:     {}", core.key_id().to_hex().as_ref());
         tracing::info!("Endpoint ID: {}", core.iroh_secret().public().to_z32());
 
-        let endpoint = Endpoint::builder(presets::N0)
+        let endpoint = cli
+            .global_args
+            .endpoint_builder()
             .secret_key(core.iroh_secret().clone())
             .alpns(Protocol::alpns())
             .bind()
