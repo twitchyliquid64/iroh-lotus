@@ -511,6 +511,55 @@ impl Core {
         Ok(digest)
     }
 
+    /// Brings this node's own `cluster-nodes` listing in line with `addr`,
+    /// the address its endpoint is reachable at right now.
+    ///
+    /// Compares and writes under one borrow, so what was compared is what
+    /// the write chains onto. Only the `iroh` field of the entry is
+    /// rewritten; anything else listed under this node stays.
+    ///
+    /// Maintains the transports of the endpoint the ledger already names,
+    /// nothing more. A node the ledger does not list is left unlisted, and
+    /// one listed under another endpoint id is left alone: which endpoint
+    /// a node is, like whether it is listed, is an operator's decision,
+    /// and this must not undo it — a daemon started over a copied state
+    /// directory on a fresh key would otherwise capture the original's
+    /// entry.
+    pub fn advertise(&mut self, addr: &iroh::EndpointAddr) -> Result<Advertised, AdvertiseError> {
+        let listed = self.peer_addresses().map_err(AdvertiseError::Chain)?;
+        let Some(current) = listed.get(&self.key_id()) else {
+            return Ok(Advertised::NotListed);
+        };
+        if current == addr {
+            return Ok(Advertised::Unchanged);
+        }
+        if current.id != addr.id {
+            return Ok(Advertised::OtherEndpoint(current.id));
+        }
+        if let Err(reason) = self.signs_alone().map_err(AdvertiseError::Chain)? {
+            return Ok(Advertised::CannotSign(reason));
+        }
+
+        let value = Value::try_from(addr).map_err(AdvertiseError::Addr)?;
+        let key = NamespaceKey::try_new(CLUSTER_NODES_KEY).expect("the reserved key is static");
+        let path = SubkeyPath::try_new(vec![
+            Subkey::Key(self.key_id().to_hex().as_ref().to_owned()),
+            Subkey::Key("iroh".to_owned()),
+        ])
+        .expect("two segments are not empty");
+        let (digest, _) = self
+            .sign_write(|prev| {
+                Msg::SetNamespaceKey(SetNamespaceKey {
+                    prev,
+                    key,
+                    path,
+                    value: Some(value),
+                })
+            })
+            .map_err(AdvertiseError::Chain)?;
+        Ok(Advertised::Written(digest))
+    }
+
     /// Answers one sync-machine query against this node's chain — the
     /// core-side half of the `sync` crate's `Effect::Ask` contract.
     pub fn sync_answer(&self, query: sync::Query) -> Result<sync::Answer, storage::sqlite::Error> {
@@ -726,6 +775,34 @@ pub enum AdmitError {
     #[error("the endpoint address has no ledger encoding")]
     Addr(#[source] wire::msg::AddrError),
     #[error("writing the admission")]
+    Chain(#[source] ChainError),
+    #[error("the server is shutting down")]
+    ServerGone,
+}
+
+/// What [`Core::advertise`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Advertised {
+    /// The ledger already listed this address.
+    Unchanged,
+    /// The listing was rewritten; holds the digest of the envelope.
+    Written(EnvelopeDigest),
+    /// The ledger does not list this node, so there is nothing to update.
+    NotListed,
+    /// The ledger lists this node under the endpoint id given, not the
+    /// one it serves on, so the listing is not this endpoint's to keep.
+    OtherEndpoint(iroh::EndpointId),
+    /// The listing is stale, but this node's signature alone would not
+    /// carry the update.
+    CannotSign(CannotSignAlone),
+}
+
+/// Why [`Core::advertise`] could not run.
+#[derive(Debug, thiserror::Error)]
+pub enum AdvertiseError {
+    #[error("the endpoint address has no ledger encoding")]
+    Addr(#[source] wire::msg::AddrError),
+    #[error("reading or writing the listing")]
     Chain(#[source] ChainError),
     #[error("the server is shutting down")]
     ServerGone,

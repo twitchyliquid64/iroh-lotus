@@ -258,6 +258,9 @@ async fn status_shows_each_side_of_a_kept_connection() {
         a_text.contains("inbound    0 connections\n"),
         "got {a_text}"
     );
+    // Where the listing stands depends on whether the publisher has
+    // looked since the fixture relisted the nodes; only that it reports.
+    assert!(a_text.contains("\nlisting    "), "got {a_text}");
 
     assert!(b_text.contains("inbound    1 connection\n"), "got {b_text}");
     assert!(b_text.contains("peers      0 kept\n"), "got {b_text}");
@@ -273,6 +276,7 @@ async fn status_renders_json_when_asked() {
     assert_eq!(json["version"], lotusd::VERSION);
     assert_eq!(json["endpoint"]["id"], a.endpoint().id().to_z32());
     assert_eq!(json["inbound"], 0);
+    assert!(json["published"].is_object(), "got {json}");
     assert_eq!(json["peers"].as_array().map(Vec::len), Some(1));
     assert_eq!(json["peers"][0]["endpoint"], b.endpoint().id().to_z32());
     assert_eq!(

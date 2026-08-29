@@ -920,6 +920,9 @@ impl fmt::Display for StatusText<'_> {
                         }
                     }
                 }
+                if let Some(published) = &status.published {
+                    writeln!(f, "listing    {published}")?;
+                }
             }
             None => writeln!(f, "endpoint   none (not serving peers)")?,
         }

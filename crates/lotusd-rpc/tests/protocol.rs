@@ -157,6 +157,7 @@ impl Handler for Fake {
                         chain: range(),
                         peers: Vec::new(),
                         inbound: 0,
+                        published: None,
                     }))
                     .await
             }

@@ -26,8 +26,9 @@ use wire::{
 };
 
 use crate::{
-    AdmitError, ChainError, ChangeFilter, ChangeSelector, Core, InitError, Responder,
-    SubscriptionHandle, VERSION,
+    AdmitError, AdvertiseError, Advertised, ChainError, ChangeFilter, ChangeSelector, Core,
+    InitError, Responder, SubscriptionHandle, VERSION,
+    addr_publish::{AddrPublish, AddrPublishHandle, PublishState},
     bootstrap::{InviteError, Invites, Welcomed},
     invite::{self, Invite, Token},
     peer_egress::{PeerEgress, PeerEgressHandle, PeerState, PeerStatus},
@@ -77,6 +78,8 @@ enum ServerMsg {
         EndpointAddr,
         Responder<EnvelopeDigest, AdmitError>,
     ),
+    Advertise(EndpointAddr, Responder<Advertised, AdvertiseError>),
+    Published(Responder<Option<PublishState>, ()>),
 }
 
 /// A write a local client asks for, to be signed by this node onto its
@@ -197,6 +200,7 @@ pub struct Server {
     /// still works, nothing is served over the network.
     endpoint: Option<Endpoint>,
     peer_connection_limit: Option<usize>,
+    advertise_settle: Option<Duration>,
 }
 
 impl Server {
@@ -206,6 +210,7 @@ impl Server {
             local_sock,
             endpoint: None,
             peer_connection_limit: None,
+            advertise_settle: None,
         })
     }
 
@@ -226,18 +231,27 @@ impl Server {
         self
     }
 
+    /// How long the endpoint's address is left to settle after it moves
+    /// before the node publishes it to the ledger, overriding
+    /// [`DEFAULT_SETTLE`](crate::addr_publish::DEFAULT_SETTLE).
+    pub fn with_advertise_settle(mut self, settle: Duration) -> Self {
+        self.advertise_settle = Some(settle);
+        self
+    }
+
     /// Consumes the initialized server and starts an async task for its mainloop, returning
     /// a handle that can be used to query and control the server.
     ///
-    /// The peer ingress and egress are spawned here as the mainloop's
-    /// children, and are brought down before the mainloop returns by
-    /// either route out of it.
+    /// The peer ingress and egress, and the publisher of this node's own
+    /// address, are spawned here as the mainloop's children, and are
+    /// brought down before the mainloop returns by either route out of it.
     pub async fn run(self) -> (ServerHandle, JoinHandle<()>) {
         let Self {
             mut core,
             local_sock,
             endpoint,
             peer_connection_limit,
+            advertise_settle,
         } = self;
         let (hnd_tx, mut hnd_recv) = mpsc::channel(8);
         let handle = ServerHandle(hnd_tx);
@@ -254,11 +268,20 @@ impl Server {
         let egress = endpoint
             .clone()
             .map(|ep| PeerEgress::new(ep, weak.clone(), core.key_id()).spawn());
+        let publisher = endpoint.as_ref().map(|ep| {
+            let publisher = AddrPublish::new(ep.watch_addr(), weak.clone(), core.key_id());
+            match advertise_settle {
+                Some(settle) => publisher.with_settle(settle),
+                None => publisher,
+            }
+            .spawn()
+        });
 
         let join_hnd = tokio::spawn(async move {
             let mut peers = Peers {
                 ingress,
                 egress,
+                publisher,
                 endpoint,
             };
             let mut invites = Invites::default();
@@ -366,6 +389,8 @@ impl Server {
             // On the mainloop like any write: signed onto the head the core
             // stands at right now, both envelopes before anything else runs.
             ServerMsg::Admit(key, addr, r) => r.respond(core.admit(key, &addr)),
+            ServerMsg::Advertise(addr, r) => r.respond(core.advertise(&addr)),
+            ServerMsg::Published(r) => r.handle(peers.published()).await,
         }
 
         ControlFlow::Continue(())
@@ -472,6 +497,7 @@ fn outcome(insert: Insert) -> rpc::WriteOutcome {
 struct Peers {
     ingress: Option<PeerIngressHandle>,
     egress: Option<PeerEgressHandle>,
+    publisher: Option<AddrPublishHandle>,
     endpoint: Option<Endpoint>,
 }
 
@@ -492,9 +518,21 @@ impl Peers {
         }
     }
 
+    /// Where this node's own listing stands; `None` when there is no
+    /// endpoint to list.
+    async fn published(&self) -> Result<Option<PublishState>, ()> {
+        match &self.publisher {
+            Some(publisher) => publisher.state().await.map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// Brings the actors down and then closes the endpoint, in that order:
     /// closing first would pull the endpoint out from under them.
     async fn close(&mut self) {
+        if let Some(publisher) = self.publisher.take() {
+            publisher.shutdown().await;
+        }
         if let Some(egress) = self.egress.take() {
             egress.shutdown().await;
         }
@@ -589,6 +627,7 @@ impl Rpc {
         let chain = self.0.chain_range().await.map_err(|()| gone())?;
         let peers = self.0.peers().await.map_err(|()| gone())?;
         let inbound = self.0.peer_connections().await.map_err(|()| gone())?;
+        let published = self.0.published().await.map_err(|()| gone())?;
 
         Ok(rpc::NodeStatus {
             version: VERSION.to_owned(),
@@ -616,6 +655,21 @@ impl Rpc {
                 .collect(),
             // More connections than fit a u32 is not a count anyone reads.
             inbound: u32::try_from(inbound).unwrap_or(u32::MAX),
+            published: published.map(|state| match state {
+                PublishState::Unchecked => rpc::Published::Unchecked(rpc::Unchecked {}),
+                PublishState::Published => rpc::Published::Published(rpc::Connected {}),
+                PublishState::Pending => rpc::Published::Pending(rpc::Unchecked {}),
+                PublishState::NotListed => rpc::Published::NotListed(rpc::Unchecked {}),
+                PublishState::OtherEndpoint(id) => {
+                    rpc::Published::OtherEndpoint(rpc::OtherEndpoint {
+                        endpoint: id.to_z32(),
+                    })
+                }
+                PublishState::CannotSign(reason) => rpc::Published::CannotSign(rpc::Reason {
+                    reason: reason.to_string(),
+                }),
+                PublishState::Failed(reason) => rpc::Published::Failed(rpc::Reason { reason }),
+            }),
         })
     }
 
@@ -977,6 +1031,22 @@ impl ServerHandle {
         let (send, recv) = Responder::channel();
         let _ = self.0.send(ServerMsg::Admit(key, addr, send)).await;
         recv.await.map_err(|_| AdmitError::ServerGone)?
+    }
+
+    /// Brings this node's own listing in line with `addr` — see
+    /// [`Core::advertise`].
+    pub async fn advertise(&self, addr: EndpointAddr) -> Result<Advertised, AdvertiseError> {
+        let (send, recv) = Responder::channel();
+        let _ = self.0.send(ServerMsg::Advertise(addr, send)).await;
+        recv.await.map_err(|_| AdvertiseError::ServerGone)?
+    }
+
+    /// Where this node's own listing stands; `None` when it serves no
+    /// endpoint.
+    pub async fn published(&self) -> Result<Option<PublishState>, ()> {
+        let (send, recv) = Responder::channel();
+        let _ = self.0.send(ServerMsg::Published(send)).await;
+        recv.await.map_err(|_| ())?
     }
 
     /// Unwraps what came back down a responder, reading a dropped sender as

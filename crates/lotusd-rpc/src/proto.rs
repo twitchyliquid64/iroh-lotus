@@ -250,6 +250,68 @@ pub struct NodeStatus {
     /// How many connections from peers the daemon is serving.
     #[cbor(key = 6)]
     pub inbound: u32,
+    /// Whether the ledger's listing of this node carries the address its
+    /// endpoint reports; `None` when it runs without an endpoint.
+    #[cbor(key = 7)]
+    pub published: Option<Published>,
+}
+
+/// Where the daemon's own `cluster-nodes` listing stands against the
+/// address its endpoint reports.
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Published {
+    /// Nothing has been compared yet.
+    Unchecked(Unchecked),
+    /// The ledger lists the address the endpoint reports.
+    Published(Connected),
+    /// The address moved; the listing is about to be, or being, updated.
+    Pending(Unchecked),
+    /// The ledger does not list this node.
+    NotListed(Unchecked),
+    /// The ledger lists this node under another endpoint id, given in
+    /// z-base-32, so the listing is not this endpoint's to keep.
+    OtherEndpoint(OtherEndpoint),
+    /// The listing is stale and the node cannot sign the update alone.
+    CannotSign(Reason),
+    /// The last update failed; it is retried.
+    Failed(Reason),
+}
+
+impl fmt::Display for Published {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Published::Unchecked(_) => f.write_str("not checked yet"),
+            Published::Published(_) => f.write_str("published"),
+            Published::Pending(_) => f.write_str("pending"),
+            Published::NotListed(_) => f.write_str("not listed in the cluster"),
+            Published::OtherEndpoint(OtherEndpoint { endpoint }) => {
+                write!(f, "listed under another endpoint, {endpoint}")
+            }
+            Published::CannotSign(Reason { reason }) => {
+                write!(f, "cannot sign the update: {reason}")
+            }
+            Published::Failed(Reason { reason }) => write!(f, "failed: {reason}"),
+        }
+    }
+}
+
+/// A state that carries nothing yet; a struct so it can.
+#[derive(Debug, Clone, Cbor, Default, PartialEq, Eq)]
+pub struct Unchecked {}
+
+/// The endpoint id a listing names instead of the daemon's, in z-base-32.
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+pub struct OtherEndpoint {
+    #[cbor(key = 1)]
+    pub endpoint: String,
+}
+
+/// Why a state was reached, for a person.
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+pub struct Reason {
+    #[cbor(key = 1)]
+    pub reason: String,
 }
 
 /// An iroh endpoint as the control protocol describes it: the endpoint id
