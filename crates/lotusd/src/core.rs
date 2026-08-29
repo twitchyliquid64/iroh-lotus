@@ -16,6 +16,7 @@ use wire::{
     Envelope, EnvelopeDigest, Key, KeyId, Msg, Signature,
     keys::{Ed25519PublicKey, Ed25519Signature, PublicKey},
     msg::{FullCheckpoint, InitMsg, Namespace, NamespaceKey, Value},
+    subkey::SubkeyPath,
 };
 
 use crate::{ChangeFilter, SubscriptionHandle, Subscriptions};
@@ -156,7 +157,7 @@ impl Core {
                 ]),
             },
         }));
-        let envelope = sign(&signing_key, key_id, envelope)?;
+        let envelope = sign(&signing_key, key_id, envelope).map_err(InitError::Wire)?;
 
         let mut storage =
             SqliteStorage::open(state_dir.join(SQLITE_DB_FILENAME)).map_err(InitError::Storage)?;
@@ -211,6 +212,43 @@ impl Core {
             self.subscriptions.publish(differ.from(), head, &movement);
         }
         insert
+    }
+
+    /// The value `path` addresses in the namespace under `key` — the whole
+    /// namespace's value when no path is given — and the head it was read
+    /// at. `None` when the ledger holds no such namespace, or the path
+    /// stops short of anything inside it.
+    ///
+    /// One borrow for both, so the value is the one that head holds.
+    pub fn read(
+        &self,
+        key: &NamespaceKey,
+        path: Option<&SubkeyPath>,
+    ) -> Result<(EnvelopeDigest, Option<Value>), storage::sqlite::Error> {
+        let head = self.chain.head();
+        let path = path.map_or(&[][..], |path| path.as_ref().as_slice());
+        Ok((head, self.storage.value_at(head, key, path)?))
+    }
+
+    /// Signs the message `build` makes for the current head with this
+    /// node's key and inserts it through [`insert`] — how every local
+    /// write reaches the chain.
+    ///
+    /// Weak: the message chains onto whatever head the core stands at, no
+    /// precondition on what was there, and carries one signature. Returns
+    /// the envelope's digest alongside what inserting it did.
+    ///
+    /// [`insert`]: Self::insert
+    pub fn sign_write(
+        &mut self,
+        build: impl FnOnce(EnvelopeDigest) -> Msg,
+    ) -> Result<(EnvelopeDigest, Insert), ChainError> {
+        let msg = build(self.chain.head());
+        let envelope =
+            sign(&self.signing_key, self.key_id(), Envelope::new(msg)).map_err(ChainError::Wire)?;
+        let digest = envelope.digest().map_err(ChainError::Wire)?;
+        let insert = self.insert([envelope])?;
+        Ok((digest, insert))
     }
 
     /// Registers a subscription for the changes `filter` selects.
@@ -476,8 +514,8 @@ async fn load_secret(
 ///
 /// Every part of the envelope but its signatures must already be in place —
 /// timestamps included — since the digest signed here covers them.
-fn sign(key: &SigningKey, key_id: KeyId, envelope: Envelope) -> Result<Envelope, InitError> {
-    let digest = envelope.signature_digest().map_err(InitError::Wire)?;
+fn sign(key: &SigningKey, key_id: KeyId, envelope: Envelope) -> Result<Envelope, wire::Error> {
+    let digest = envelope.signature_digest()?;
     let signature = Signature::Ed25519(Ed25519Signature::from_bytes(
         key.sign(digest.as_bytes()).to_bytes(),
     ));

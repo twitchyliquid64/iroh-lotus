@@ -6,16 +6,17 @@ use std::collections::BTreeMap;
 use lotusd_rpc::{
     Call, ChainRange, ChainWalk, Changed, EnvelopeFrame, EnvelopeSelector, Error, Failure,
     FailureKind, GetChainRange, GetEnvelopes, GetVersion, Handler, MAX_FRAME_LEN, NamespaceChange,
-    NodeStatus, Request, Response, Responses, Verification, Watch, WatchEvent, WatchPath,
-    WatchSelector, call, serve,
+    NodeStatus, Read, Reorged, Request, Response, Responses, ValueAt, Verification, Watch,
+    WatchEvent, WatchPath, WatchSelector, WeakDelete, WeakIncrement, WeakPush, WeakSet,
+    WriteOutcome, Written, call, serve,
 };
 use std::time::Duration;
 
 use tokio::io::{AsyncWriteExt, DuplexStream, duplex};
 use wire::{
     Envelope, EnvelopeDigest, Msg, VerificationStatus,
-    keys::KeyId,
-    msg::{FullCheckpoint, InitMsg, NamespaceKey},
+    keys::{Ed25519PublicKey, Key, KeyId, PublicKey},
+    msg::{FullCheckpoint, InitMsg, NamespaceKey, Value},
     subkey::SubkeyPath,
 };
 
@@ -44,6 +45,15 @@ fn changed() -> Changed {
     }
 }
 
+/// What the fake claims every write did.
+fn written() -> Written {
+    Written {
+        digest: EnvelopeDigest::from_bytes([8u8; 32]),
+        head: EnvelopeDigest::from_bytes([8u8; 32]),
+        outcome: WriteOutcome::Reorged(Reorged { from: range().head }),
+    }
+}
+
 /// A fixed reading for the fake's log to claim, well clear of now.
 const STORED_AT_MILLIS: i64 = 1_787_000_000_000;
 
@@ -63,6 +73,27 @@ fn path(text: &str) -> SubkeyPath {
     text.parse().unwrap()
 }
 
+/// A value of every shape the ledger holds, nested, so one crossing
+/// exercises them all.
+fn every_value() -> Value {
+    Value::Map(BTreeMap::from([
+        ("s".to_owned(), Value::String("text".to_owned())),
+        ("i".to_owned(), Value::Int(-7)),
+        ("b".to_owned(), Value::Bool(true)),
+        (
+            "a".to_owned(),
+            Value::Array(vec![Value::Int(1), Value::Map(BTreeMap::new())]),
+        ),
+        (
+            "k".to_owned(),
+            Value::Key(Key::new(
+                PublicKey::Ed25519(Ed25519PublicKey::from_bytes([0xab; 32])),
+                3,
+            )),
+        ),
+    ]))
+}
+
 /// A handler that answers each method the way the daemon does, plus a
 /// `GetChainRange` that streams so the multi-response path is exercised.
 struct Fake {
@@ -72,6 +103,13 @@ struct Fake {
     watched: Option<WatchSelector>,
     /// The envelope selector the last request carried, likewise.
     selected: Option<EnvelopeSelector>,
+    /// The read the last request asked for, likewise.
+    read: Option<Read>,
+    /// The write the last request asked for, likewise.
+    set: Option<WeakSet>,
+    push: Option<WeakPush>,
+    delete: Option<WeakDelete>,
+    increment: Option<WeakIncrement>,
     /// Fails every request with this, rather than answering.
     fail: Option<Failure>,
 }
@@ -82,6 +120,11 @@ impl Fake {
             ranges: 1,
             watched: None,
             selected: None,
+            read: None,
+            set: None,
+            push: None,
+            delete: None,
+            increment: None,
             fail: None,
         }
     }
@@ -159,6 +202,34 @@ impl Handler for Fake {
                             .await
                     }
                 }
+            }
+            Request::Read(read) => {
+                // A path answers with every shape; the whole namespace
+                // answers with nothing there.
+                let value = read.path.is_some().then(every_value);
+                self.read = Some(read);
+                responses
+                    .send(Response::Value(ValueAt {
+                        head: range().head,
+                        value,
+                    }))
+                    .await
+            }
+            Request::WeakSet(set) => {
+                self.set = Some(set);
+                responses.send(Response::Written(written())).await
+            }
+            Request::WeakPush(push) => {
+                self.push = Some(push);
+                responses.send(Response::Written(written())).await
+            }
+            Request::WeakDelete(delete) => {
+                self.delete = Some(delete);
+                responses.send(Response::Written(written())).await
+            }
+            Request::WeakIncrement(increment) => {
+                self.increment = Some(increment);
+                responses.send(Response::Written(written())).await
             }
         }
     }
@@ -494,4 +565,160 @@ async fn an_envelope_frame_carries_when_the_node_stored_it() {
     // reading: it reads back as no time rather than as some other one.
     let nonsense = EnvelopeFrame::new(EnvelopeDigest::from_bytes([1u8; 32]), envelope(), i64::MAX);
     assert_eq!(nonsense.stored_at(), None);
+}
+
+/// A read names its namespace and path, and the path may be absent.
+#[tokio::test]
+async fn a_read_carries_its_key_and_path_across() {
+    for read in [
+        Read {
+            key: key("a"),
+            path: None,
+        },
+        Read {
+            key: key("a"),
+            path: Some(path("servers[0].host")),
+        },
+    ] {
+        let (client, mut server) = duplex(64 * 1024);
+        let served = tokio::spawn(async move {
+            let mut handler = Fake::new();
+            serve(&mut server, &mut handler).await.unwrap();
+            handler.read
+        });
+
+        call(client, read.clone()).await.unwrap();
+
+        assert_eq!(served.await.unwrap(), Some(read));
+    }
+}
+
+/// The answer carries the head it was read at, and a value of any shape
+/// the ledger holds — or none, which is an answer rather than a failure.
+#[tokio::test]
+async fn a_read_answers_with_the_head_and_whatever_is_there() {
+    let at = call(
+        connect(Fake::new()),
+        Read {
+            key: key("a"),
+            path: Some(path("x")),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(at.head, range().head);
+    assert_eq!(at.value, Some(every_value()));
+
+    let at = call(
+        connect(Fake::new()),
+        Read {
+            key: key("a"),
+            path: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(at.value, None);
+}
+
+/// A write crosses whole: namespace, optional path, and a value of every
+/// shape.
+#[tokio::test]
+async fn a_weak_set_carries_its_value_across() {
+    for set in [
+        WeakSet {
+            key: key("a"),
+            path: None,
+            value: every_value(),
+        },
+        WeakSet {
+            key: key("a"),
+            path: Some(path("servers[0].host")),
+            value: Value::String("h".to_owned()),
+        },
+    ] {
+        let (client, mut server) = duplex(64 * 1024);
+        let served = tokio::spawn(async move {
+            let mut handler = Fake::new();
+            serve(&mut server, &mut handler).await.unwrap();
+            handler.set
+        });
+
+        assert_eq!(call(client, set.clone()).await.unwrap(), written());
+
+        assert_eq!(served.await.unwrap(), Some(set));
+    }
+}
+
+/// The other weak writes cross whole too, optional path and bounds
+/// included, and are answered the same way a set is.
+#[tokio::test]
+async fn a_push_delete_and_increment_carry_across() {
+    let push = WeakPush {
+        key: key("a"),
+        path: Some(path("tags")),
+        value: every_value(),
+    };
+    let (client, mut server) = duplex(64 * 1024);
+    let served = tokio::spawn(async move {
+        let mut handler = Fake::new();
+        serve(&mut server, &mut handler).await.unwrap();
+        handler.push
+    });
+    assert_eq!(call(client, push.clone()).await.unwrap(), written());
+    assert_eq!(served.await.unwrap(), Some(push));
+
+    let delete = WeakDelete {
+        key: key("a"),
+        path: None,
+    };
+    let (client, mut server) = duplex(64 * 1024);
+    let served = tokio::spawn(async move {
+        let mut handler = Fake::new();
+        serve(&mut server, &mut handler).await.unwrap();
+        handler.delete
+    });
+    assert_eq!(call(client, delete.clone()).await.unwrap(), written());
+    assert_eq!(served.await.unwrap(), Some(delete));
+
+    let increment = WeakIncrement {
+        key: key("a"),
+        path: Some(path("n")),
+        delta: -3,
+        min: Some(i64::MIN),
+        max: None,
+    };
+    let (client, mut server) = duplex(64 * 1024);
+    let served = tokio::spawn(async move {
+        let mut handler = Fake::new();
+        serve(&mut server, &mut handler).await.unwrap();
+        handler.increment
+    });
+    assert_eq!(call(client, increment.clone()).await.unwrap(), written());
+    assert_eq!(served.await.unwrap(), Some(increment));
+}
+
+/// A write the chain refused is the client's problem, and is told apart
+/// from the daemon breaking.
+#[tokio::test]
+async fn a_rejected_write_is_told_apart_from_a_broken_daemon() {
+    let err = call(
+        connect(Fake {
+            fail: Some(Failure::rejected("no namespace a")),
+            ..Fake::new()
+        }),
+        WeakSet {
+            key: key("a"),
+            path: Some(path("x")),
+            value: Value::Int(1),
+        },
+    )
+    .await
+    .unwrap_err();
+
+    let Error::Failed(failure) = err else {
+        panic!("expected a reported failure, got {err:?}");
+    };
+    assert_eq!(failure.kind, FailureKind::Rejected);
+    assert_eq!(failure.message, "no namespace a");
 }

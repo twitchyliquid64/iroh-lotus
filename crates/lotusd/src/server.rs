@@ -15,7 +15,13 @@ use tokio::{
     sync::{mpsc, oneshot},
     task::JoinHandle,
 };
-use wire::{Envelope, EnvelopeDigest, KeyId};
+use wire::{
+    Envelope, EnvelopeDigest, KeyId, Msg,
+    msg::{
+        AmendNamespaceKey, AmendOp, DeleteNamespace, IncrementDecrement, Namespace, SetNamespace,
+        SetNamespaceKey,
+    },
+};
 
 use crate::{
     ChainError, ChangeFilter, ChangeSelector, Core, InitError, Responder, SubscriptionHandle,
@@ -45,6 +51,106 @@ enum ServerMsg {
     PeerAddresses(Responder<BTreeMap<KeyId, EndpointAddr>, ChainError>),
     Peers(Responder<Vec<PeerStatus>, ()>),
     Identity(Responder<Identity, ()>),
+    Read(rpc::Read, Responder<rpc::ValueAt, ChainError>),
+    WeakWrite(WeakWrite, Responder<rpc::Written, ChainError>),
+}
+
+/// A write a local client asks for, to be signed by this node onto its
+/// current head: the control protocol's weak writes, under one roof so
+/// the mainloop and the handle serve them through one path.
+#[derive(Debug, Clone)]
+pub enum WeakWrite {
+    Set(rpc::WeakSet),
+    Push(rpc::WeakPush),
+    Delete(rpc::WeakDelete),
+    Increment(rpc::WeakIncrement),
+}
+
+impl From<rpc::WeakSet> for WeakWrite {
+    fn from(set: rpc::WeakSet) -> Self {
+        WeakWrite::Set(set)
+    }
+}
+
+impl From<rpc::WeakPush> for WeakWrite {
+    fn from(push: rpc::WeakPush) -> Self {
+        WeakWrite::Push(push)
+    }
+}
+
+impl From<rpc::WeakDelete> for WeakWrite {
+    fn from(delete: rpc::WeakDelete) -> Self {
+        WeakWrite::Delete(delete)
+    }
+}
+
+impl From<rpc::WeakIncrement> for WeakWrite {
+    fn from(increment: rpc::WeakIncrement) -> Self {
+        WeakWrite::Increment(increment)
+    }
+}
+
+impl WeakWrite {
+    /// The ledger message this write is, chained onto `prev`.
+    ///
+    /// A path picks the nested form; none, the whole-namespace one — a
+    /// pathless amend addresses the namespace's whole value, which the
+    /// ledger allows when that value is one array or one integer.
+    fn message(self, prev: EnvelopeDigest) -> Msg {
+        match self {
+            WeakWrite::Set(rpc::WeakSet {
+                key,
+                path: Some(path),
+                value,
+            }) => Msg::SetNamespaceKey(SetNamespaceKey {
+                prev,
+                key,
+                path,
+                value: Some(value),
+            }),
+            WeakWrite::Set(rpc::WeakSet {
+                key,
+                path: None,
+                value,
+            }) => Msg::SetNamespace(SetNamespace {
+                prev,
+                key,
+                namespace: Namespace { value },
+            }),
+            WeakWrite::Push(rpc::WeakPush { key, path, value }) => {
+                Msg::AmendNamespaceKey(AmendNamespaceKey {
+                    prev,
+                    key,
+                    path,
+                    op: AmendOp::AppendEntry(value),
+                })
+            }
+            WeakWrite::Delete(rpc::WeakDelete {
+                key,
+                path: Some(path),
+            }) => Msg::SetNamespaceKey(SetNamespaceKey {
+                prev,
+                key,
+                path,
+                value: None,
+            }),
+            WeakWrite::Delete(rpc::WeakDelete { key, path: None }) => {
+                Msg::DeleteNamespace(DeleteNamespace { prev, key })
+            }
+            WeakWrite::Increment(rpc::WeakIncrement {
+                key,
+                path,
+                delta,
+                min,
+                max,
+            }) => Msg::AmendNamespaceKey(AmendNamespaceKey {
+                prev,
+                key,
+                path,
+                op: AmendOp::IncrementDecrement(IncrementDecrement { delta, min, max }),
+            }),
+        }
+    }
 }
 
 /// Who a running node is: its id in the cluster, and the endpoint it
@@ -200,6 +306,21 @@ impl Server {
                 node: core.key_id(),
                 endpoint: peers.endpoint.as_ref().map(Endpoint::addr),
             })),
+            ServerMsg::Read(read, r) => r.respond(
+                core.read(&read.key, read.path.as_ref())
+                    .map(|(head, value)| rpc::ValueAt { head, value })
+                    .map_err(ChainError::Storage),
+            ),
+            // On the mainloop for the same reason `Insert` is: the write
+            // is signed onto the head the core stands at right now.
+            ServerMsg::WeakWrite(write, r) => r.respond(
+                core.sign_write(|prev| write.message(prev))
+                    .map(|(digest, insert)| rpc::Written {
+                        digest,
+                        head: core.head(),
+                        outcome: outcome(insert),
+                    }),
+            ),
         }
 
         ControlFlow::Continue(())
@@ -243,6 +364,16 @@ impl Server {
         if let Err(e) = rpc::serve(&mut stream, &mut Rpc(handle)).await {
             tracing::warn!(error = %e, "serving local connection");
         }
+    }
+}
+
+/// What an insert did, as the control protocol spells it.
+fn outcome(insert: Insert) -> rpc::WriteOutcome {
+    match insert {
+        Insert::Extended => rpc::WriteOutcome::Extended,
+        Insert::Reorged { from } => rpc::WriteOutcome::Reorged(rpc::Reorged { from }),
+        Insert::Unchanged => rpc::WriteOutcome::Unchanged,
+        Insert::Duplicate => rpc::WriteOutcome::Duplicate,
     }
 }
 
@@ -320,6 +451,18 @@ impl rpc::Handler for Rpc {
             }
             rpc::Request::GetEnvelopes(get) => self.envelopes(get.select, responses).await,
             rpc::Request::Watch(watch) => self.watch(watch.selector, responses).await,
+            rpc::Request::Read(read) => {
+                let value = self
+                    .0
+                    .read(read)
+                    .await
+                    .map_err(|err| rpc::Failure::internal(err.to_string()))?;
+                responses.send(rpc::Response::Value(value)).await
+            }
+            rpc::Request::WeakSet(set) => self.write(set, responses).await,
+            rpc::Request::WeakPush(push) => self.write(push, responses).await,
+            rpc::Request::WeakDelete(delete) => self.write(delete, responses).await,
+            rpc::Request::WeakIncrement(increment) => self.write(increment, responses).await,
         }
     }
 }
@@ -364,6 +507,23 @@ impl Rpc {
             // More connections than fit a u32 is not a count anyone reads.
             inbound: u32::try_from(inbound).unwrap_or(u32::MAX),
         })
+    }
+
+    /// Signs `write` onto the chain and answers with what that did.
+    async fn write(
+        &self,
+        write: impl Into<WeakWrite>,
+        responses: &mut rpc::Responses<'_>,
+    ) -> Result<(), rpc::Error> {
+        let written = self.0.weak_write(write).await.map_err(|err| match err {
+            // The chain judged the write and said no: the client's to fix.
+            // Anything else is the daemon's.
+            RequestError::Chain(ChainError::Apply(reason)) => {
+                rpc::Failure::rejected(reason.to_string())
+            }
+            other => rpc::Failure::internal(other.to_string()),
+        })?;
+        responses.send(rpc::Response::Written(written)).await
     }
 
     /// Streams the envelopes `select` picks out, one response frame each.
@@ -654,6 +814,26 @@ impl ServerHandle {
     ) -> Result<Option<SubscriptionHandle>, RequestError> {
         let (send, recv) = Responder::channel();
         let _ = self.0.send(ServerMsg::WatchOrphaned(digest, send)).await;
+        Self::answer(recv.await)
+    }
+
+    /// Reads the value `read` addresses, at the head the core stands at.
+    pub async fn read(&self, read: rpc::Read) -> Result<rpc::ValueAt, RequestError> {
+        let (send, recv) = Responder::channel();
+        let _ = self.0.send(ServerMsg::Read(read, send)).await;
+        Self::answer(recv.await)
+    }
+
+    /// Signs `write` into an envelope with the node's key and inserts it
+    /// onto the current head, waking every subscriber the movement
+    /// concerns — the peers announce it from there like any other head
+    /// movement.
+    pub async fn weak_write(
+        &self,
+        write: impl Into<WeakWrite>,
+    ) -> Result<rpc::Written, RequestError> {
+        let (send, recv) = Responder::channel();
+        let _ = self.0.send(ServerMsg::WeakWrite(write.into(), send)).await;
         Self::answer(recv.await)
     }
 

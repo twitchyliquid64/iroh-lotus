@@ -22,8 +22,9 @@ mod proto;
 pub use proto::{
     Attempt, ChainRange, ChainWalk, Changed, Connected, EndpointInfo, EnvelopeFrame,
     EnvelopeSelector, Failure, FailureKind, GetChainRange, GetEnvelopes, GetStatus, GetVersion,
-    NamespaceChange, NodeStatus, PeerInfo, PeerState, Request, Response, Verification, Watch,
-    WatchEvent, WatchPath, WatchSelector,
+    NamespaceChange, NodeStatus, PeerInfo, PeerState, Read, Reorged, Request, Response, ValueAt,
+    Verification, Watch, WatchEvent, WatchPath, WatchSelector, WeakDelete, WeakIncrement, WeakPush,
+    WeakSet, WriteOutcome, Written,
 };
 
 mod method;

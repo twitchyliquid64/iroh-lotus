@@ -12,7 +12,7 @@ pub use crate::core::{
 };
 
 mod server;
-pub use server::{Identity, RequestError, Server, ServerHandle};
+pub use server::{Identity, RequestError, Server, ServerHandle, WeakWrite};
 
 mod subscribe;
 pub use subscribe::{

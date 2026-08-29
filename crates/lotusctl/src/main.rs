@@ -4,12 +4,17 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use lotusd_rpc::{
     Call, ChainWalk, EnvelopeFrame, GetChainRange, GetEnvelopes, GetStatus, GetVersion,
-    NamespaceChange, NodeStatus, Watch, WatchEvent, WatchSelector, call,
+    NamespaceChange, NodeStatus, Read, ValueAt, Watch, WatchEvent, WatchSelector, WeakDelete,
+    WeakIncrement, WeakPush, WeakSet, WriteOutcome, Written, call,
 };
 use render::{ColorChoice, Entry, Render};
 use tokio::net::UnixStream;
 use tokio::runtime::Builder;
-use wire::{EnvelopeDigest, msg::NamespaceKey, subkey::SubkeyPath};
+use wire::{
+    EnvelopeDigest,
+    msg::{NamespaceKey, Value},
+    subkey::SubkeyPath,
+};
 
 /// The version of this CLI.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -36,6 +41,53 @@ enum Command {
     Chain(ChainCommand),
     /// Prints the envelopes named, wherever they sit in the daemon's log
     Show(ShowCommand),
+    /// Prints a value from a namespace, and the head it was read at
+    Read(ReadCommand),
+    /// Writes a value into a namespace, signed by the daemon's own key
+    #[command(
+        long_about = "Writes a value into a namespace, signed by the daemon's own key.\n\n\
+        The write is chained onto whatever head the daemon stands at, with no \
+        precondition on what was there before, and carries this one node's \
+        signature. With --path, the value replaces what the path addresses; every \
+        parent of it must already exist. Without, the whole namespace is set, and \
+        created if the ledger does not hold it.\n\n\
+        The value is always a JSON literal: a string, a whole number, true or \
+        false, an array or an object. A string is quoted even when it is one \
+        word, so `weak-set cfg '\"hello\"'` writes the string hello and \
+        `weak-set cfg 7` the number 7."
+    )]
+    WeakSet(WeakSetCommand),
+    /// Appends a value to an array in a namespace, signed by the daemon's
+    /// own key
+    #[command(
+        long_about = "Appends a value to an array in a namespace, signed by the daemon's own key.\n\n\
+        Chained onto whatever head the daemon stands at, as weak-set is. With \
+        --path, the value is appended to the array the path addresses; a path \
+        addressing nothing under an existing map starts a one-entry array. \
+        Without, the namespace's whole value must be one array.\n\n\
+        The value is always a JSON literal, strings quoted."
+    )]
+    WeakPush(WeakPushCommand),
+    /// Clears a value in a namespace, or deletes the namespace, signed by
+    /// the daemon's own key
+    #[command(
+        long_about = "Clears a value in a namespace, or deletes the namespace, signed by the daemon's own key.\n\n\
+        Chained onto whatever head the daemon stands at, as weak-set is. With \
+        --path, what the path addresses is removed — a key from its map, an \
+        element from its array — and must exist. Without, the whole namespace \
+        is deleted."
+    )]
+    WeakDelete(WeakDeleteCommand),
+    /// Adds to an integer in a namespace, signed by the daemon's own key
+    #[command(
+        long_about = "Adds to an integer in a namespace, signed by the daemon's own key.\n\n\
+        Chained onto whatever head the daemon stands at, as weak-set is. With \
+        --path, the delta is added to the integer the path addresses; without, \
+        the namespace's whole value must be one integer. Either way it must \
+        already exist. A negative delta decrements. The sum is clamped up to \
+        --min and down to --max where they are given."
+    )]
+    WeakIncrement(WeakIncrementCommand),
     /// Reports who the daemon is, how much of the chain it holds, and how
     /// it stands with its peers
     Status,
@@ -104,6 +156,239 @@ struct ShowCommand {
     /// The envelope digests to print, in hex
     #[arg(value_parser = parse_digest, required = true)]
     digests: Vec<EnvelopeDigest>,
+}
+
+/// The arguments for the read subcommand.
+#[derive(Debug, Args)]
+struct ReadCommand {
+    /// The namespace to read
+    #[arg(value_parser = parse_namespace_key)]
+    key: NamespaceKey,
+
+    /// A path within it, written as `servers[0].host`; the whole
+    /// namespace when left out
+    path: Option<SubkeyPath>,
+
+    /// Print the value in the ledger's tagged JSON form, which spells
+    /// every value type — `{"type": "int", "value": 7}` — where the plain
+    /// form prints a trusted key in that form and everything else bare
+    #[arg(long)]
+    tagged: bool,
+}
+
+/// The arguments for the weak-set subcommand.
+#[derive(Debug, Args)]
+struct WeakSetCommand {
+    /// The namespace to write to
+    #[arg(value_parser = parse_namespace_key)]
+    key: NamespaceKey,
+
+    /// The value to write, as a JSON literal — strings quoted
+    value: String,
+
+    /// The path within the namespace to set, written as `servers[0].host`;
+    /// the whole namespace when left out
+    #[arg(long, short)]
+    path: Option<SubkeyPath>,
+
+    /// Read the value in the ledger's tagged JSON form,
+    /// `{"type": "int", "value": 7}`, which can spell a trusted key
+    #[arg(long)]
+    tagged: bool,
+}
+
+impl WeakSetCommand {
+    /// The value these arguments write.
+    fn value(&self) -> Result<Value, MainError> {
+        parse_value(&self.value, self.tagged)
+    }
+}
+
+/// The arguments for the weak-push subcommand.
+#[derive(Debug, Args)]
+struct WeakPushCommand {
+    /// The namespace to write to
+    #[arg(value_parser = parse_namespace_key)]
+    key: NamespaceKey,
+
+    /// The value to append, as a JSON literal — strings quoted
+    value: String,
+
+    /// The path of the array within the namespace, written as
+    /// `servers[0].tags`; the namespace's whole value when left out
+    #[arg(long, short)]
+    path: Option<SubkeyPath>,
+
+    /// Read the value in the ledger's tagged JSON form,
+    /// `{"type": "int", "value": 7}`, which can spell a trusted key
+    #[arg(long)]
+    tagged: bool,
+}
+
+impl WeakPushCommand {
+    /// The value these arguments append.
+    fn value(&self) -> Result<Value, MainError> {
+        parse_value(&self.value, self.tagged)
+    }
+}
+
+/// The arguments for the weak-delete subcommand.
+#[derive(Debug, Args)]
+struct WeakDeleteCommand {
+    /// The namespace to write to
+    #[arg(value_parser = parse_namespace_key)]
+    key: NamespaceKey,
+
+    /// The path within the namespace to clear, written as
+    /// `servers[0].host`; the whole namespace is deleted when left out
+    #[arg(long, short)]
+    path: Option<SubkeyPath>,
+}
+
+/// The arguments for the weak-increment subcommand.
+#[derive(Debug, Args)]
+struct WeakIncrementCommand {
+    /// The namespace to write to
+    #[arg(value_parser = parse_namespace_key)]
+    key: NamespaceKey,
+
+    /// How much to add; negative to subtract
+    #[arg(allow_negative_numbers = true)]
+    delta: i64,
+
+    /// The path of the integer within the namespace, written as
+    /// `servers[0].weight`; the namespace's whole value when left out
+    #[arg(long, short)]
+    path: Option<SubkeyPath>,
+
+    /// Clamp the sum up to this floor
+    #[arg(long, allow_negative_numbers = true)]
+    min: Option<i64>,
+
+    /// Clamp the sum down to this ceiling
+    #[arg(long, allow_negative_numbers = true)]
+    max: Option<i64>,
+}
+
+/// Reads a value from the command line: a JSON literal, or the ledger's
+/// tagged form when `tagged`.
+fn parse_value(text: &str, tagged: bool) -> Result<Value, MainError> {
+    if tagged {
+        return serde_json::from_str(text)
+            .map_err(|e| MainError::Other(format!("`{text}` is not a tagged value: {e}")));
+    }
+    serde_json::from_str(text)
+        .map_err(|e| {
+            MainError::Other(format!(
+                "`{text}` is not JSON: {e}; a string is written quoted, as '\"text\"'"
+            ))
+        })
+        .and_then(value_from_json)
+}
+
+/// Reads a plain JSON value as a ledger value: objects are maps, numbers
+/// must be whole and fit an `i64`, and `null` is nothing the ledger holds.
+fn value_from_json(json: serde_json::Value) -> Result<Value, MainError> {
+    match json {
+        serde_json::Value::String(text) => Ok(Value::String(text)),
+        serde_json::Value::Bool(flag) => Ok(Value::Bool(flag)),
+        serde_json::Value::Number(number) => number.as_i64().map(Value::Int).ok_or_else(|| {
+            MainError::Other(format!("{number} is not a whole number an i64 holds"))
+        }),
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .map(value_from_json)
+            .collect::<Result<_, _>>()
+            .map(Value::Array),
+        serde_json::Value::Object(fields) => fields
+            .into_iter()
+            .map(|(key, value)| value_from_json(value).map(|value| (key, value)))
+            .collect::<Result<_, _>>()
+            .map(Value::Map),
+        serde_json::Value::Null => Err(MainError::Other(
+            "null is not a value the ledger holds".to_string(),
+        )),
+    }
+}
+
+/// Writes a ledger value as plain JSON: maps are objects, and a trusted
+/// key — which plain JSON has no shape for — is written in the ledger's
+/// tagged form, `{"type": "key", "value": …}`.
+fn value_to_json(value: &Value) -> Result<serde_json::Value, MainError> {
+    Ok(match value {
+        Value::String(text) => serde_json::Value::String(text.clone()),
+        Value::Int(n) => serde_json::Value::from(*n),
+        Value::Bool(flag) => serde_json::Value::Bool(*flag),
+        Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(value_to_json).collect::<Result<_, _>>()?)
+        }
+        Value::Map(fields) => serde_json::Value::Object(
+            fields
+                .iter()
+                .map(|(key, value)| value_to_json(value).map(|value| (key.clone(), value)))
+                .collect::<Result<_, _>>()?,
+        ),
+        Value::Key(_) => serde_json::to_value(value).map_err(MainError::Json)?,
+    })
+}
+
+/// What `read` reports.
+#[derive(Debug, serde::Serialize)]
+struct ReadLine {
+    head: EnvelopeDigest,
+    /// The value as JSON — plain or tagged as asked — or `null` when the
+    /// daemon holds nothing at the path.
+    value: serde_json::Value,
+}
+
+impl ReadLine {
+    fn new(at: ValueAt, tagged: bool) -> Result<Self, MainError> {
+        let value = match at.value {
+            None => serde_json::Value::Null,
+            Some(value) if tagged => serde_json::to_value(&value).map_err(MainError::Json)?,
+            Some(value) => value_to_json(&value)?,
+        };
+        Ok(Self {
+            head: at.head,
+            value,
+        })
+    }
+}
+
+impl fmt::Display for ReadLine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "head   {}", self.head.to_hex().as_ref())?;
+        match &self.value {
+            serde_json::Value::Null => writeln!(f, "value  — (not set)"),
+            value => writeln!(f, "value  {value}"),
+        }
+    }
+}
+
+/// What `weak-set` reports.
+#[derive(Debug, serde::Serialize)]
+struct WrittenLine {
+    envelope: EnvelopeDigest,
+    head: EnvelopeDigest,
+    outcome: WriteOutcome,
+}
+
+impl From<Written> for WrittenLine {
+    fn from(written: Written) -> Self {
+        Self {
+            envelope: written.digest,
+            head: written.head,
+            outcome: written.outcome,
+        }
+    }
+}
+
+impl fmt::Display for WrittenLine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "envelope  {}", self.envelope.to_hex().as_ref())?;
+        writeln!(f, "head      {}", self.head.to_hex().as_ref())?;
+        writeln!(f, "outcome   {}", self.outcome)
+    }
 }
 
 /// The arguments for the watch subcommand.
@@ -396,6 +681,71 @@ async fn async_main() -> Result<(), MainError> {
                 )));
             }
         }
+        Command::Read(args) => {
+            let path = cli.global_args.local_sock_path()?;
+            let at = call(
+                connect(&path).await?,
+                Read {
+                    key: args.key.clone(),
+                    path: args.path.clone(),
+                },
+            )
+            .await
+            .map_err(MainError::Rpc)?;
+            let line = ReadLine::new(at, args.tagged)?;
+
+            match cli.global_args.format {
+                Format::Text => print!("{line}"),
+                Format::Json => print_json(&line)?,
+            }
+        }
+        Command::WeakSet(args) => {
+            let value = args.value()?;
+            write(
+                &cli.global_args,
+                WeakSet {
+                    key: args.key.clone(),
+                    path: args.path.clone(),
+                    value,
+                },
+            )
+            .await?
+        }
+        Command::WeakPush(args) => {
+            let value = args.value()?;
+            write(
+                &cli.global_args,
+                WeakPush {
+                    key: args.key.clone(),
+                    path: args.path.clone(),
+                    value,
+                },
+            )
+            .await?
+        }
+        Command::WeakDelete(args) => {
+            write(
+                &cli.global_args,
+                WeakDelete {
+                    key: args.key.clone(),
+                    path: args.path.clone(),
+                },
+            )
+            .await?
+        }
+        Command::WeakIncrement(args) => {
+            write(
+                &cli.global_args,
+                WeakIncrement {
+                    key: args.key.clone(),
+                    path: args.path.clone(),
+                    delta: args.delta,
+                    min: args.min,
+                    max: args.max,
+                },
+            )
+            .await?
+        }
         Command::Status => {
             let path = cli.global_args.local_sock_path()?;
             let status = call(connect(&path).await?, GetStatus {})
@@ -515,6 +865,24 @@ impl fmt::Display for StatusText<'_> {
 
 fn plural(n: usize, one: &'static str, many: &'static str) -> &'static str {
     if n == 1 { one } else { many }
+}
+
+/// Sends one weak write to the daemon and prints what it did.
+async fn write<M>(args: &GlobalArgs, request: M) -> Result<(), MainError>
+where
+    M: lotusd_rpc::Method<Response = Written>,
+{
+    let path = args.local_sock_path()?;
+    let written = call(connect(&path).await?, request)
+        .await
+        .map_err(MainError::Rpc)?;
+    let line = WrittenLine::from(written);
+
+    match args.format {
+        Format::Text => print!("{line}"),
+        Format::Json => print_json(&line)?,
+    }
+    Ok(())
 }
 
 /// Fetches whatever `request` selects, reading the stream to its end.

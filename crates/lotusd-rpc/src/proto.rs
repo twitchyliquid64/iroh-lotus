@@ -12,7 +12,9 @@ use std::{
 use cbor2::Cbor;
 use chrono::{DateTime, Utc};
 use wire::{
-    Envelope, EnvelopeDigest, VerificationStatus, keys::KeyId, msg::NamespaceKey,
+    Envelope, EnvelopeDigest, VerificationStatus,
+    keys::KeyId,
+    msg::{NamespaceKey, Value},
     subkey::SubkeyPath,
 };
 
@@ -30,6 +32,160 @@ pub enum Request {
     GetEnvelopes(GetEnvelopes),
     /// See [`Watch`].
     Watch(Watch),
+    /// See [`Read`].
+    Read(Read),
+    /// See [`WeakSet`].
+    WeakSet(WeakSet),
+    /// See [`WeakPush`].
+    WeakPush(WeakPush),
+    /// See [`WeakDelete`].
+    WeakDelete(WeakDelete),
+    /// See [`WeakIncrement`].
+    WeakIncrement(WeakIncrement),
+}
+
+/// Asks the daemon for the value a path addresses in a namespace, at the
+/// canonical head it stands at.
+///
+/// Answered with one [`ValueAt`]: the head and the value are read under
+/// one borrow of the chain, so the value is the one that head holds.
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+pub struct Read {
+    #[cbor(key = 1)]
+    pub key: NamespaceKey,
+    /// The path within the namespace, or `None` for its whole value.
+    #[cbor(key = 2)]
+    pub path: Option<SubkeyPath>,
+}
+
+/// Answers [`Read`].
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+pub struct ValueAt {
+    /// The canonical head the value was read at.
+    #[cbor(key = 1)]
+    pub head: EnvelopeDigest,
+    /// What the path addresses, or `None` when the namespace is not held
+    /// or the path stops short of anything inside it.
+    #[cbor(key = 2)]
+    pub value: Option<Value>,
+}
+
+/// Asks the daemon to write `value` where `path` addresses in `key`,
+/// signed by the daemon's own key and chained onto its current head.
+///
+/// Weak in the sense that the write claims no precondition: it goes onto
+/// whatever head the daemon stands at when it arrives, and carries one
+/// node's signature only, so it is not immune to a heavier fork. The
+/// chain refuses writes the ledger's rules do not allow — a path into a
+/// namespace the ledger does not hold, or a reserved namespace given the
+/// wrong shape — as a [`FailureKind::Rejected`].
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+pub struct WeakSet {
+    #[cbor(key = 1)]
+    pub key: NamespaceKey,
+    /// The path within the namespace to set, or `None` to set the whole
+    /// namespace — creating it if the ledger does not hold it.
+    #[cbor(key = 2)]
+    pub path: Option<SubkeyPath>,
+    #[cbor(key = 3)]
+    pub value: Value,
+}
+
+/// Asks the daemon to append `value` to the array `path` addresses in
+/// `key` — the namespace's whole value when no path is given — signed and
+/// chained like a [`WeakSet`].
+///
+/// A path addressing nothing under an existing map becomes a one-entry
+/// array; anything else that is not an array is refused.
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+pub struct WeakPush {
+    #[cbor(key = 1)]
+    pub key: NamespaceKey,
+    #[cbor(key = 2)]
+    pub path: Option<SubkeyPath>,
+    #[cbor(key = 3)]
+    pub value: Value,
+}
+
+/// Asks the daemon to clear what `path` addresses in `key`, or to delete
+/// the whole namespace when no path is given — signed and chained like a
+/// [`WeakSet`]. Clearing what is not there is refused.
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+pub struct WeakDelete {
+    #[cbor(key = 1)]
+    pub key: NamespaceKey,
+    #[cbor(key = 2)]
+    pub path: Option<SubkeyPath>,
+}
+
+/// Asks the daemon to add `delta` to the integer `path` addresses in
+/// `key` — the namespace's whole value when no path is given — clamping
+/// the sum to whichever of `min` and `max` are set. Signed and chained
+/// like a [`WeakSet`]; the integer must exist.
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+pub struct WeakIncrement {
+    #[cbor(key = 1)]
+    pub key: NamespaceKey,
+    #[cbor(key = 2)]
+    pub path: Option<SubkeyPath>,
+    /// Negative to decrement.
+    #[cbor(key = 3)]
+    pub delta: i64,
+    #[cbor(key = 4)]
+    pub min: Option<i64>,
+    #[cbor(key = 5)]
+    pub max: Option<i64>,
+}
+
+/// Answers every weak write: [`WeakSet`], [`WeakPush`], [`WeakDelete`]
+/// and [`WeakIncrement`].
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+pub struct Written {
+    /// The digest of the envelope the write was signed into.
+    #[cbor(key = 1)]
+    pub digest: EnvelopeDigest,
+    /// The canonical head after the write.
+    #[cbor(key = 2)]
+    pub head: EnvelopeDigest,
+    #[cbor(key = 3)]
+    pub outcome: WriteOutcome,
+}
+
+/// What a write did to the canonical head — [`state::Insert`] as the
+/// control protocol spells it.
+///
+/// [`state::Insert`]: https://docs.rs/state
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteOutcome {
+    /// The head moved forward onto the new envelope.
+    Extended,
+    /// The canonical chain switched branches, abandoning `from`.
+    Reorged(Reorged),
+    /// The head did not move: the envelope lost its fork.
+    Unchanged,
+    /// The envelope was already in the log and the head did not move.
+    Duplicate,
+}
+
+impl fmt::Display for WriteOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WriteOutcome::Extended => f.write_str("extended"),
+            WriteOutcome::Reorged(Reorged { from }) => {
+                write!(f, "reorged from {}", from.to_hex().as_ref())
+            }
+            WriteOutcome::Unchanged => f.write_str("unchanged"),
+            WriteOutcome::Duplicate => f.write_str("duplicate"),
+        }
+    }
+}
+
+/// The head a reorg abandoned.
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+pub struct Reorged {
+    #[cbor(key = 1)]
+    pub from: EnvelopeDigest,
 }
 
 /// Asks the daemon for its version.
@@ -417,6 +573,10 @@ pub enum Response {
     Envelope(EnvelopeFrame),
     /// Answers [`Watch`], as many times as the chain moves.
     Watch(WatchEvent),
+    /// Answers [`Read`].
+    Value(ValueAt),
+    /// Answers every weak write, [`WeakSet`] and its siblings.
+    Written(Written),
     /// Ends the stream: the request could not be served to completion.
     Failed(Failure),
 }
@@ -431,6 +591,8 @@ impl Response {
             Response::Status(_) => "status",
             Response::Envelope(_) => "envelope",
             Response::Watch(_) => "watch event",
+            Response::Value(_) => "value",
+            Response::Written(_) => "write outcome",
             Response::Failed(_) => "failure",
         }
     }
@@ -480,6 +642,15 @@ impl Failure {
             message: message.into(),
         }
     }
+
+    /// The daemon understood the request, and the chain refused what it
+    /// asked for.
+    pub fn rejected(message: impl Into<String>) -> Self {
+        Self {
+            kind: FailureKind::Rejected,
+            message: message.into(),
+        }
+    }
 }
 
 impl fmt::Display for Failure {
@@ -496,4 +667,7 @@ pub enum FailureKind {
     Internal,
     /// The daemon does not serve this request.
     Unsupported,
+    /// The chain refused what the request asked for. Asking again the
+    /// same way gets the same answer; the request itself has to change.
+    Rejected,
 }

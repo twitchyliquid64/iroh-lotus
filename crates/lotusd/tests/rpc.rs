@@ -8,14 +8,18 @@ use std::{
 
 use lotusd::{Core, IfInitialized, Server, ServerHandle, VERSION};
 use lotusd_rpc::{
-    Call, ChainWalk, EnvelopeFrame, GetChainRange, GetEnvelopes, GetVersion, Verification, Watch,
-    WatchSelector, call,
+    Call, ChainWalk, EnvelopeFrame, Error, FailureKind, GetChainRange, GetEnvelopes, GetVersion,
+    Read, Verification, Watch, WatchSelector, WeakDelete, WeakIncrement, WeakPush, WeakSet,
+    WriteOutcome, Written, call,
 };
+use std::collections::BTreeMap;
 use tempfile::TempDir;
 use tokio::{net::UnixStream, task::JoinHandle, time::timeout};
+
 use wire::{
-    Envelope, EnvelopeDigest, Msg,
+    Envelope, EnvelopeDigest, Msg, VerificationStatus,
     msg::{Namespace, NamespaceKey, SetNamespace, Value},
+    subkey::SubkeyPath,
 };
 
 /// How long a step gets before we call it hung. Generous: this bounds a
@@ -431,4 +435,366 @@ async fn get_envelopes_applies_the_window_it_was_sent() {
             .collect::<Vec<_>>(),
         [second.digest().unwrap()],
     );
+}
+
+fn key(k: &str) -> NamespaceKey {
+    NamespaceKey::try_new(k).unwrap()
+}
+
+fn path(text: &str) -> SubkeyPath {
+    text.parse().unwrap()
+}
+
+/// Reads `key` at `path` over the socket.
+async fn read(socket: &Path, key: NamespaceKey, path: Option<SubkeyPath>) -> lotusd_rpc::ValueAt {
+    let stream = UnixStream::connect(socket).await.unwrap();
+    call(stream, Read { key, path }).await.unwrap()
+}
+
+/// Writes `value` to `key` at `path` over the socket.
+async fn weak_set(
+    socket: &Path,
+    key: NamespaceKey,
+    path: Option<SubkeyPath>,
+    value: Value,
+) -> Result<Written, Error> {
+    let stream = UnixStream::connect(socket).await.unwrap();
+    call(stream, WeakSet { key, path, value }).await
+}
+
+/// Sends any weak write over the socket.
+async fn write<M>(socket: &Path, request: M) -> Result<Written, Error>
+where
+    M: lotusd_rpc::Method<Response = Written>,
+{
+    let stream = UnixStream::connect(socket).await.unwrap();
+    call(stream, request).await
+}
+
+/// The value `key` holds at `path`.
+async fn value_at(socket: &Path, key: NamespaceKey, path: Option<SubkeyPath>) -> Option<Value> {
+    read(socket, key, path).await.value
+}
+
+/// Whether a write came back rejected, as opposed to done or broken.
+fn rejected(result: Result<Written, Error>) -> bool {
+    matches!(result, Err(Error::Failed(failure)) if failure.kind == FailureKind::Rejected)
+}
+
+/// A namespace the ledger does not hold reads as nothing, at the head the
+/// node stands at.
+#[tokio::test]
+async fn reading_what_is_not_there_answers_nothing() {
+    let dir = TempDir::new().unwrap();
+    let (head, path, _handle, _join) = serve(&dir).await;
+
+    let at = read(&path, key("cfg"), None).await;
+    assert_eq!(at.head, head);
+    assert_eq!(at.value, None);
+}
+
+/// A weak set of a whole namespace creates it, and reads back at the
+/// head the write moved the chain to.
+#[tokio::test]
+async fn a_weak_set_of_a_namespace_is_read_back() {
+    let dir = TempDir::new().unwrap();
+    let (genesis, socket, handle, _join) = serve(&dir).await;
+
+    let value = Value::Map(BTreeMap::from([(
+        "servers".to_owned(),
+        Value::Array(vec![Value::Map(BTreeMap::from([(
+            "host".to_owned(),
+            Value::String("a.example".to_owned()),
+        )]))]),
+    )]));
+    let written = weak_set(&socket, key("cfg"), None, value.clone())
+        .await
+        .unwrap();
+    assert_eq!(written.outcome, WriteOutcome::Extended);
+    assert_eq!(written.head, written.digest);
+    assert_ne!(written.head, genesis);
+    assert_eq!(handle.head().await.unwrap(), written.head);
+
+    let at = read(&socket, key("cfg"), None).await;
+    assert_eq!(at.head, written.head);
+    assert_eq!(at.value, Some(value));
+
+    let at = read(&socket, key("cfg"), Some(path("servers[0].host"))).await;
+    assert_eq!(at.value, Some(Value::String("a.example".to_owned())));
+
+    let at = read(&socket, key("cfg"), Some(path("servers[1]"))).await;
+    assert_eq!(at.value, None);
+}
+
+/// A weak set at a path replaces only what the path addresses.
+#[tokio::test]
+async fn a_weak_set_at_a_path_replaces_only_that_value() {
+    let dir = TempDir::new().unwrap();
+    let (_genesis, socket, _handle, _join) = serve(&dir).await;
+
+    let map = |host: &str, port: i64| {
+        Value::Map(BTreeMap::from([
+            ("host".to_owned(), Value::String(host.to_owned())),
+            ("port".to_owned(), Value::Int(port)),
+        ]))
+    };
+    weak_set(&socket, key("cfg"), None, map("a.example", 80))
+        .await
+        .unwrap();
+
+    let written = weak_set(&socket, key("cfg"), Some(path("port")), Value::Int(443))
+        .await
+        .unwrap();
+    assert_eq!(written.outcome, WriteOutcome::Extended);
+
+    let at = read(&socket, key("cfg"), None).await;
+    assert_eq!(at.head, written.head);
+    assert_eq!(at.value, Some(map("a.example", 443)));
+}
+
+/// The envelope a weak set writes carries the node's own signature, and
+/// the chain verified it against the trusted key set.
+#[tokio::test]
+async fn a_weak_set_is_signed_by_the_node() {
+    let dir = TempDir::new().unwrap();
+    let (_genesis, socket, handle, _join) = serve(&dir).await;
+    let node = handle.identity().await.unwrap().node;
+
+    let written = weak_set(&socket, key("cfg"), None, Value::Bool(true))
+        .await
+        .unwrap();
+
+    let frames = envelopes(&socket, GetEnvelopes::digests([written.digest])).await;
+    let (_digest, envelope) = frames.into_iter().next().unwrap().into_parts();
+    assert!(envelope.signatures().contains_key(&node));
+    assert!(matches!(
+        envelope.verification_status(),
+        VerificationStatus::AllMatched { total_weight } if *total_weight > 0
+    ));
+}
+
+/// A write the chain refuses — a path into a namespace that is not there —
+/// is reported as rejected, and the head stays put.
+#[tokio::test]
+async fn a_weak_set_the_chain_refuses_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let (genesis, socket, handle, _join) = serve(&dir).await;
+
+    let err = weak_set(&socket, key("cfg"), Some(path("port")), Value::Int(443))
+        .await
+        .unwrap_err();
+
+    let Error::Failed(failure) = err else {
+        panic!("expected a reported failure, got {err:?}");
+    };
+    assert_eq!(failure.kind, FailureKind::Rejected);
+    assert_eq!(handle.head().await.unwrap(), genesis);
+}
+
+/// A weak set moves the head like any insert, so a watcher hears of it.
+#[tokio::test]
+async fn a_weak_set_wakes_a_watcher() {
+    let dir = TempDir::new().unwrap();
+    let (genesis, socket, _handle, _join) = serve(&dir).await;
+
+    let stream = UnixStream::connect(&socket).await.unwrap();
+    let mut watch = Call::send(
+        stream,
+        Watch {
+            selector: WatchSelector::Namespace(key("cfg")),
+        },
+    )
+    .await
+    .unwrap();
+
+    let written = weak_set(&socket, key("cfg"), None, Value::Int(1))
+        .await
+        .unwrap();
+
+    let event = timeout(GRACE, watch.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let lotusd_rpc::WatchEvent::Changed(changed) = event else {
+        panic!("expected a change, got {event:?}");
+    };
+    assert_eq!(changed.from, genesis);
+    assert_eq!(changed.head, written.head);
+}
+
+/// A push appends to an array at a path, starts one under a map where
+/// there was nothing, and extends a namespace that is one array.
+#[tokio::test]
+async fn a_weak_push_appends_to_an_array() {
+    let dir = TempDir::new().unwrap();
+    let (_genesis, socket, _handle, _join) = serve(&dir).await;
+    let push = |path: Option<SubkeyPath>, n: i64| WeakPush {
+        key: key("cfg"),
+        path,
+        value: Value::Int(n),
+    };
+
+    weak_set(&socket, key("cfg"), None, Value::Map(BTreeMap::new()))
+        .await
+        .unwrap();
+    write(&socket, push(Some(path("xs")), 1)).await.unwrap();
+    let written = write(&socket, push(Some(path("xs")), 2)).await.unwrap();
+    assert_eq!(written.outcome, WriteOutcome::Extended);
+    assert_eq!(
+        value_at(&socket, key("cfg"), Some(path("xs"))).await,
+        Some(Value::Array(vec![Value::Int(1), Value::Int(2)]))
+    );
+
+    weak_set(&socket, key("list"), None, Value::Array(vec![]))
+        .await
+        .unwrap();
+    write(&socket, push(None, 7).with_key("list"))
+        .await
+        .unwrap();
+    assert_eq!(
+        value_at(&socket, key("list"), None).await,
+        Some(Value::Array(vec![Value::Int(7)]))
+    );
+}
+
+/// A push onto something that is not an array is rejected.
+#[tokio::test]
+async fn a_weak_push_onto_a_non_array_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let (_genesis, socket, _handle, _join) = serve(&dir).await;
+
+    weak_set(&socket, key("cfg"), None, Value::Int(1))
+        .await
+        .unwrap();
+    assert!(rejected(
+        write(
+            &socket,
+            WeakPush {
+                key: key("cfg"),
+                path: None,
+                value: Value::Int(2),
+            },
+        )
+        .await
+    ));
+    assert_eq!(
+        value_at(&socket, key("cfg"), None).await,
+        Some(Value::Int(1))
+    );
+}
+
+/// A delete at a path removes that value; without one it removes the
+/// namespace. Deleting what is not there is rejected.
+#[tokio::test]
+async fn a_weak_delete_clears_a_value_or_a_namespace() {
+    let dir = TempDir::new().unwrap();
+    let (_genesis, socket, _handle, _join) = serve(&dir).await;
+    let delete = |path: Option<SubkeyPath>| WeakDelete {
+        key: key("cfg"),
+        path,
+    };
+
+    weak_set(
+        &socket,
+        key("cfg"),
+        None,
+        Value::Map(BTreeMap::from([
+            ("a".to_owned(), Value::Int(1)),
+            ("b".to_owned(), Value::Int(2)),
+        ])),
+    )
+    .await
+    .unwrap();
+
+    let written = write(&socket, delete(Some(path("a")))).await.unwrap();
+    assert_eq!(written.outcome, WriteOutcome::Extended);
+    assert_eq!(
+        value_at(&socket, key("cfg"), None).await,
+        Some(Value::Map(BTreeMap::from([(
+            "b".to_owned(),
+            Value::Int(2)
+        )])))
+    );
+    assert!(rejected(write(&socket, delete(Some(path("a")))).await));
+
+    write(&socket, delete(None)).await.unwrap();
+    assert_eq!(value_at(&socket, key("cfg"), None).await, None);
+    assert!(rejected(write(&socket, delete(None)).await));
+}
+
+/// An increment adds to the integer at a path, clamps to the bounds
+/// given, and is rejected where there is no integer to add to.
+#[tokio::test]
+async fn a_weak_increment_adds_and_clamps() {
+    let dir = TempDir::new().unwrap();
+    let (_genesis, socket, _handle, _join) = serve(&dir).await;
+    let increment = |path: Option<SubkeyPath>, delta: i64, max: Option<i64>| WeakIncrement {
+        key: key("cfg"),
+        path,
+        delta,
+        min: None,
+        max,
+    };
+
+    weak_set(
+        &socket,
+        key("cfg"),
+        None,
+        Value::Map(BTreeMap::from([("n".to_owned(), Value::Int(5))])),
+    )
+    .await
+    .unwrap();
+
+    let written = write(&socket, increment(Some(path("n")), -2, None))
+        .await
+        .unwrap();
+    assert_eq!(written.outcome, WriteOutcome::Extended);
+    assert_eq!(
+        value_at(&socket, key("cfg"), Some(path("n"))).await,
+        Some(Value::Int(3))
+    );
+
+    write(&socket, increment(Some(path("n")), 100, Some(10)))
+        .await
+        .unwrap();
+    assert_eq!(
+        value_at(&socket, key("cfg"), Some(path("n"))).await,
+        Some(Value::Int(10))
+    );
+
+    assert!(rejected(
+        write(&socket, increment(Some(path("m")), 1, None)).await
+    ));
+    assert!(rejected(write(&socket, increment(None, 1, None)).await));
+
+    weak_set(&socket, key("count"), None, Value::Int(0))
+        .await
+        .unwrap();
+    write(&socket, increment(None, 1, None).with_key("count"))
+        .await
+        .unwrap();
+    assert_eq!(
+        value_at(&socket, key("count"), None).await,
+        Some(Value::Int(1))
+    );
+}
+
+/// Retargets a request built for one namespace at another.
+trait WithKey {
+    fn with_key(self, key: &str) -> Self;
+}
+
+impl WithKey for WeakPush {
+    fn with_key(mut self, k: &str) -> Self {
+        self.key = key(k);
+        self
+    }
+}
+
+impl WithKey for WeakIncrement {
+    fn with_key(mut self, k: &str) -> Self {
+        self.key = key(k);
+        self
+    }
 }

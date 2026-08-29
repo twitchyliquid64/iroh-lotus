@@ -2,7 +2,8 @@
 
 use crate::{
     ChainRange, EnvelopeFrame, Error, GetChainRange, GetEnvelopes, GetStatus, GetVersion,
-    NodeStatus, Request, Response, Watch, WatchEvent,
+    NodeStatus, Read, Request, Response, ValueAt, Watch, WatchEvent, WeakDelete, WeakIncrement,
+    WeakPush, WeakSet, Written,
 };
 
 /// One method of the local control protocol.
@@ -63,4 +64,9 @@ methods! {
     "status": GetStatus => Status(NodeStatus),
     "envelopes": GetEnvelopes => Envelope(EnvelopeFrame),
     "watch": Watch => Watch(WatchEvent),
+    "read": Read => Value(ValueAt),
+    "weak set": WeakSet => Written(Written),
+    "weak push": WeakPush => Written(Written),
+    "weak delete": WeakDelete => Written(Written),
+    "weak increment": WeakIncrement => Written(Written),
 }
