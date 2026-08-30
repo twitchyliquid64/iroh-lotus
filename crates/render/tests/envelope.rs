@@ -283,6 +283,31 @@ fn colour_does_not_disturb_the_columns() {
     );
 }
 
+/// A path and the namespace it reaches into are painted apart, so a name
+/// in one never reads as a name in the other.
+#[test]
+fn the_path_and_the_namespace_are_painted_apart() {
+    let coloured = Render::new()
+        .with_palette(Palette::Ansi)
+        .envelope(&entry(2, write(Some(Value::Int(1)))));
+
+    // Not through `field`: the escapes are the point, and it reads the
+    // labels a palette has painted over.
+    let message = coloured
+        .lines()
+        .find(|line| plain(line).starts_with("   message "))
+        .expect("a stanza carries a message line");
+    assert!(
+        message.contains("servers\x1b[0m in namespace \x1b["),
+        "the path closes before the namespace opens: got {message:?}",
+    );
+    assert!(
+        plain(message).ends_with("set servers in namespace cfg"),
+        "got {:?}",
+        plain(message),
+    );
+}
+
 /// Both palettes reset what they set, so nothing bleeds past the value it
 /// was meant to colour.
 #[test]
@@ -507,7 +532,7 @@ fn a_cleared_path_shows_no_value() {
     let rendered = Render::new().envelope(&entry(2, write(None)));
 
     assert!(
-        rendered.contains("   message        clear cfg at servers\n"),
+        rendered.contains("   message        clear servers in namespace cfg\n"),
         "got {rendered}"
     );
     assert!(!rendered.contains("   value  "), "got {rendered}");
@@ -558,7 +583,7 @@ fn an_increment_shows_the_bounds_it_clamps_to() {
     let plain = amend(AmendOp::IncrementDecrement(IncrementDecrement::new(-1)));
     let rendered = Render::new().envelope(&entry(2, plain));
     assert!(
-        rendered.contains("   message        add -1 to cfg at servers\n"),
+        rendered.contains("   message        add -1 to servers in namespace cfg\n"),
         "got {rendered}"
     );
     assert!(!rendered.contains("clamped"), "got {rendered}");

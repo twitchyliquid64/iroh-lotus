@@ -171,7 +171,7 @@ impl Render {
                 |prev| self.digest(prev).to_string(),
             ),
         )?;
-        self.field(out, "message", describe(envelope.payload()))?;
+        self.field(out, "message", self.describe(envelope.payload()))?;
         self.write_detail(out, envelope.payload())?;
 
         self.field(
@@ -303,6 +303,48 @@ impl Render {
         values.try_for_each(|value| writeln!(out, "   {:<LABEL$}  {value}", ""))
     }
 
+    /// A one-line summary of what a message does.
+    ///
+    /// The namespace and the path into it are painted apart: a name in
+    /// one is not a name in the other, and a path carries key ids that
+    /// would otherwise read as digests.
+    fn describe(&self, msg: &Msg) -> String {
+        let namespace = |key| format!("namespace {}", self.palette.paint(Style::Namespace, key));
+        let inside = |path, key| {
+            format!(
+                "{} in {}",
+                self.palette.paint(Style::Path, path),
+                namespace(key)
+            )
+        };
+        match msg {
+            Msg::Init(init) => format!(
+                "init, {}",
+                plural(init.state.namespaces.len(), "namespace", "namespaces")
+            ),
+            Msg::SetNamespace(set) => format!("set {}", namespace(&set.key)),
+            Msg::SetNamespaceKey(set) => match set.value {
+                Some(_) => format!("set {}", inside(&set.path, &set.key)),
+                None => format!("clear {}", inside(&set.path, &set.key)),
+            },
+            Msg::AmendNamespaceKey(amend) => {
+                let target = amend
+                    .path
+                    .as_ref()
+                    .map_or_else(|| namespace(&amend.key), |path| inside(path, &amend.key));
+                match &amend.op {
+                    AmendOp::AppendEntry(_) => format!("append an entry to {target}"),
+                    AmendOp::IncrementDecrement(op) => format!("add {} to {target}", op.delta),
+                    AmendOp::DeleteMatching(predicate) => format!(
+                        "delete entries of {target} matching {}",
+                        plural(predicate.as_ref().len(), "condition", "conditions")
+                    ),
+                }
+            }
+            Msg::DeleteNamespace(delete) => format!("delete {}", namespace(&delete.key)),
+        }
+    }
+
     /// How an envelope's signatures scored, as stored — the status a node
     /// resolves forks on, not one recomputed here.
     fn describe_status(&self, status: &VerificationStatus) -> impl fmt::Display {
@@ -320,36 +362,6 @@ impl Render {
             }
         };
         self.palette.paint(style, text)
-    }
-}
-
-/// A one-line summary of what a message does.
-fn describe(msg: &Msg) -> String {
-    match msg {
-        Msg::Init(init) => format!(
-            "init, {}",
-            plural(init.state.namespaces.len(), "namespace", "namespaces")
-        ),
-        Msg::SetNamespace(set) => format!("set namespace {}", set.key),
-        Msg::SetNamespaceKey(set) => match set.value {
-            Some(_) => format!("set {} at {}", set.key, set.path),
-            None => format!("clear {} at {}", set.key, set.path),
-        },
-        Msg::AmendNamespaceKey(amend) => {
-            let target = amend.path.as_ref().map_or_else(
-                || amend.key.to_string(),
-                |path| format!("{} at {path}", amend.key),
-            );
-            match &amend.op {
-                AmendOp::AppendEntry(_) => format!("append an entry to {target}"),
-                AmendOp::IncrementDecrement(op) => format!("add {} to {target}", op.delta),
-                AmendOp::DeleteMatching(predicate) => format!(
-                    "delete entries of {target} matching {}",
-                    plural(predicate.as_ref().len(), "condition", "conditions")
-                ),
-            }
-        }
-        Msg::DeleteNamespace(delete) => format!("delete namespace {}", delete.key),
     }
 }
 

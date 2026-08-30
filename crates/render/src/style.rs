@@ -71,6 +71,10 @@ pub(crate) enum Style {
     Digest,
     /// A field's label.
     Label,
+    /// The name of a namespace.
+    Namespace,
+    /// A path into the value a namespace holds.
+    Path,
     /// What an envelope is — `root`, `head`.
     Mark,
     /// Signatures that all verified.
@@ -90,6 +94,8 @@ impl Style {
             Style::Header => "1",
             Style::Digest => "36",
             Style::Label => "2",
+            Style::Namespace => "35",
+            Style::Path => "34",
             Style::Mark => "1;33",
             Style::Good => "32",
             Style::Unknown => "33",
