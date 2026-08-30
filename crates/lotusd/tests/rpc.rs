@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use lotusd::{Core, IfInitialized, Server, ServerHandle, VERSION};
+use lotusd::{Core, IfInitialized, NodeKeys, Server, ServerHandle, VERSION};
 use lotusd_rpc::{
     Call, ChainWalk, EnvelopeFrame, Error, FailureKind, GetChainRange, GetEnvelopes, GetVersion,
     Read, Verification, Watch, WatchSelector, WeakDelete, WeakDeleteMatching, WeakIncrement,
@@ -38,38 +38,49 @@ async fn watchers(handle: &ServerHandle, count: usize) {
 }
 
 /// Starts a server on a fresh cluster in `dir`, alongside the head it began
-/// at — the genesis, which is also its root — and the socket clients reach
-/// it on.
+/// at — the genesis, which is also its root — the node's keys, and the
+/// socket clients reach it on.
 ///
 /// The handle comes back for the caller to hold: the mainloop stops as soon
 /// as the last one is dropped.
-async fn serve(dir: &TempDir) -> (EnvelopeDigest, PathBuf, ServerHandle, JoinHandle<()>) {
+async fn serve(
+    dir: &TempDir,
+) -> (
+    EnvelopeDigest,
+    NodeKeys,
+    PathBuf,
+    ServerHandle,
+    JoinHandle<()>,
+) {
     let core = Core::create_in_state_dir(dir.path().to_path_buf(), IfInitialized::Fail)
         .await
         .unwrap();
     let head = core.head();
+    let keys = core.keys().clone();
 
     // Short name on purpose: a unix socket path has to fit in SUN_LEN.
     let path = dir.path().join("s.sock");
     let listener = tokio::net::UnixListener::bind(&path).unwrap();
     let (handle, join) = Server::new(core, listener).unwrap().run().await;
 
-    (head, path, handle, join)
+    (head, keys, path, handle, join)
 }
 
-/// A write onto `prev`, distinct per `value` so two of them fork.
-fn set_ns(prev: EnvelopeDigest, value: &str) -> Envelope {
-    Envelope::new(Msg::SetNamespace(SetNamespace {
+/// A write onto `prev`, distinct per `value` so two of them fork, signed
+/// by the node so the chain accepts it.
+fn set_ns(keys: &NodeKeys, prev: EnvelopeDigest, value: &str) -> Envelope {
+    keys.sign(Envelope::new(Msg::SetNamespace(SetNamespace {
         prev,
         key: NamespaceKey::try_new("cfg").unwrap(),
         namespace: Namespace {
             value: Value::String(value.to_string()),
         },
-    }))
+    })))
+    .unwrap()
 }
 
-/// Splits two siblings into (winner, loser) by the fork rule: equal
-/// signature weight, so the higher digest wins.
+/// Splits two siblings into (winner, loser) by the fork rule: both carry
+/// the same single signature, so the higher digest wins.
 fn ranked(a: Envelope, b: Envelope) -> (Envelope, Envelope) {
     if a.digest().unwrap() > b.digest().unwrap() {
         (a, b)
@@ -93,7 +104,7 @@ async fn envelopes(path: &Path, request: GetEnvelopes) -> Vec<EnvelopeFrame> {
 #[tokio::test]
 async fn get_version_answers_with_the_daemon_version() {
     let dir = TempDir::new().unwrap();
-    let (_head, path, _handle, _join) = serve(&dir).await;
+    let (_head, _keys, path, _handle, _join) = serve(&dir).await;
 
     let stream = UnixStream::connect(&path).await.unwrap();
     assert_eq!(call(stream, GetVersion {}).await.unwrap(), VERSION);
@@ -102,7 +113,7 @@ async fn get_version_answers_with_the_daemon_version() {
 #[tokio::test]
 async fn get_chain_range_answers_with_the_range_the_core_holds() {
     let dir = TempDir::new().unwrap();
-    let (head, path, _handle, _join) = serve(&dir).await;
+    let (head, _keys, path, _handle, _join) = serve(&dir).await;
 
     let stream = UnixStream::connect(&path).await.unwrap();
     let range = call(stream, GetChainRange {}).await.unwrap();
@@ -115,7 +126,7 @@ async fn get_chain_range_answers_with_the_range_the_core_holds() {
 #[tokio::test]
 async fn each_connection_carries_its_own_request() {
     let dir = TempDir::new().unwrap();
-    let (head, path, _handle, _join) = serve(&dir).await;
+    let (head, _keys, path, _handle, _join) = serve(&dir).await;
 
     for _ in 0..3 {
         let stream = UnixStream::connect(&path).await.unwrap();
@@ -126,7 +137,7 @@ async fn each_connection_carries_its_own_request() {
 #[tokio::test]
 async fn connections_are_served_off_the_mainloop() {
     let dir = TempDir::new().unwrap();
-    let (head, path, _handle, _join) = serve(&dir).await;
+    let (head, _keys, path, _handle, _join) = serve(&dir).await;
 
     // More at once than the mainloop's message channel is deep. Each answer
     // comes back through that channel, so serving these on the mainloop
@@ -151,7 +162,7 @@ async fn connections_are_served_off_the_mainloop() {
 #[tokio::test]
 async fn a_watch_registers_a_subscription() {
     let dir = TempDir::new().unwrap();
-    let (_head, path, handle, _join) = serve(&dir).await;
+    let (_head, _keys, path, handle, _join) = serve(&dir).await;
     assert_eq!(handle.watchers().await.unwrap(), 0);
 
     let stream = UnixStream::connect(&path).await.unwrap();
@@ -173,7 +184,7 @@ async fn a_watch_registers_a_subscription() {
 #[tokio::test]
 async fn a_dropped_connection_deregisters_its_subscription() {
     let dir = TempDir::new().unwrap();
-    let (_head, path, handle, _join) = serve(&dir).await;
+    let (_head, _keys, path, handle, _join) = serve(&dir).await;
 
     let stream = UnixStream::connect(&path).await.unwrap();
     let call = Call::send(
@@ -197,7 +208,7 @@ async fn a_dropped_connection_deregisters_its_subscription() {
 #[tokio::test]
 async fn watchers_are_deregistered_one_at_a_time() {
     let dir = TempDir::new().unwrap();
-    let (_head, path, handle, _join) = serve(&dir).await;
+    let (_head, _keys, path, handle, _join) = serve(&dir).await;
 
     let mut calls = Vec::new();
     for _ in 0..3 {
@@ -227,11 +238,11 @@ async fn watchers_are_deregistered_one_at_a_time() {
 #[tokio::test]
 async fn get_envelopes_answers_with_the_canonical_chain_oldest_first() {
     let dir = TempDir::new().unwrap();
-    let (head, path, handle, _join) = serve(&dir).await;
+    let (head, keys, path, handle, _join) = serve(&dir).await;
 
-    let first = set_ns(head, "one");
+    let first = set_ns(&keys, head, "one");
     handle.insert([first.clone()]).await.unwrap();
-    let second = set_ns(first.digest().unwrap(), "two");
+    let second = set_ns(&keys, first.digest().unwrap(), "two");
     handle.insert([second.clone()]).await.unwrap();
 
     let digests: Vec<_> = envelopes(&path, GetEnvelopes::chain())
@@ -251,11 +262,11 @@ async fn get_envelopes_answers_with_the_canonical_chain_oldest_first() {
 #[tokio::test]
 async fn get_envelopes_limits_from_the_head_end() {
     let dir = TempDir::new().unwrap();
-    let (head, path, handle, _join) = serve(&dir).await;
+    let (head, keys, path, handle, _join) = serve(&dir).await;
 
-    let first = set_ns(head, "one");
+    let first = set_ns(&keys, head, "one");
     handle.insert([first.clone()]).await.unwrap();
-    let second = set_ns(first.digest().unwrap(), "two");
+    let second = set_ns(&keys, first.digest().unwrap(), "two");
     handle.insert([second.clone()]).await.unwrap();
 
     let digests: Vec<_> = envelopes(&path, GetEnvelopes::newest(2))
@@ -276,9 +287,9 @@ async fn get_envelopes_limits_from_the_head_end() {
 #[tokio::test]
 async fn get_envelopes_by_digest_reaches_an_orphan() {
     let dir = TempDir::new().unwrap();
-    let (head, path, handle, _join) = serve(&dir).await;
+    let (head, keys, path, handle, _join) = serve(&dir).await;
 
-    let (winner, loser) = ranked(set_ns(head, "one"), set_ns(head, "two"));
+    let (winner, loser) = ranked(set_ns(&keys, head, "one"), set_ns(&keys, head, "two"));
     handle.insert([loser.clone()]).await.unwrap();
     handle.insert([winner.clone()]).await.unwrap();
     let orphan = loser.digest().unwrap();
@@ -302,9 +313,9 @@ async fn get_envelopes_by_digest_reaches_an_orphan() {
 #[tokio::test]
 async fn get_envelopes_answers_in_the_order_asked_and_skips_what_it_lacks() {
     let dir = TempDir::new().unwrap();
-    let (head, path, handle, _join) = serve(&dir).await;
+    let (head, keys, path, handle, _join) = serve(&dir).await;
 
-    let first = set_ns(head, "one");
+    let first = set_ns(&keys, head, "one");
     handle.insert([first.clone()]).await.unwrap();
     let unknown = EnvelopeDigest::from_bytes([0xab; 32]);
 
@@ -331,7 +342,7 @@ async fn get_envelopes_answers_in_the_order_asked_and_skips_what_it_lacks() {
 #[tokio::test]
 async fn a_fetched_envelope_keeps_the_verification_status_the_node_gave_it() {
     let dir = TempDir::new().unwrap();
-    let (head, path, _handle, _join) = serve(&dir).await;
+    let (head, _keys, path, _handle, _join) = serve(&dir).await;
 
     let frames = envelopes(&path, GetEnvelopes::digests([head])).await;
     let [frame] = frames.as_slice() else {
@@ -359,12 +370,12 @@ const WINDOW: Duration = Duration::from_millis(250);
 #[tokio::test]
 async fn get_envelopes_reports_when_the_node_stored_each_envelope() {
     let dir = TempDir::new().unwrap();
-    let (head, path, handle, _join) = serve(&dir).await;
+    let (head, keys, path, handle, _join) = serve(&dir).await;
 
     // Compared in milliseconds: a reading taken straight off chrono here
     // carries nanoseconds a `StoredAt` does not.
     let before = chrono::Utc::now().timestamp_millis();
-    let inserted = set_ns(head, "one");
+    let inserted = set_ns(&keys, head, "one");
     handle.insert([inserted.clone()]).await.unwrap();
     let after = chrono::Utc::now().timestamp_millis();
 
@@ -394,13 +405,13 @@ async fn get_envelopes_reports_when_the_node_stored_each_envelope() {
 #[tokio::test]
 async fn get_envelopes_applies_the_window_it_was_sent() {
     let dir = TempDir::new().unwrap();
-    let (head, path, handle, _join) = serve(&dir).await;
+    let (head, keys, path, handle, _join) = serve(&dir).await;
 
     // The genesis ages out of the window; what follows lands inside it.
     tokio::time::sleep(OLD).await;
-    let first = set_ns(head, "one");
+    let first = set_ns(&keys, head, "one");
     handle.insert([first.clone()]).await.unwrap();
-    let second = set_ns(first.digest().unwrap(), "two");
+    let second = set_ns(&keys, first.digest().unwrap(), "two");
     handle.insert([second.clone()]).await.unwrap();
 
     let recent: Vec<_> = envelopes(&path, GetEnvelopes::since(WINDOW))
@@ -486,7 +497,7 @@ fn rejected(result: Result<Written, Error>) -> bool {
 #[tokio::test]
 async fn reading_what_is_not_there_answers_nothing() {
     let dir = TempDir::new().unwrap();
-    let (head, path, _handle, _join) = serve(&dir).await;
+    let (head, _keys, path, _handle, _join) = serve(&dir).await;
 
     let at = read(&path, key("cfg"), None).await;
     assert_eq!(at.head, head);
@@ -498,7 +509,7 @@ async fn reading_what_is_not_there_answers_nothing() {
 #[tokio::test]
 async fn a_weak_set_of_a_namespace_is_read_back() {
     let dir = TempDir::new().unwrap();
-    let (genesis, socket, handle, _join) = serve(&dir).await;
+    let (genesis, _keys, socket, handle, _join) = serve(&dir).await;
 
     let value = Value::Map(BTreeMap::from([(
         "servers".to_owned(),
@@ -530,7 +541,7 @@ async fn a_weak_set_of_a_namespace_is_read_back() {
 #[tokio::test]
 async fn a_weak_set_at_a_path_replaces_only_that_value() {
     let dir = TempDir::new().unwrap();
-    let (_genesis, socket, _handle, _join) = serve(&dir).await;
+    let (_genesis, _keys, socket, _handle, _join) = serve(&dir).await;
 
     let map = |host: &str, port: i64| {
         Value::Map(BTreeMap::from([
@@ -557,7 +568,7 @@ async fn a_weak_set_at_a_path_replaces_only_that_value() {
 #[tokio::test]
 async fn a_weak_set_is_signed_by_the_node() {
     let dir = TempDir::new().unwrap();
-    let (_genesis, socket, handle, _join) = serve(&dir).await;
+    let (_genesis, _keys, socket, handle, _join) = serve(&dir).await;
     let node = handle.identity().await.unwrap().node;
 
     let written = weak_set(&socket, key("cfg"), None, Value::Bool(true))
@@ -578,7 +589,7 @@ async fn a_weak_set_is_signed_by_the_node() {
 #[tokio::test]
 async fn a_weak_set_the_chain_refuses_is_rejected() {
     let dir = TempDir::new().unwrap();
-    let (genesis, socket, handle, _join) = serve(&dir).await;
+    let (genesis, _keys, socket, handle, _join) = serve(&dir).await;
 
     let err = weak_set(&socket, key("cfg"), Some(path("port")), Value::Int(443))
         .await
@@ -595,7 +606,7 @@ async fn a_weak_set_the_chain_refuses_is_rejected() {
 #[tokio::test]
 async fn a_weak_set_wakes_a_watcher() {
     let dir = TempDir::new().unwrap();
-    let (genesis, socket, _handle, _join) = serve(&dir).await;
+    let (genesis, _keys, socket, _handle, _join) = serve(&dir).await;
 
     let stream = UnixStream::connect(&socket).await.unwrap();
     let mut watch = Call::send(
@@ -628,7 +639,7 @@ async fn a_weak_set_wakes_a_watcher() {
 #[tokio::test]
 async fn a_weak_push_appends_to_an_array() {
     let dir = TempDir::new().unwrap();
-    let (_genesis, socket, _handle, _join) = serve(&dir).await;
+    let (_genesis, _keys, socket, _handle, _join) = serve(&dir).await;
     let push = |path: Option<SubkeyPath>, n: i64| WeakPush {
         key: key("cfg"),
         path,
@@ -662,7 +673,7 @@ async fn a_weak_push_appends_to_an_array() {
 #[tokio::test]
 async fn a_weak_push_onto_a_non_array_is_rejected() {
     let dir = TempDir::new().unwrap();
-    let (_genesis, socket, _handle, _join) = serve(&dir).await;
+    let (_genesis, _keys, socket, _handle, _join) = serve(&dir).await;
 
     weak_set(&socket, key("cfg"), None, Value::Int(1))
         .await
@@ -689,7 +700,7 @@ async fn a_weak_push_onto_a_non_array_is_rejected() {
 #[tokio::test]
 async fn a_weak_delete_clears_a_value_or_a_namespace() {
     let dir = TempDir::new().unwrap();
-    let (_genesis, socket, _handle, _join) = serve(&dir).await;
+    let (_genesis, _keys, socket, _handle, _join) = serve(&dir).await;
     let delete = |path: Option<SubkeyPath>| WeakDelete {
         key: key("cfg"),
         path,
@@ -729,7 +740,7 @@ async fn a_weak_delete_clears_a_value_or_a_namespace() {
 #[tokio::test]
 async fn a_weak_delete_matching_removes_entries_by_content() {
     let dir = TempDir::new().unwrap();
-    let (_genesis, socket, _handle, _join) = serve(&dir).await;
+    let (_genesis, _keys, socket, _handle, _join) = serve(&dir).await;
     let server = |id: &str| {
         Value::Map(BTreeMap::from([(
             "id".to_owned(),
@@ -789,7 +800,7 @@ async fn a_weak_delete_matching_removes_entries_by_content() {
 #[tokio::test]
 async fn a_weak_increment_adds_and_clamps() {
     let dir = TempDir::new().unwrap();
-    let (_genesis, socket, _handle, _join) = serve(&dir).await;
+    let (_genesis, _keys, socket, _handle, _join) = serve(&dir).await;
     let increment = |path: Option<SubkeyPath>, delta: i64, max: Option<i64>| WeakIncrement {
         key: key("cfg"),
         path,

@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use lotusd::{
-    Core, IfInitialized, Server, ServerHandle,
+    Core, IfInitialized, NodeKeys, Server, ServerHandle,
     sync_driver::{self, SyncError},
 };
 use sync::{Message, PullOutcome, ServeOutcome};
@@ -16,22 +16,25 @@ use wire::{
     msg::{Namespace, NamespaceKey, SetNamespace, Value},
 };
 
-fn set_ns(prev: EnvelopeDigest, k: &str, v: &str) -> Envelope {
-    Envelope::new(Msg::SetNamespace(SetNamespace {
+/// A write onto `prev`, signed by the cluster's one node key — every node
+/// here runs off a copy of the same state dir.
+fn set_ns(keys: &NodeKeys, prev: EnvelopeDigest, k: &str, v: &str) -> Envelope {
+    keys.sign(Envelope::new(Msg::SetNamespace(SetNamespace {
         prev,
         key: NamespaceKey::try_new(k).unwrap(),
         namespace: Namespace {
             value: Value::String(v.to_string()),
         },
-    }))
+    })))
+    .unwrap()
 }
 
 /// A linear run of `n` envelopes chaining onto `prev`.
-fn run_of(prev: EnvelopeDigest, label: &str, n: usize) -> Vec<Envelope> {
+fn run_of(keys: &NodeKeys, prev: EnvelopeDigest, label: &str, n: usize) -> Vec<Envelope> {
     let mut cursor = prev;
     (0..n)
         .map(|i| {
-            let envelope = set_ns(cursor, &format!("{label}{i}"), "v");
+            let envelope = set_ns(keys, cursor, &format!("{label}{i}"), "v");
             cursor = envelope.digest().unwrap();
             envelope
         })
@@ -58,15 +61,16 @@ async fn serve_dir(dir: &TempDir) -> ServerHandle {
     handle
 }
 
-/// `n` running nodes of one cluster, alongside its genesis head.
-async fn cluster(n: usize) -> (Vec<TempDir>, EnvelopeDigest, Vec<ServerHandle>) {
+/// `n` running nodes of one cluster, alongside its genesis head and the
+/// key every one of them signs with.
+async fn cluster(n: usize) -> (Vec<TempDir>, EnvelopeDigest, NodeKeys, Vec<ServerHandle>) {
     let dirs: Vec<TempDir> = (0..n).map(|_| TempDir::new().unwrap()).collect();
 
-    let genesis = {
+    let (genesis, keys) = {
         let core = Core::create_in_state_dir(dirs[0].path().to_path_buf(), IfInitialized::Fail)
             .await
             .unwrap();
-        core.head()
+        (core.head(), core.keys().clone())
         // The core drops here, closing its store before the copies.
     };
     for dir in &dirs[1..] {
@@ -77,15 +81,23 @@ async fn cluster(n: usize) -> (Vec<TempDir>, EnvelopeDigest, Vec<ServerHandle>) 
     for dir in &dirs {
         handles.push(serve_dir(dir).await);
     }
-    (dirs, genesis, handles)
+    (dirs, genesis, keys, handles)
 }
 
-/// Two running nodes of one cluster, alongside its genesis head.
-async fn cluster_pair() -> (TempDir, TempDir, EnvelopeDigest, ServerHandle, ServerHandle) {
-    let (mut dirs, genesis, mut handles) = cluster(2).await;
+/// Two running nodes of one cluster, alongside its genesis head and the
+/// key they sign with.
+async fn cluster_pair() -> (
+    TempDir,
+    TempDir,
+    EnvelopeDigest,
+    NodeKeys,
+    ServerHandle,
+    ServerHandle,
+) {
+    let (mut dirs, genesis, keys, mut handles) = cluster(2).await;
     let (dir_b, dir_a) = (dirs.pop().unwrap(), dirs.pop().unwrap());
     let (b, a) = (handles.pop().unwrap(), handles.pop().unwrap());
-    (dir_a, dir_b, genesis, a, b)
+    (dir_a, dir_b, genesis, keys, a, b)
 }
 
 /// One sync session between two nodes over a pipe: `puller` pulls from
@@ -106,8 +118,8 @@ async fn sync_once(
 
 #[tokio::test]
 async fn a_behind_node_pulls_the_missing_suffix() {
-    let (_da, _db, genesis, a, b) = cluster_pair().await;
-    a.insert(run_of(genesis, "a", 3)).await.unwrap();
+    let (_da, _db, genesis, keys, a, b) = cluster_pair().await;
+    a.insert(run_of(&keys, genesis, "a", 3)).await.unwrap();
 
     let (pulled, served) = sync_once(&b, &a).await;
 
@@ -122,7 +134,7 @@ async fn a_behind_node_pulls_the_missing_suffix() {
 /// routine `PeerClosed`.
 #[tokio::test]
 async fn an_identical_pair_parts_at_hello() {
-    let (_da, _db, _genesis, a, b) = cluster_pair().await;
+    let (_da, _db, _genesis, _keys, a, b) = cluster_pair().await;
 
     let (pulled, served) = sync_once(&b, &a).await;
 
@@ -134,9 +146,13 @@ async fn an_identical_pair_parts_at_hello() {
 /// pulls the other, fork choice lands both on the same head.
 #[tokio::test]
 async fn forked_nodes_converge_after_pulling_each_other() {
-    let (_da, _db, genesis, a, b) = cluster_pair().await;
-    a.insert([set_ns(genesis, "a", "ours")]).await.unwrap();
-    b.insert([set_ns(genesis, "b", "theirs")]).await.unwrap();
+    let (_da, _db, genesis, keys, a, b) = cluster_pair().await;
+    a.insert([set_ns(&keys, genesis, "a", "ours")])
+        .await
+        .unwrap();
+    b.insert([set_ns(&keys, genesis, "b", "theirs")])
+        .await
+        .unwrap();
 
     let (pulled, _) = sync_once(&b, &a).await;
     assert!(matches!(pulled, Ok(PullOutcome::Synced { .. })));
@@ -148,19 +164,22 @@ async fn forked_nodes_converge_after_pulling_each_other() {
 
     let head = a.head().await.unwrap();
     assert_eq!(b.head().await.unwrap(), head);
-    let winner = [set_ns(genesis, "a", "ours"), set_ns(genesis, "b", "theirs")]
-        .into_iter()
-        .map(|envelope| envelope.digest().unwrap())
-        .max()
-        .unwrap();
+    let winner = [
+        set_ns(&keys, genesis, "a", "ours"),
+        set_ns(&keys, genesis, "b", "theirs"),
+    ]
+    .into_iter()
+    .map(|envelope| envelope.digest().unwrap())
+    .max()
+    .unwrap();
     assert_eq!(head, winner, "the higher digest wins the fork");
 }
 
 /// A second pull right after converging is a no-op.
 #[tokio::test]
 async fn a_second_pull_is_already_current() {
-    let (_da, _db, genesis, a, b) = cluster_pair().await;
-    a.insert(run_of(genesis, "a", 2)).await.unwrap();
+    let (_da, _db, genesis, keys, a, b) = cluster_pair().await;
+    a.insert(run_of(&keys, genesis, "a", 2)).await.unwrap();
 
     let (pulled, _) = sync_once(&b, &a).await;
     assert!(matches!(pulled, Ok(PullOutcome::Synced { .. })));
@@ -173,11 +192,13 @@ async fn a_second_pull_is_already_current() {
 /// convergence argument rests on.
 #[tokio::test]
 async fn a_change_relays_through_a_middle_node() {
-    let (_dirs, genesis, handles) = cluster(3).await;
+    let (_dirs, genesis, keys, handles) = cluster(3).await;
     let [one, two, three]: [ServerHandle; 3] = handles.try_into().unwrap();
 
     // Written at one end, pulled hop by hop to the other…
-    one.insert([set_ns(genesis, "a", "forward")]).await.unwrap();
+    one.insert([set_ns(&keys, genesis, "a", "forward")])
+        .await
+        .unwrap();
     let head = one.head().await.unwrap();
 
     let (pulled, _) = sync_once(&two, &one).await;
@@ -194,7 +215,10 @@ async fn a_change_relays_through_a_middle_node() {
     assert_eq!(three.head().await.unwrap(), head);
 
     // …and a write at the far end relays back the other way.
-    three.insert([set_ns(head, "a", "backward")]).await.unwrap();
+    three
+        .insert([set_ns(&keys, head, "a", "backward")])
+        .await
+        .unwrap();
     let head = three.head().await.unwrap();
 
     let (pulled, _) = sync_once(&two, &three).await;
@@ -216,7 +240,7 @@ async fn a_change_relays_through_a_middle_node() {
 /// of its body is read.
 #[tokio::test]
 async fn an_oversized_frame_claim_fails_the_session() {
-    let (_da, _db, _genesis, _a, b) = cluster_pair().await;
+    let (_da, _db, _genesis, _keys, _a, b) = cluster_pair().await;
 
     let (pull_end, mut peer) = tokio::io::duplex(64 * 1024);
     // `peer` stays open in this scope: the failure must come from the
@@ -232,7 +256,7 @@ async fn an_oversized_frame_claim_fails_the_session() {
 /// A peer speaking another protocol version is a breach at `Hello`.
 #[tokio::test]
 async fn a_version_mismatch_is_a_breach() {
-    let (_da, _db, _genesis, _a, b) = cluster_pair().await;
+    let (_da, _db, _genesis, _keys, _a, b) = cluster_pair().await;
     let head = b.head().await.unwrap();
 
     let (pull_end, mut peer) = tokio::io::duplex(64 * 1024);
@@ -257,7 +281,7 @@ async fn a_version_mismatch_is_a_breach() {
 /// A peer that hangs up mid-frame is truncated, not merely closed.
 #[tokio::test]
 async fn a_close_mid_frame_is_truncated() {
-    let (_da, _db, _genesis, _a, b) = cluster_pair().await;
+    let (_da, _db, _genesis, _keys, _a, b) = cluster_pair().await;
 
     let (pull_end, mut peer) = tokio::io::duplex(64 * 1024);
     let pulled = tokio::join!(sync_driver::pull(pull_end, &b), async {

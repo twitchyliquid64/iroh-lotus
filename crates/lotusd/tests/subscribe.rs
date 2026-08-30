@@ -42,21 +42,33 @@ fn pair() -> Namespace {
     }
 }
 
-fn set_ns(prev: EnvelopeDigest, k: &str, namespace: Namespace) -> Envelope {
-    Envelope::new(Msg::SetNamespace(SetNamespace {
-        prev,
-        key: key(k),
-        namespace,
-    }))
+/// A write onto `prev`, signed by the node whose core it is bound for:
+/// the chain takes no envelope without a signature.
+fn set_ns(core: &Core, prev: EnvelopeDigest, k: &str, namespace: Namespace) -> Envelope {
+    signed(
+        core,
+        Envelope::new(Msg::SetNamespace(SetNamespace {
+            prev,
+            key: key(k),
+            namespace,
+        })),
+    )
 }
 
-fn set_key(prev: EnvelopeDigest, k: &str, path: SubkeyPath, value: Value) -> Envelope {
-    Envelope::new(Msg::SetNamespaceKey(SetNamespaceKey {
-        prev,
-        key: key(k),
-        path,
-        value: Some(value),
-    }))
+fn signed(core: &Core, envelope: Envelope) -> Envelope {
+    core.keys().sign(envelope).unwrap()
+}
+
+fn set_key(core: &Core, prev: EnvelopeDigest, k: &str, path: SubkeyPath, value: Value) -> Envelope {
+    signed(
+        core,
+        Envelope::new(Msg::SetNamespaceKey(SetNamespaceKey {
+            prev,
+            key: key(k),
+            path,
+            value: Some(value),
+        })),
+    )
 }
 
 #[tokio::test]
@@ -66,7 +78,7 @@ async fn inserting_notifies_a_subscriber_watching_the_namespace() {
     let mut subscription = core.subscribe(ChangeFilter::namespace(key("a")));
     assert_eq!(subscription.opened_at(), core.head());
 
-    let envelope = set_ns(core.head(), "a", pair());
+    let envelope = set_ns(&core, core.head(), "a", pair());
     assert_eq!(core.insert([envelope]).unwrap(), Insert::Extended);
 
     let notification = subscription.next().await.unwrap();
@@ -82,15 +94,16 @@ async fn a_path_subscriber_hears_only_about_its_own_path() {
     let dir = TempDir::new().unwrap();
     let mut core = core(&dir).await;
 
-    let envelope = set_ns(core.head(), "a", pair());
+    let envelope = set_ns(&core, core.head(), "a", pair());
     core.insert([envelope]).unwrap();
 
     let mut subscription = core.subscribe(ChangeFilter::path(key("a"), keys(&["host"])));
 
-    let sibling = set_key(core.head(), "a", keys(&["port"]), Value::Int(2));
+    let sibling = set_key(&core, core.head(), "a", keys(&["port"]), Value::Int(2));
     core.insert([sibling]).unwrap();
 
     let watched = set_key(
+        &core,
         core.head(),
         "a",
         keys(&["host"]),
@@ -123,7 +136,10 @@ async fn a_losing_fork_wakes_nobody() {
     let root = core.head();
 
     let (winner, loser) = {
-        let (one, two) = (set_ns(root, "a", pair()), set_ns(root, "b", pair()));
+        let (one, two) = (
+            set_ns(&core, root, "a", pair()),
+            set_ns(&core, root, "b", pair()),
+        );
         if one.digest().unwrap() > two.digest().unwrap() {
             (one, two)
         } else {
@@ -148,7 +164,10 @@ async fn a_reorg_notifies_about_the_branch_left_behind() {
     let root = core.head();
 
     let (winner, loser) = {
-        let (one, two) = (set_ns(root, "a", pair()), set_ns(root, "b", pair()));
+        let (one, two) = (
+            set_ns(&core, root, "a", pair()),
+            set_ns(&core, root, "b", pair()),
+        );
         if one.digest().unwrap() > two.digest().unwrap() {
             (one, two)
         } else {

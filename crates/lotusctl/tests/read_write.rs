@@ -8,7 +8,7 @@ use iroh::{
     Endpoint, EndpointAddr, RelayMode, SecretKey, endpoint::presets,
     test_utils::test_transport::TestNetwork,
 };
-use lotusd::{Core, IfInitialized, Server, ServerHandle, peer_ingress::Protocol};
+use lotusd::{Core, IfInitialized, NodeKeys, Server, ServerHandle, peer_ingress::Protocol};
 use state::CLUSTER_NODES_KEY;
 use tempfile::TempDir;
 use tokio::{net::UnixListener, process::Command, task::JoinHandle, time::timeout};
@@ -89,6 +89,8 @@ struct Node {
     handle: ServerHandle,
     _join: JoinHandle<()>,
     endpoint: Option<Endpoint>,
+    /// The key it signs the envelopes these tests write with.
+    keys: NodeKeys,
     genesis: EnvelopeDigest,
 }
 
@@ -100,6 +102,7 @@ impl Node {
             .await
             .unwrap();
         let genesis = core.root();
+        let keys = core.keys().clone();
         let listener = UnixListener::bind(dir.path().join("local.sock")).unwrap();
         let endpoint = match network {
             Some(network) => Some(endpoint(network).await),
@@ -116,6 +119,7 @@ impl Node {
             handle,
             _join: join,
             endpoint,
+            keys,
             genesis,
         }
     }
@@ -141,11 +145,14 @@ impl Node {
                 })
                 .collect(),
         );
-        let envelope = Envelope::new(Msg::SetNamespace(SetNamespace {
-            prev,
-            key: NamespaceKey::try_new(CLUSTER_NODES_KEY).unwrap(),
-            namespace: Namespace { value },
-        }));
+        let envelope = self
+            .keys
+            .sign(Envelope::new(Msg::SetNamespace(SetNamespace {
+                prev,
+                key: NamespaceKey::try_new(CLUSTER_NODES_KEY).unwrap(),
+                namespace: Namespace { value },
+            })))
+            .unwrap();
         self.handle.insert([envelope]).await.unwrap();
     }
 

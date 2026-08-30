@@ -256,6 +256,8 @@ struct Node {
     join: JoinHandle<()>,
     endpoint: Endpoint,
     id: wire::KeyId,
+    /// The key it signs the envelopes these tests write with.
+    keys: lotusd::NodeKeys,
     _dir: TempDir,
 }
 
@@ -267,6 +269,7 @@ impl Node {
             .await
             .unwrap();
         let id = core.key_id();
+        let keys = core.keys().clone();
         // Short name on purpose: a unix socket path has to fit in SUN_LEN.
         let listener = UnixListener::bind(dir.path().join("s.sock")).unwrap();
         let endpoint = Endpoint::builder(presets::Minimal)
@@ -287,6 +290,7 @@ impl Node {
             join,
             endpoint,
             id,
+            keys,
             _dir: dir,
         }
     }
@@ -366,6 +370,7 @@ impl Node {
                 ),
             },
         }));
+        let envelope = self.keys.sign(envelope).unwrap();
         self.handle.insert([envelope]).await.unwrap();
     }
 

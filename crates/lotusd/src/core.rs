@@ -9,7 +9,9 @@ use std::{
 use ed25519_zebra::SigningKey;
 use iroh::SecretKey;
 use rand::{TryRng, rngs::SysRng};
-use state::{CLUSTER_NODES_KEY, Chain, ChangeDiffer, Insert, TRUSTED_KEYS_KEY};
+use state::{
+    CLUSTER_NODES_KEY, Chain, ChangeDiffer, Insert, MIN_ENVELOPE_SIGNATURES_KEY, TRUSTED_KEYS_KEY,
+};
 use storage::{LogEntry, SqliteStorage, Storage, StoredAt};
 use tokio::{fs, io::AsyncWriteExt};
 use wire::{
@@ -140,6 +142,13 @@ impl Core {
                                     .expect("infallible converting a valid EndpointAddr"),
                                 )])),
                             )])),
+                        },
+                    ),
+                    (
+                        NamespaceKey::try_new(MIN_ENVELOPE_SIGNATURES_KEY)
+                            .expect("the reserved key is static"),
+                        Namespace {
+                            value: Value::Int(1),
                         },
                     ),
                 ]),
@@ -845,7 +854,7 @@ async fn load_secret(
 
 /// The two keys that make a node: what [`Core`] runs on, and what
 /// [`Core::prepare_join`] lays down before there is a chain to run.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NodeKeys {
     /// The one key this node signs ledger envelopes with.
     signing_key: SigningKey,
@@ -916,7 +925,7 @@ impl NodeKeys {
     /// Every part of the envelope but its signatures must already be in
     /// place — timestamps included — since the digest signed here covers
     /// them.
-    fn sign(&self, envelope: Envelope) -> Result<Envelope, wire::Error> {
+    pub fn sign(&self, envelope: Envelope) -> Result<Envelope, wire::Error> {
         let digest = envelope.signature_digest()?;
         let signature = Signature::Ed25519(Ed25519Signature::from_bytes(
             self.signing_key.sign(digest.as_bytes()).to_bytes(),

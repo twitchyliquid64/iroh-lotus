@@ -4,7 +4,7 @@
 
 use std::{process::Stdio, time::Duration};
 
-use lotusd::{Core, IfInitialized, Server, ServerHandle};
+use lotusd::{Core, IfInitialized, NodeKeys, Server, ServerHandle};
 use tempfile::TempDir;
 use tokio::{net::UnixListener, process::Command, task::JoinHandle, time::timeout};
 use wire::{
@@ -17,32 +17,36 @@ use wire::{
 const GRACE: Duration = Duration::from_secs(20);
 
 /// Starts a daemon in `dir`, on the socket `lotusctl --state-dir dir` looks
-/// for. The join handle is returned so the mainloop outlives the test.
-async fn serve(dir: &TempDir) -> (EnvelopeDigest, ServerHandle, JoinHandle<()>) {
+/// for. Its keys come back too: the cluster takes no envelope this node
+/// has not signed. The join handle is returned so the mainloop outlives
+/// the test.
+async fn serve(dir: &TempDir) -> (EnvelopeDigest, NodeKeys, ServerHandle, JoinHandle<()>) {
     let core = Core::create_in_state_dir(dir.path().to_path_buf(), IfInitialized::Fail)
         .await
         .unwrap();
     let head = core.head();
+    let keys = core.keys().clone();
 
     let listener = UnixListener::bind(dir.path().join("local.sock")).unwrap();
     let (handle, join) = Server::new(core, listener).unwrap().run().await;
 
-    (head, handle, join)
+    (head, keys, handle, join)
 }
 
-/// A write onto `prev`.
-fn set_ns(prev: EnvelopeDigest, value: &str) -> Envelope {
-    Envelope::new(Msg::SetNamespace(SetNamespace {
+/// A write onto `prev`, signed by the node so the chain accepts it.
+fn set_ns(keys: &NodeKeys, prev: EnvelopeDigest, value: &str) -> Envelope {
+    keys.sign(Envelope::new(Msg::SetNamespace(SetNamespace {
         prev,
         key: NamespaceKey::try_new("cfg").unwrap(),
         namespace: Namespace {
             value: Value::String(value.to_string()),
         },
-    }))
+    })))
+    .unwrap()
 }
 
-/// Splits two siblings into (winner, loser) by the fork rule: equal
-/// signature weight, so the higher digest wins.
+/// Splits two siblings into (winner, loser) by the fork rule: both carry
+/// the same single signature, so the higher digest wins.
 fn ranked(a: Envelope, b: Envelope) -> (Envelope, Envelope) {
     if a.digest().unwrap() > b.digest().unwrap() {
         (a, b)
@@ -88,11 +92,11 @@ fn hex(digest: EnvelopeDigest) -> String {
 
 /// A cluster three envelopes deep, with the daemon serving it.
 async fn chain_of_three(dir: &TempDir) -> ([EnvelopeDigest; 3], ServerHandle, JoinHandle<()>) {
-    let (head, handle, join) = serve(dir).await;
+    let (head, keys, handle, join) = serve(dir).await;
 
-    let first = set_ns(head, "one");
+    let first = set_ns(&keys, head, "one");
     handle.insert([first.clone()]).await.unwrap();
-    let second = set_ns(first.digest().unwrap(), "two");
+    let second = set_ns(&keys, first.digest().unwrap(), "two");
     handle.insert([second.clone()]).await.unwrap();
 
     (
@@ -269,9 +273,9 @@ async fn colour_is_off_when_the_output_is_not_a_terminal() {
 #[tokio::test]
 async fn show_prints_an_envelope_that_has_left_the_chain() {
     let dir = TempDir::new().unwrap();
-    let (head, handle, _join) = serve(&dir).await;
+    let (head, keys, handle, _join) = serve(&dir).await;
 
-    let (winner, loser) = ranked(set_ns(head, "one"), set_ns(head, "two"));
+    let (winner, loser) = ranked(set_ns(&keys, head, "one"), set_ns(&keys, head, "two"));
     handle.insert([loser.clone()]).await.unwrap();
     handle.insert([winner]).await.unwrap();
     let orphan = loser.digest().unwrap();

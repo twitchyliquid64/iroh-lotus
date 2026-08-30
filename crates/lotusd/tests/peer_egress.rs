@@ -11,7 +11,7 @@ use iroh::{
     test_utils::test_transport::TestNetwork,
 };
 use lotusd::{
-    Core, IfInitialized, Server, ServerHandle,
+    Core, IfInitialized, NodeKeys, Server, ServerHandle,
     peer_egress::{PeerState, PeerStatus},
     peer_ingress::Protocol,
 };
@@ -97,6 +97,8 @@ struct Node {
     endpoint: Endpoint,
     /// Its real node id — the key its own genesis entry sits under.
     id: KeyId,
+    /// The key it signs the envelopes these tests write with.
+    keys: NodeKeys,
     _dir: TempDir,
 }
 
@@ -107,6 +109,7 @@ impl Node {
             .await
             .unwrap();
         let id = core.key_id();
+        let keys = core.keys().clone();
         // Short name on purpose: a unix socket path has to fit in SUN_LEN.
         let listener = UnixListener::bind(dir.path().join("s.sock")).unwrap();
         let endpoint = endpoint(network).await;
@@ -120,6 +123,7 @@ impl Node {
             join,
             endpoint,
             id,
+            keys,
             _dir: dir,
         }
     }
@@ -133,13 +137,16 @@ impl Node {
     /// Replaces this node's `cluster-nodes` with `entries`.
     async fn list(&self, entries: impl IntoIterator<Item = (KeyId, EndpointAddr)>) {
         let prev = self.handle.head().await.unwrap();
-        let envelope = Envelope::new(Msg::SetNamespace(SetNamespace {
-            prev,
-            key: NamespaceKey::try_new(CLUSTER_NODES_KEY).unwrap(),
-            namespace: Namespace {
-                value: cluster_nodes(entries),
-            },
-        }));
+        let envelope = self
+            .keys
+            .sign(Envelope::new(Msg::SetNamespace(SetNamespace {
+                prev,
+                key: NamespaceKey::try_new(CLUSTER_NODES_KEY).unwrap(),
+                namespace: Namespace {
+                    value: cluster_nodes(entries),
+                },
+            })))
+            .unwrap();
         self.handle.insert([envelope]).await.unwrap();
     }
 
@@ -160,7 +167,7 @@ impl Node {
     /// Extends this node's chain by one envelope, returning the new head.
     async fn extend(&self, label: &str) -> EnvelopeDigest {
         let prev = self.handle.head().await.unwrap();
-        let envelope = set_ns(prev, label, "v");
+        let envelope = self.keys.sign(set_ns(prev, label, "v")).unwrap();
         let head = envelope.digest().unwrap();
         self.handle.insert([envelope]).await.unwrap();
         head

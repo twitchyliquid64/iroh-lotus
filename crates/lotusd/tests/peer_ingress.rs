@@ -10,7 +10,7 @@ use iroh::{
     test_utils::test_transport::TestNetwork,
 };
 use lotusd::{
-    Core, IfInitialized, Server, ServerHandle,
+    Core, IfInitialized, NodeKeys, Server, ServerHandle,
     peer_ingress::Protocol,
     sync_driver::{self, SyncError},
 };
@@ -26,22 +26,25 @@ use wire::{
 /// test failure, it does not measure anything.
 const GRACE: Duration = Duration::from_secs(10);
 
-fn set_ns(prev: EnvelopeDigest, k: &str, v: &str) -> Envelope {
-    Envelope::new(Msg::SetNamespace(SetNamespace {
+/// A write onto `prev`, signed by the cluster's one node key — both nodes
+/// here run off a copy of the same state dir.
+fn set_ns(keys: &NodeKeys, prev: EnvelopeDigest, k: &str, v: &str) -> Envelope {
+    keys.sign(Envelope::new(Msg::SetNamespace(SetNamespace {
         prev,
         key: NamespaceKey::try_new(k).unwrap(),
         namespace: Namespace {
             value: Value::String(v.to_string()),
         },
-    }))
+    })))
+    .unwrap()
 }
 
 /// A linear run of `n` envelopes chaining onto `prev`.
-fn run_of(prev: EnvelopeDigest, label: &str, n: usize) -> Vec<Envelope> {
+fn run_of(keys: &NodeKeys, prev: EnvelopeDigest, label: &str, n: usize) -> Vec<Envelope> {
     let mut cursor = prev;
     (0..n)
         .map(|i| {
-            let envelope = set_ns(cursor, &format!("{label}{i}"), "v");
+            let envelope = set_ns(keys, cursor, &format!("{label}{i}"), "v");
             cursor = envelope.digest().unwrap();
             envelope
         })
@@ -137,16 +140,16 @@ impl Node {
     }
 }
 
-/// Two nodes of one cluster, alongside its genesis head. The first gets
-/// `a_limit` as its peer connection cap.
-async fn cluster_pair(a_limit: Option<usize>) -> (Node, Node, EnvelopeDigest) {
+/// Two nodes of one cluster, alongside its genesis head and the key they
+/// both sign with. The first gets `a_limit` as its peer connection cap.
+async fn cluster_pair(a_limit: Option<usize>) -> (Node, Node, EnvelopeDigest, NodeKeys) {
     let dir_a = TempDir::new().unwrap();
     let dir_b = TempDir::new().unwrap();
-    let genesis = {
+    let (genesis, keys) = {
         let core = Core::create_in_state_dir(dir_a.path().to_path_buf(), IfInitialized::Fail)
             .await
             .unwrap();
-        core.head()
+        (core.head(), core.keys().clone())
         // The core drops here, closing its store before the copy.
     };
     copy_state_dir(dir_a.path(), dir_b.path());
@@ -154,13 +157,16 @@ async fn cluster_pair(a_limit: Option<usize>) -> (Node, Node, EnvelopeDigest) {
     let network = TestNetwork::new();
     let a = Node::start(dir_a, &network, a_limit).await;
     let b = Node::start(dir_b, &network, None).await;
-    (a, b, genesis)
+    (a, b, genesis, keys)
 }
 
 #[tokio::test]
 async fn a_behind_node_pulls_over_iroh() {
-    let (a, b, genesis) = cluster_pair(None).await;
-    a.handle.insert(run_of(genesis, "a", 3)).await.unwrap();
+    let (a, b, genesis, keys) = cluster_pair(None).await;
+    a.handle
+        .insert(run_of(&keys, genesis, "a", 3))
+        .await
+        .unwrap();
 
     let conn = b.connect(&a).await;
     let pulled = b.pull_over(&conn).await.unwrap();
@@ -174,10 +180,13 @@ async fn a_behind_node_pulls_over_iroh() {
 /// turn, and the connection outlives them all.
 #[tokio::test]
 async fn one_connection_serves_pull_after_pull() {
-    let (a, b, genesis) = cluster_pair(None).await;
+    let (a, b, genesis, keys) = cluster_pair(None).await;
     let conn = b.connect(&a).await;
 
-    a.handle.insert(run_of(genesis, "a", 2)).await.unwrap();
+    a.handle
+        .insert(run_of(&keys, genesis, "a", 2))
+        .await
+        .unwrap();
     let first = b.pull_over(&conn).await.unwrap();
     let second = b.pull_over(&conn).await.unwrap();
 
@@ -185,7 +194,10 @@ async fn one_connection_serves_pull_after_pull() {
     assert_eq!(first, PullOutcome::Synced { head, ingested: 2 });
     assert_eq!(second, PullOutcome::AlreadyCurrent);
 
-    a.handle.insert(run_of(head, "more", 1)).await.unwrap();
+    a.handle
+        .insert(run_of(&keys, head, "more", 1))
+        .await
+        .unwrap();
     let third = b.pull_over(&conn).await.unwrap();
     assert_eq!(
         third,
@@ -198,7 +210,7 @@ async fn one_connection_serves_pull_after_pull() {
 
 #[tokio::test]
 async fn peer_connections_counts_the_peers_being_served() {
-    let (a, b, _genesis) = cluster_pair(None).await;
+    let (a, b, _genesis, _keys) = cluster_pair(None).await;
     assert_eq!(a.handle.peer_connections().await.unwrap(), 0);
 
     let conn = b.connect(&a).await;
@@ -224,7 +236,7 @@ async fn a_node_without_an_endpoint_has_no_peers() {
 /// a connection to open streams on.
 #[tokio::test]
 async fn connections_over_the_limit_are_refused() {
-    let (a, b, _genesis) = cluster_pair(Some(1)).await;
+    let (a, b, _genesis, _keys) = cluster_pair(Some(1)).await;
 
     let _held = b.connect(&a).await;
     a.wait_for_peers(1).await;
@@ -239,7 +251,7 @@ async fn connections_over_the_limit_are_refused() {
 /// endpoint closed behind it.
 #[tokio::test]
 async fn shutdown_completes_with_a_live_peer_connection() {
-    let (a, b, _genesis) = cluster_pair(None).await;
+    let (a, b, _genesis, _keys) = cluster_pair(None).await;
     let conn = b.connect(&a).await;
     a.wait_for_peers(1).await;
 
@@ -260,7 +272,7 @@ async fn shutdown_completes_with_a_live_peer_connection() {
 
 #[tokio::test]
 async fn dropping_the_last_handle_closes_the_endpoint() {
-    let (a, _b, _genesis) = cluster_pair(None).await;
+    let (a, _b, _genesis, _keys) = cluster_pair(None).await;
     let Node {
         handle,
         join,

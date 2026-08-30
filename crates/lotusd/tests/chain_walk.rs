@@ -39,7 +39,8 @@ async fn stamped_chain(dir: &TempDir) -> Core {
 
     for value in ["one", "two"] {
         tokio::time::sleep(GAP).await;
-        let envelope = set_ns(core.head(), value);
+        // Signed: the chain takes no envelope without one.
+        let envelope = core.keys().sign(set_ns(core.head(), value)).unwrap();
         core.insert([envelope]).unwrap();
     }
 

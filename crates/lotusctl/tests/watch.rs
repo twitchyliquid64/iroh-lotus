@@ -3,7 +3,7 @@
 
 use std::{process::Stdio, time::Duration};
 
-use lotusd::{Core, IfInitialized, Server, ServerHandle};
+use lotusd::{Core, IfInitialized, NodeKeys, Server, ServerHandle};
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
@@ -23,17 +23,20 @@ use wire::{
 const GRACE: Duration = Duration::from_secs(20);
 
 /// Starts a daemon in `dir`, on the socket `lotusctl --state-dir dir` looks
-/// for. The join handle is returned so the mainloop outlives the test.
-async fn serve(dir: &TempDir) -> (EnvelopeDigest, ServerHandle, JoinHandle<()>) {
+/// for. Its keys come back too: the cluster takes no envelope this node
+/// has not signed. The join handle is returned so the mainloop outlives
+/// the test.
+async fn serve(dir: &TempDir) -> (EnvelopeDigest, NodeKeys, ServerHandle, JoinHandle<()>) {
     let core = Core::create_in_state_dir(dir.path().to_path_buf(), IfInitialized::Fail)
         .await
         .unwrap();
     let head = core.head();
+    let signer = core.keys().clone();
 
     let listener = UnixListener::bind(dir.path().join("local.sock")).unwrap();
     let (handle, join) = Server::new(core, listener).unwrap().run().await;
 
-    (head, handle, join)
+    (head, signer, handle, join)
 }
 
 /// Runs `lotusctl --state-dir dir --format json watch <args>`, with its
@@ -116,43 +119,58 @@ fn path(text: &str) -> SubkeyPath {
 }
 
 /// A namespace with two leaves, so writes inside it can miss each other.
-fn pair(prev: EnvelopeDigest, k: &str) -> Envelope {
-    Envelope::new(Msg::SetNamespace(SetNamespace {
-        prev,
-        key: key(k),
-        namespace: Namespace {
-            value: Value::Map(
-                [
-                    ("host".to_string(), Value::String("one".to_string())),
-                    ("port".to_string(), Value::Int(1)),
-                ]
-                .into(),
-            ),
-        },
-    }))
+fn pair(signer: &NodeKeys, prev: EnvelopeDigest, k: &str) -> Envelope {
+    signed(
+        signer,
+        Envelope::new(Msg::SetNamespace(SetNamespace {
+            prev,
+            key: key(k),
+            namespace: Namespace {
+                value: Value::Map(
+                    [
+                        ("host".to_string(), Value::String("one".to_string())),
+                        ("port".to_string(), Value::Int(1)),
+                    ]
+                    .into(),
+                ),
+            },
+        })),
+    )
 }
 
-fn set_ns(prev: EnvelopeDigest, k: &str, v: &str) -> Envelope {
-    Envelope::new(Msg::SetNamespace(SetNamespace {
-        prev,
-        key: key(k),
-        namespace: Namespace {
-            value: Value::String(v.to_string()),
-        },
-    }))
+/// The node's signature over `envelope`: the chain takes no envelope
+/// without one.
+fn signed(signer: &NodeKeys, envelope: Envelope) -> Envelope {
+    signer.sign(envelope).unwrap()
 }
 
-fn set_key(prev: EnvelopeDigest, k: &str, p: &str, v: &str) -> Envelope {
-    Envelope::new(Msg::SetNamespaceKey(SetNamespaceKey {
-        prev,
-        key: key(k),
-        path: path(p),
-        value: Some(Value::String(v.to_string())),
-    }))
+fn set_ns(signer: &NodeKeys, prev: EnvelopeDigest, k: &str, v: &str) -> Envelope {
+    signed(
+        signer,
+        Envelope::new(Msg::SetNamespace(SetNamespace {
+            prev,
+            key: key(k),
+            namespace: Namespace {
+                value: Value::String(v.to_string()),
+            },
+        })),
+    )
 }
 
-/// Splits two siblings into (winner, loser) by the fork rule: equal
-/// signature weight, so the higher digest wins.
+fn set_key(signer: &NodeKeys, prev: EnvelopeDigest, k: &str, p: &str, v: &str) -> Envelope {
+    signed(
+        signer,
+        Envelope::new(Msg::SetNamespaceKey(SetNamespaceKey {
+            prev,
+            key: key(k),
+            path: path(p),
+            value: Some(Value::String(v.to_string())),
+        })),
+    )
+}
+
+/// Splits two siblings into (winner, loser) by the fork rule: both carry
+/// the same single signature, so the higher digest wins.
 fn ranked(a: Envelope, b: Envelope) -> (Envelope, Envelope) {
     if a.digest().unwrap() > b.digest().unwrap() {
         (a, b)
@@ -170,12 +188,12 @@ fn wire_hex(digest: EnvelopeDigest) -> String {
 #[tokio::test]
 async fn watch_head_reports_the_movement_it_saw() {
     let dir = TempDir::new().unwrap();
-    let (head, handle, _join) = serve(&dir).await;
+    let (head, signer, handle, _join) = serve(&dir).await;
 
     let mut child = watch(&dir, &["head", "-n", "1"]);
     watching(&handle).await;
 
-    let envelope = set_ns(head, "a", "1");
+    let envelope = set_ns(&signer, head, "a", "1");
     handle.insert([envelope.clone()]).await.unwrap();
 
     let event = line(&mut child).await;
@@ -191,13 +209,16 @@ async fn watch_head_reports_the_movement_it_saw() {
 #[tokio::test]
 async fn watch_namespace_skips_the_namespaces_it_was_not_asked_about() {
     let dir = TempDir::new().unwrap();
-    let (head, handle, _join) = serve(&dir).await;
+    let (head, signer, handle, _join) = serve(&dir).await;
 
     let mut child = watch(&dir, &["namespace", "b", "-n", "1"]);
     watching(&handle).await;
 
-    handle.insert([set_ns(head, "a", "1")]).await.unwrap();
-    let watched = set_ns(handle.head().await.unwrap(), "b", "2");
+    handle
+        .insert([set_ns(&signer, head, "a", "1")])
+        .await
+        .unwrap();
+    let watched = set_ns(&signer, handle.head().await.unwrap(), "b", "2");
     handle.insert([watched.clone()]).await.unwrap();
 
     let event = line(&mut child).await;
@@ -212,16 +233,16 @@ async fn watch_namespace_skips_the_namespaces_it_was_not_asked_about() {
 #[tokio::test]
 async fn watch_path_reports_the_path_that_changed() {
     let dir = TempDir::new().unwrap();
-    let (head, handle, _join) = serve(&dir).await;
-    handle.insert([pair(head, "a")]).await.unwrap();
+    let (head, signer, handle, _join) = serve(&dir).await;
+    handle.insert([pair(&signer, head, "a")]).await.unwrap();
 
     let mut child = watch(&dir, &["path", "a", "host", "-n", "1"]);
     watching(&handle).await;
 
     // A sibling first: the watch must sleep through it.
-    let sibling = set_key(handle.head().await.unwrap(), "a", "port", "9");
+    let sibling = set_key(&signer, handle.head().await.unwrap(), "a", "port", "9");
     handle.insert([sibling]).await.unwrap();
-    let watched = set_key(handle.head().await.unwrap(), "a", "host", "two");
+    let watched = set_key(&signer, handle.head().await.unwrap(), "a", "host", "two");
     handle.insert([watched.clone()]).await.unwrap();
 
     let event = line(&mut child).await;
@@ -235,12 +256,15 @@ async fn watch_path_reports_the_path_that_changed() {
 #[tokio::test]
 async fn a_whole_namespace_write_reports_no_paths() {
     let dir = TempDir::new().unwrap();
-    let (head, handle, _join) = serve(&dir).await;
+    let (head, signer, handle, _join) = serve(&dir).await;
 
     let mut child = watch(&dir, &["namespace", "a", "-n", "1"]);
     watching(&handle).await;
 
-    handle.insert([set_ns(head, "a", "1")]).await.unwrap();
+    handle
+        .insert([set_ns(&signer, head, "a", "1")])
+        .await
+        .unwrap();
 
     let event = line(&mut child).await;
     assert_eq!(event["changes"]["a"], serde_json::json!([]));
@@ -252,8 +276,11 @@ async fn a_whole_namespace_write_reports_no_paths() {
 #[tokio::test]
 async fn watch_orphaned_reports_the_envelope_leaving_the_chain() {
     let dir = TempDir::new().unwrap();
-    let (head, handle, _join) = serve(&dir).await;
-    let (winner, loser) = ranked(set_ns(head, "a", "1"), set_ns(head, "b", "2"));
+    let (head, signer, handle, _join) = serve(&dir).await;
+    let (winner, loser) = ranked(
+        set_ns(&signer, head, "a", "1"),
+        set_ns(&signer, head, "b", "2"),
+    );
     handle.insert([loser.clone()]).await.unwrap();
 
     let orphan = loser.digest().unwrap();
@@ -277,8 +304,11 @@ async fn watch_orphaned_reports_the_envelope_leaving_the_chain() {
 #[tokio::test]
 async fn watch_orphaned_answers_at_once_for_an_envelope_already_gone() {
     let dir = TempDir::new().unwrap();
-    let (head, handle, _join) = serve(&dir).await;
-    let (winner, loser) = ranked(set_ns(head, "a", "1"), set_ns(head, "b", "2"));
+    let (head, signer, handle, _join) = serve(&dir).await;
+    let (winner, loser) = ranked(
+        set_ns(&signer, head, "a", "1"),
+        set_ns(&signer, head, "b", "2"),
+    );
     handle.insert([winner]).await.unwrap();
     // The loser never became canonical.
     handle.insert([loser.clone()]).await.unwrap();
@@ -296,7 +326,7 @@ async fn watch_orphaned_answers_at_once_for_an_envelope_already_gone() {
 #[tokio::test]
 async fn a_watch_ends_when_the_daemon_shuts_down() {
     let dir = TempDir::new().unwrap();
-    let (_head, handle, join) = serve(&dir).await;
+    let (_head, _signer, handle, join) = serve(&dir).await;
 
     let child = watch(&dir, &["head"]);
     watching(&handle).await;
@@ -311,14 +341,14 @@ async fn a_watch_ends_when_the_daemon_shuts_down() {
 #[tokio::test]
 async fn watch_renders_a_readable_block_by_default() {
     let dir = TempDir::new().unwrap();
-    let (head, handle, _join) = serve(&dir).await;
-    handle.insert([pair(head, "a")]).await.unwrap();
+    let (head, signer, handle, _join) = serve(&dir).await;
+    handle.insert([pair(&signer, head, "a")]).await.unwrap();
 
     let child = watch_text(&dir, &["head", "-n", "1"]);
     watching(&handle).await;
 
     let from = handle.head().await.unwrap();
-    let watched = set_key(from, "a", "host", "two");
+    let watched = set_key(&signer, from, "a", "host", "two");
     handle.insert([watched.clone()]).await.unwrap();
 
     let text = output(child).await;
@@ -336,12 +366,15 @@ async fn watch_renders_a_readable_block_by_default() {
 #[tokio::test]
 async fn a_whole_namespace_write_reads_as_such() {
     let dir = TempDir::new().unwrap();
-    let (head, handle, _join) = serve(&dir).await;
+    let (head, signer, handle, _join) = serve(&dir).await;
 
     let child = watch_text(&dir, &["namespace", "a", "-n", "1"]);
     watching(&handle).await;
 
-    handle.insert([set_ns(head, "a", "1")]).await.unwrap();
+    handle
+        .insert([set_ns(&signer, head, "a", "1")])
+        .await
+        .unwrap();
 
     assert!(
         output(child).await.contains("  a  (whole namespace)"),

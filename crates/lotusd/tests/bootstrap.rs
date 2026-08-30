@@ -44,6 +44,8 @@ struct Node {
     handle: ServerHandle,
     _join: JoinHandle<()>,
     id: KeyId,
+    /// The key it signs the envelopes these tests write with.
+    keys: NodeKeys,
     _dir: TempDir,
 }
 
@@ -51,6 +53,7 @@ impl Node {
     /// Starts a server over `core`, serving peers on `endpoint` if given.
     async fn start(dir: TempDir, core: Core, endpoint: Option<Endpoint>) -> Self {
         let id = core.key_id();
+        let keys = core.keys().clone();
         // Short name on purpose: a unix socket path has to fit in SUN_LEN.
         let listener = UnixListener::bind(dir.path().join("s.sock")).unwrap();
         let server = Server::new(core, listener).unwrap();
@@ -63,6 +66,7 @@ impl Node {
             handle,
             _join: join,
             id,
+            keys,
             _dir: dir,
         }
     }
@@ -77,20 +81,25 @@ impl Node {
         Self::start(dir, core, Some(endpoint)).await
     }
 
-    /// Extends this node's chain by one unsigned envelope, returning the
-    /// new head.
+    /// Extends this node's chain by one envelope, returning the new head.
     async fn extend(&self, label: &str) -> EnvelopeDigest {
         let prev = self.handle.head().await.unwrap();
-        let envelope = Envelope::new(Msg::SetNamespace(SetNamespace {
+        let envelope = self.sign(Envelope::new(Msg::SetNamespace(SetNamespace {
             prev,
             key: NamespaceKey::try_new(label).unwrap(),
             namespace: Namespace {
                 value: Value::String("v".to_owned()),
             },
-        }));
+        })));
         let head = envelope.digest().unwrap();
         self.handle.insert([envelope]).await.unwrap();
         head
+    }
+
+    /// The node's signature over `envelope`: the chain takes no envelope
+    /// without one.
+    fn sign(&self, envelope: Envelope) -> Envelope {
+        self.keys.sign(envelope).unwrap()
     }
 
     /// Writes `label` signed by this node's own key.
@@ -323,14 +332,14 @@ async fn a_node_that_cannot_sign_alone_cannot_invite() {
     let a = Node::founder(&network).await;
     let prev = a.handle.head().await.unwrap();
     a.handle
-        .insert([Envelope::new(Msg::SetNamespace(SetNamespace {
+        .insert([a.sign(Envelope::new(Msg::SetNamespace(SetNamespace {
             prev,
             key: NamespaceKey::try_new(MIN_ENVELOPE_WEIGHT_KEY).unwrap(),
             namespace: Namespace {
                 // The founding key weighs 2.
                 value: Value::Int(5),
             },
-        }))])
+        })))])
         .await
         .unwrap();
 
