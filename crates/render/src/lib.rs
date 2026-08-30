@@ -14,3 +14,5 @@ pub use envelope::{Entry, Render};
 
 mod style;
 pub use style::{ColorChoice, Palette};
+
+mod value;

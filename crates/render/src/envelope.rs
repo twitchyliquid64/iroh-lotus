@@ -3,9 +3,15 @@
 use core::fmt;
 
 use chrono::{DateTime, Local, Utc};
-use wire::{Envelope, EnvelopeDigest, Msg, VerificationStatus, msg::AmendOp};
+use wire::{
+    Envelope, EnvelopeDigest, Msg, VerificationStatus,
+    msg::{AmendOp, IncrementDecrement, Match},
+};
 
-use crate::style::{Palette, Style};
+use crate::{
+    style::{Palette, Style},
+    value,
+};
 
 /// Width the field labels are padded to.
 const LABEL: usize = 13;
@@ -166,14 +172,7 @@ impl Render {
             ),
         )?;
         self.field(out, "message", describe(envelope.payload()))?;
-
-        if let Msg::Init(init) = envelope.payload() {
-            self.field_list(
-                out,
-                "namespaces",
-                init.state.namespaces.keys().map(ToString::to_string),
-            )?;
-        }
+        self.write_detail(out, envelope.payload())?;
 
         self.field(
             out,
@@ -203,6 +202,63 @@ impl Render {
             }),
         )?;
         writeln!(out)
+    }
+
+    /// What the message carries beyond its one-line summary: the value
+    /// it writes, as much of it as a stanza has room for. Messages that
+    /// say everything in that line write nothing here.
+    fn write_detail<W: fmt::Write>(&self, out: &mut W, msg: &Msg) -> fmt::Result {
+        match msg {
+            // A genesis carries the whole of the ledger, so its
+            // namespaces share the room one value gets elsewhere.
+            Msg::Init(init) => self.field_list(
+                out,
+                "namespaces",
+                value::previews(
+                    init.state
+                        .namespaces
+                        .iter()
+                        .map(|(key, namespace)| (format!("{key} = "), &namespace.value)),
+                ),
+            ),
+            Msg::SetNamespace(set) => {
+                self.field_list(out, "value", value::preview("", &set.namespace.value))
+            }
+            // A cleared path has no value to show; the summary said so.
+            Msg::SetNamespaceKey(set) => match &set.value {
+                Some(value) => self.field_list(out, "value", value::preview("", value)),
+                None => Ok(()),
+            },
+            Msg::AmendNamespaceKey(amend) => match &amend.op {
+                AmendOp::AppendEntry(entry) => {
+                    self.field_list(out, "entry", value::preview("", entry))
+                }
+                AmendOp::IncrementDecrement(op) => self.write_clamp(out, op),
+                AmendOp::DeleteMatching(predicate) => self.field_list(
+                    out,
+                    "matching",
+                    predicate.as_ref().iter().flat_map(condition),
+                ),
+            },
+            Msg::DeleteNamespace(_) => Ok(()),
+        }
+    }
+
+    /// The bounds an increment clamps its sum to, where it has any: the
+    /// delta alone says what the message does only while it is unclamped.
+    fn write_clamp<W: fmt::Write>(&self, out: &mut W, op: &IncrementDecrement) -> fmt::Result {
+        let bounds = [
+            op.min.map(|min| format!("at least {min}")),
+            op.max.map(|max| format!("at most {max}")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+
+        match bounds.is_empty() {
+            true => Ok(()),
+            false => self.field(out, "clamped", bounds.join(", ")),
+        }
     }
 
     /// A digest in the colour digests are written in.
@@ -297,6 +353,16 @@ fn describe(msg: &Msg) -> String {
     }
 }
 
-fn plural(count: usize, one: &str, many: &str) -> String {
+/// One condition of a delete predicate: where it looks inside an entry,
+/// and what it must find there.
+fn condition(matches: &Match) -> Vec<String> {
+    let at = matches
+        .path
+        .as_ref()
+        .map_or_else(|| "entry".to_string(), ToString::to_string);
+    value::preview(&format!("{at} = "), &matches.value)
+}
+
+pub(crate) fn plural(count: usize, one: &str, many: &str) -> String {
     format!("{count} {}", if count == 1 { one } else { many })
 }

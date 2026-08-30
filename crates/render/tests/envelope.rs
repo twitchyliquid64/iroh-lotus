@@ -8,7 +8,11 @@ use render::{ColorChoice, Entry, Palette, Render};
 use wire::{
     Envelope, EnvelopeDigest, Msg, VerificationStatus,
     keys::{Ed25519Signature, KeyId, Signature},
-    msg::{FullCheckpoint, InitMsg, Namespace, NamespaceKey, SetNamespace, Value},
+    msg::{
+        AmendNamespaceKey, AmendOp, FullCheckpoint, IncrementDecrement, InitMsg, Match, Namespace,
+        NamespaceKey, Predicate, SetNamespace, SetNamespaceKey, Value,
+    },
+    subkey::SubkeyPath,
 };
 
 /// The digest an envelope is filed under. Made up: what is rendered is the
@@ -105,7 +109,7 @@ fn a_chain_renders_a_numbered_stanza_per_envelope() {
 #0 {}  [root]
    prev           — (genesis)
    message        init, 1 namespace
-   namespaces     cfg
+   namespaces     cfg = 1
    verification   unchecked
    signed by      —
    timestamps     0
@@ -114,6 +118,7 @@ fn a_chain_renders_a_numbered_stanza_per_envelope() {
 #1 {}  [head]
    prev           {}
    message        set namespace cfg
+   value          2
    verification   unchecked
    signed by      —
    timestamps     0
@@ -178,6 +183,7 @@ fn one_envelope_renders_unnumbered() {
 {}
    prev           {}
    message        set namespace cfg
+   value          2
    verification   unchecked
    signed by      —
    timestamps     0
@@ -332,5 +338,330 @@ fn the_time_the_log_took_an_envelope_is_shown_where_it_is_known() {
     assert!(
         unstamped.contains("   stored         —\n"),
         "got {unstamped}",
+    );
+}
+
+/// A write onto a path inside a namespace.
+fn write(value: Option<Value>) -> Envelope {
+    Envelope::new(Msg::SetNamespaceKey(SetNamespaceKey {
+        prev: digest(1),
+        key: key("cfg"),
+        path: "servers".parse::<SubkeyPath>().unwrap(),
+        value,
+    }))
+}
+
+/// An amendment of the array at `cfg.servers`.
+fn amend(op: AmendOp) -> Envelope {
+    Envelope::new(Msg::AmendNamespaceKey(AmendNamespaceKey {
+        prev: digest(1),
+        key: key("cfg"),
+        path: Some("servers".parse().unwrap()),
+        op,
+    }))
+}
+
+/// The lines of the field labelled `label`, unlabelled and undented — the
+/// label sits on the first alone, so the rest are found by their column.
+fn field(rendered: &str, label: &str) -> Vec<String> {
+    rendered
+        .lines()
+        .skip_while(|line| !line.starts_with(&format!("   {label} ")))
+        .take_while(|line| !line.is_empty())
+        .enumerate()
+        .take_while(|(index, line)| *index == 0 || line.starts_with("                  "))
+        .map(|(_, line)| line[18..].to_string())
+        .collect()
+}
+
+/// Small values are the point: an operator reading a write should see what
+/// it wrote without going back to the daemon for it.
+#[test]
+fn a_value_that_fits_is_shown_whole_on_one_line() {
+    let value = Value::Map(
+        [
+            ("host".to_string(), Value::String("10.0.0.1".to_string())),
+            ("port".to_string(), Value::Int(4433)),
+            ("tls".to_string(), Value::Bool(true)),
+        ]
+        .into(),
+    );
+
+    assert_eq!(
+        field(
+            &Render::new().envelope(&entry(2, write(Some(value)))),
+            "value"
+        ),
+        [r#"{"host": "10.0.0.1", "port": 4433, "tls": true}"#],
+    );
+}
+
+/// A value too wide for a line is broken over them, JSON-shaped, so what
+/// it holds can still be read down the page.
+#[test]
+fn a_value_too_wide_for_a_line_is_broken_over_lines() {
+    let value = Value::Map(
+        [(
+            "iroh".to_string(),
+            Value::Map(
+                [
+                    ("endpoint_id".to_string(), Value::String("e5c8".repeat(4))),
+                    (
+                        "addrs".to_string(),
+                        Value::Array(vec![Value::String("192.168.1.5:41234".to_string())]),
+                    ),
+                ]
+                .into(),
+            ),
+        )]
+        .into(),
+    );
+
+    assert_eq!(
+        field(
+            &Render::new().envelope(&entry(2, write(Some(value)))),
+            "value"
+        ),
+        [
+            "{",
+            r#"  "iroh": {"#,
+            r#"    "addrs": ["192.168.1.5:41234"],"#,
+            r#"    "endpoint_id": "e5c8e5c8e5c8e5c8""#,
+            "  }",
+            "}",
+        ],
+    );
+}
+
+/// The screen is the budget: a value with more in it than a stanza holds
+/// is cut off at a count of what was left out.
+#[test]
+fn a_value_larger_than_the_stanza_is_elided() {
+    let value = Value::Array(
+        (0..40)
+            .map(|n| {
+                Value::Map([("host".to_string(), Value::String(format!("10.0.0.{n}")))].into())
+            })
+            .collect(),
+    );
+    let lines = field(
+        &Render::new().envelope(&entry(2, write(Some(value)))),
+        "value",
+    );
+
+    assert_eq!(
+        lines,
+        [
+            "[",
+            r#"  {"host": "10.0.0.0"},"#,
+            r#"  {"host": "10.0.0.1"},"#,
+            r#"  {"host": "10.0.0.2"},"#,
+            r#"  {"host": "10.0.0.3"},"#,
+            r#"  {"host": "10.0.0.4"},"#,
+            "  … 35 more",
+            "]",
+        ],
+    );
+}
+
+/// No line runs past the width a stanza is written to, however deep the
+/// value nests or however long one string in it runs.
+#[test]
+fn no_previewed_line_runs_past_the_stanza_s_width() {
+    let deep = (0..12).fold(Value::String("x".repeat(400)), |value, depth| {
+        Value::Map([(format!("level-{depth}"), value)].into())
+    });
+    let rendered = Render::new().envelope(&entry(2, write(Some(deep))));
+    let lines = field(&rendered, "value");
+
+    // Wide enough to be worth reading, narrow enough that the 18 columns
+    // of label before it still leave the stanza inside 80.
+    assert!(
+        lines.iter().all(|line| line.chars().count() <= 60),
+        "got {rendered}",
+    );
+    assert!(lines.len() > 1, "got {rendered}");
+}
+
+/// A long string is cut inside its quotes: one that ends mid-escape reads
+/// as a broken value rather than a shortened one.
+#[test]
+fn a_long_string_is_elided_inside_its_quotes() {
+    let value = Value::String("scootaloo ".repeat(20));
+    let lines = field(
+        &Render::new().envelope(&entry(2, write(Some(value)))),
+        "value",
+    );
+
+    assert_eq!(lines.len(), 1, "got {lines:?}");
+    assert!(
+        lines[0].starts_with(r#""scootaloo scootaloo "#) && lines[0].ends_with(r#"…""#),
+        "got {}",
+        lines[0],
+    );
+}
+
+/// Clearing a path writes no value, and the summary line already says so.
+#[test]
+fn a_cleared_path_shows_no_value() {
+    let rendered = Render::new().envelope(&entry(2, write(None)));
+
+    assert!(
+        rendered.contains("   message        clear cfg at servers\n"),
+        "got {rendered}"
+    );
+    assert!(!rendered.contains("   value  "), "got {rendered}");
+}
+
+/// An appended entry is the whole of what the message writes.
+#[test]
+fn an_appended_entry_is_shown() {
+    let entry_value =
+        Value::Map([("host".to_string(), Value::String("10.0.0.9".to_string()))].into());
+    let rendered = Render::new().envelope(&entry(2, amend(AmendOp::AppendEntry(entry_value))));
+
+    assert_eq!(field(&rendered, "entry"), [r#"{"host": "10.0.0.9"}"#]);
+}
+
+/// A delete says what it matches on: the count in the summary line names
+/// how many conditions there are, never what they look for.
+#[test]
+fn the_conditions_of_a_delete_are_listed() {
+    let predicate = Predicate::try_new(vec![
+        Match::at(
+            "host".parse().unwrap(),
+            Value::String("10.0.0.1".to_string()),
+        ),
+        Match::entry(Value::Int(3)),
+    ])
+    .unwrap();
+    let rendered = Render::new().envelope(&entry(2, amend(AmendOp::DeleteMatching(predicate))));
+
+    assert_eq!(
+        field(&rendered, "matching"),
+        [r#"host = "10.0.0.1""#, "entry = 3"],
+    );
+}
+
+/// The delta alone says what an increment does only while it is unclamped:
+/// where bounds are set, they are shown.
+#[test]
+fn an_increment_shows_the_bounds_it_clamps_to() {
+    let clamped = amend(AmendOp::IncrementDecrement(
+        IncrementDecrement::new(5).with_min(0).with_max(10),
+    ));
+    assert_eq!(
+        field(&Render::new().envelope(&entry(2, clamped)), "clamped"),
+        ["at least 0, at most 10"],
+    );
+
+    let plain = amend(AmendOp::IncrementDecrement(IncrementDecrement::new(-1)));
+    let rendered = Render::new().envelope(&entry(2, plain));
+    assert!(
+        rendered.contains("   message        add -1 to cfg at servers\n"),
+        "got {rendered}"
+    );
+    assert!(!rendered.contains("clamped"), "got {rendered}");
+}
+
+/// A genesis of `namespaces`, in the order given.
+fn init(namespaces: Vec<(&str, Value)>) -> Envelope {
+    Envelope::new(Msg::Init(InitMsg {
+        state: FullCheckpoint {
+            namespaces: namespaces
+                .into_iter()
+                .map(|(name, value)| (key(name), Namespace { value }))
+                .collect(),
+        },
+    }))
+}
+
+/// A genesis establishes what the ledger starts as, which is more than
+/// the names it starts with.
+#[test]
+fn a_genesis_shows_what_its_namespaces_hold() {
+    let rendered = Render::new().envelope(&entry(
+        1,
+        init(vec![
+            ("cfg", Value::Int(1)),
+            ("motd", Value::String("hello there".to_string())),
+        ]),
+    ));
+
+    assert_eq!(
+        field(&rendered, "namespaces"),
+        ["cfg = 1", r#"motd = "hello there""#],
+    );
+}
+
+/// The namespaces share the room one value gets, so a genesis carrying a
+/// whole cluster stays a stanza: no one namespace spends the lines the
+/// rest are shown in.
+#[test]
+fn the_namespaces_of_a_genesis_share_the_room_between_them() {
+    let nodes = |count: u8| {
+        Value::Map(
+            (0..count)
+                .map(|n| {
+                    (
+                        hex(n),
+                        Value::Map(
+                            [("iroh".to_string(), Value::String(format!("10.0.0.{n}")))].into(),
+                        ),
+                    )
+                })
+                .collect(),
+        )
+    };
+    let rendered = Render::new().envelope(&entry(
+        1,
+        init(vec![
+            ("keys", nodes(4)),
+            ("nodes", nodes(9)),
+            ("cfg", Value::Bool(true)),
+        ]),
+    ));
+    let lines = field(&rendered, "namespaces");
+
+    assert_eq!(lines.len(), 3, "got {lines:?}");
+    assert!(
+        lines
+            .iter()
+            .zip(["cfg = ", "keys = ", "nodes = "])
+            .all(|(line, label)| line.starts_with(label)),
+        "got {lines:?}",
+    );
+    assert!(
+        lines[1].ends_with('…') && lines[2].ends_with('…'),
+        "got {lines:?}",
+    );
+}
+
+/// One namespace has the whole budget, and a value worth breaking over
+/// lines is broken over them.
+#[test]
+fn a_lone_namespace_is_shown_over_as_many_lines_as_it_takes() {
+    let value = Value::Map(
+        [(
+            "iroh".to_string(),
+            Value::Map(
+                [
+                    ("addrs".to_string(), Value::Array(vec![Value::Int(1)])),
+                    ("endpoint_id".to_string(), Value::String("e5c8".repeat(4))),
+                ]
+                .into(),
+            ),
+        )]
+        .into(),
+    );
+    let rendered = Render::new().envelope(&entry(1, init(vec![("nodes", value)])));
+
+    assert_eq!(
+        field(&rendered, "namespaces"),
+        [
+            "nodes = {",
+            r#"  "iroh": {"addrs": [1], "endpoint_id": "e5c8e5c8e5c8e5c8"}"#,
+            "}",
+        ],
     );
 }
