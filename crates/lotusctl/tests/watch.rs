@@ -190,7 +190,7 @@ async fn watch_head_reports_the_movement_it_saw() {
     let dir = TempDir::new().unwrap();
     let (head, signer, handle, _join) = serve(&dir).await;
 
-    let mut child = watch(&dir, &["head", "-n", "1"]);
+    let mut child = watch(&dir, &["--head", "-n", "1"]);
     watching(&handle).await;
 
     let envelope = set_ns(&signer, head, "a", "1");
@@ -211,7 +211,7 @@ async fn watch_namespace_skips_the_namespaces_it_was_not_asked_about() {
     let dir = TempDir::new().unwrap();
     let (head, signer, handle, _join) = serve(&dir).await;
 
-    let mut child = watch(&dir, &["namespace", "b", "-n", "1"]);
+    let mut child = watch(&dir, &["b", "-n", "1"]);
     watching(&handle).await;
 
     handle
@@ -236,7 +236,7 @@ async fn watch_path_reports_the_path_that_changed() {
     let (head, signer, handle, _join) = serve(&dir).await;
     handle.insert([pair(&signer, head, "a")]).await.unwrap();
 
-    let mut child = watch(&dir, &["path", "a", "host", "-n", "1"]);
+    let mut child = watch(&dir, &["a", "host", "-n", "1"]);
     watching(&handle).await;
 
     // A sibling first: the watch must sleep through it.
@@ -258,7 +258,7 @@ async fn a_whole_namespace_write_reports_no_paths() {
     let dir = TempDir::new().unwrap();
     let (head, signer, handle, _join) = serve(&dir).await;
 
-    let mut child = watch(&dir, &["namespace", "a", "-n", "1"]);
+    let mut child = watch(&dir, &["a", "-n", "1"]);
     watching(&handle).await;
 
     handle
@@ -284,7 +284,7 @@ async fn watch_orphaned_reports_the_envelope_leaving_the_chain() {
     handle.insert([loser.clone()]).await.unwrap();
 
     let orphan = loser.digest().unwrap();
-    let mut child = watch(&dir, &["orphaned", orphan.to_hex().as_ref(), "-n", "1"]);
+    let mut child = watch(&dir, &["--envelope", orphan.to_hex().as_ref(), "-n", "1"]);
     watching(&handle).await;
 
     handle.insert([winner]).await.unwrap();
@@ -314,7 +314,7 @@ async fn watch_orphaned_answers_at_once_for_an_envelope_already_gone() {
     handle.insert([loser.clone()]).await.unwrap();
     let orphan = loser.digest().unwrap();
 
-    let mut child = watch(&dir, &["orphaned", orphan.to_hex().as_ref()]);
+    let mut child = watch(&dir, &["--envelope", orphan.to_hex().as_ref()]);
 
     let event = line(&mut child).await;
     assert_eq!(event["event"], "already_orphaned");
@@ -328,7 +328,7 @@ async fn a_watch_ends_when_the_daemon_shuts_down() {
     let dir = TempDir::new().unwrap();
     let (_head, _signer, handle, join) = serve(&dir).await;
 
-    let child = watch(&dir, &["head"]);
+    let child = watch(&dir, &["--head"]);
     watching(&handle).await;
 
     handle.shutdown().await.unwrap();
@@ -344,7 +344,7 @@ async fn watch_renders_a_readable_block_by_default() {
     let (head, signer, handle, _join) = serve(&dir).await;
     handle.insert([pair(&signer, head, "a")]).await.unwrap();
 
-    let child = watch_text(&dir, &["head", "-n", "1"]);
+    let child = watch_text(&dir, &["--head", "-n", "1"]);
     watching(&handle).await;
 
     let from = handle.head().await.unwrap();
@@ -368,7 +368,7 @@ async fn a_whole_namespace_write_reads_as_such() {
     let dir = TempDir::new().unwrap();
     let (head, signer, handle, _join) = serve(&dir).await;
 
-    let child = watch_text(&dir, &["namespace", "a", "-n", "1"]);
+    let child = watch_text(&dir, &["a", "-n", "1"]);
     watching(&handle).await;
 
     handle

@@ -43,57 +43,78 @@ enum Command {
     /// Prints the envelopes named, wherever they sit in the daemon's log
     Show(ShowCommand),
     /// Prints a value from a namespace, and the head it was read at
-    Read(ReadCommand),
-    /// Writes a value into a namespace, signed by the daemon's own key
+    #[command(alias = "read")]
+    Get(GetCommand),
+    /// Writes a value into a namespace
     #[command(
-        long_about = "Writes a value into a namespace, signed by the daemon's own key.\n\n\
+        alias = "weak-set",
+        override_usage = "lotusctl set <NAMESPACE> [PATH] <VALUE>",
+        long_about = "Writes a value into a namespace.\n\n\
         The write is chained onto whatever head the daemon stands at, with no \
         precondition on what was there before, and carries this one node's \
-        signature. With --path, the value replaces what the path addresses; every \
-        parent of it must already exist. Without, the whole namespace is set, and \
-        created if the ledger does not hold it.\n\n\
+        signature. Given a PATH, the value replaces what the path addresses; \
+        every parent of it must already exist. Without one, the whole namespace \
+        is set, and created if the ledger does not hold it.\n\n\
+        The value is always the last argument, so `set cfg 7` writes the whole \
+        namespace and `set cfg port 443` one key inside it.\n\n\
         The value is always a JSON literal: a string, a whole number, true or \
         false, an array or an object. A string is quoted even when it is one \
-        word, so `weak-set cfg '\"hello\"'` writes the string hello and \
-        `weak-set cfg 7` the number 7."
+        word, so `set cfg '\"hello\"'` writes the string hello and `set cfg 7` \
+        the number 7."
     )]
-    WeakSet(WeakSetCommand),
-    /// Appends a value to an array in a namespace, signed by the daemon's
-    /// own key
+    Set(SetCommand),
+    /// Appends a value to an array in a namespace
     #[command(
-        long_about = "Appends a value to an array in a namespace, signed by the daemon's own key.\n\n\
-        Chained onto whatever head the daemon stands at, as weak-set is. With \
-        --path, the value is appended to the array the path addresses; a path \
+        alias = "weak-push",
+        override_usage = "lotusctl append <NAMESPACE> [PATH] <VALUE>",
+        long_about = "Appends a value to an array in a namespace.\n\n\
+        Chained onto whatever head the daemon stands at, as `set` is. Given a \
+        PATH, the value is appended to the array the path addresses; a path \
         addressing nothing under an existing map starts a one-entry array. \
-        Without, the namespace's whole value must be one array.\n\n\
-        The value is always a JSON literal, strings quoted."
+        Without one, the namespace's whole value must be one array.\n\n\
+        The value is always the last argument, and always a JSON literal with \
+        strings quoted."
     )]
-    WeakPush(WeakPushCommand),
-    /// Clears a value in a namespace, or deletes the namespace, signed by
-    /// the daemon's own key
+    Append(AppendCommand),
+    /// Adds to an integer in a namespace
     #[command(
-        long_about = "Clears a value in a namespace, or deletes the namespace, signed by the daemon's own key.\n\n\
-        Chained onto whatever head the daemon stands at, as weak-set is. With \
-        --path, what the path addresses is removed — a key from its map, an \
-        element from its array — and must exist. Without, the whole namespace \
-        is deleted.\n\n\
-        With --where or --equals, the path (or the whole namespace) must be a \
-        map or array instead, and every entry meeting all the conditions is \
-        removed: `--where id=\"web-1\"` matches an entry whose `id` field is \
-        the string web-1, `--equals 7` an entry that is the number 7. Nothing \
-        matching is fine — the write still lands."
+        aliases = ["weak-increment", "incr"],
+        override_usage = "lotusctl increment <NAMESPACE> [PATH] <DELTA>",
+        long_about = "Adds to an integer in a namespace.\n\n\
+        Chained onto whatever head the daemon stands at, as `set` is. Given a \
+        PATH, the delta is added to the integer the path addresses; without \
+        one, the namespace's whole value must be one integer. Either way it \
+        must already exist. A negative delta decrements. The sum is clamped up \
+        to --min and down to --max where they are given.\n\n\
+        The delta is always the last argument, so `increment cfg 5` adds to the \
+        whole namespace and `increment cfg n 5` to one key inside it."
     )]
-    WeakDelete(WeakDeleteCommand),
-    /// Adds to an integer in a namespace, signed by the daemon's own key
+    Increment(IncrementCommand),
+    /// Removes one value from a namespace, or deletes the namespace
     #[command(
-        long_about = "Adds to an integer in a namespace, signed by the daemon's own key.\n\n\
-        Chained onto whatever head the daemon stands at, as weak-set is. With \
-        --path, the delta is added to the integer the path addresses; without, \
-        the namespace's whole value must be one integer. Either way it must \
-        already exist. A negative delta decrements. The sum is clamped up to \
-        --min and down to --max where they are given."
+        alias = "weak-delete",
+        long_about = "Removes one value from a namespace, or deletes the namespace.\n\n\
+        Chained onto whatever head the daemon stands at, as `set` is. Given a \
+        PATH, what the path addresses is removed — a key from its map, an \
+        element from its array — and must already be there. Without one, the \
+        whole namespace is deleted.\n\n\
+        Removing whichever entries meet a condition, rather than one value \
+        named outright, is `delete`."
     )]
-    WeakIncrement(WeakIncrementCommand),
+    Unset(UnsetCommand),
+    /// Removes the entries of a map or array that meet every condition
+    #[command(
+        long_about = "Removes the entries of a map or array that meet every condition.\n\n\
+        Chained onto whatever head the daemon stands at, as `set` is. What the \
+        PATH addresses — or the namespace's whole value, given no path — must \
+        be a map or an array, and every entry meeting all the --where \
+        conditions is removed: `--where id=\"web-1\"` matches an entry whose \
+        `id` field is the string web-1, and `--where =7` an entry that is \
+        itself the number 7. Matching nothing is fine — the write still \
+        lands.\n\n\
+        Removing one value named outright is `unset`."
+    )]
+    Delete(DeleteCommand),
     /// Invites a new node into the cluster, printing the word it joins with
     #[command(
         long_about = "Invites a new node into the cluster, printing the word it joins with.\n\n\
@@ -110,6 +131,15 @@ enum Command {
     /// Reports this CLI's version alongside the daemon's
     Version,
     /// Reports movements of the chain as they happen, until interrupted
+    #[command(
+        override_usage = "lotusctl watch <NAMESPACE> [PATH] | --head | --envelope <DIGEST>",
+        long_about = "Reports movements of the chain as they happen, until interrupted.\n\n\
+        One thing is watched per invocation — a connection carries one request \
+        — named either as a namespace with an optional path inside it, or with \
+        --head for every movement of the canonical head whatever it changed, or \
+        with --envelope for one envelope leaving the canonical chain as a reorg \
+        rewrites past it."
+    )]
     Watch(WatchCommand),
 }
 
@@ -174,152 +204,154 @@ struct ShowCommand {
     digests: Vec<EnvelopeDigest>,
 }
 
-/// The arguments for the read subcommand.
+/// A namespace and an optional path inside it: how every command that
+/// addresses ledger data names what it addresses.
 #[derive(Debug, Args)]
-struct ReadCommand {
-    /// The namespace to read
-    #[arg(value_parser = parse_namespace_key)]
+struct Target {
+    /// The namespace
+    #[arg(value_parser = parse_namespace_key, value_name = "NAMESPACE")]
     key: NamespaceKey,
 
-    /// A path within it, written as `servers[0].host`
-    /// (a key with `.` or `[` in it bracket-quoted, `['my.key']`); the whole
-    /// namespace when left out
+    /// A path within it, written as `servers[0].host` (a key with `.` or
+    /// `[` in it bracket-quoted, `['my.key']`); the namespace as a whole
+    /// when left out
     path: Option<SubkeyPath>,
-
-    /// Print the value in the ledger's tagged JSON form, which spells
-    /// every value type — `{"type": "int", "value": 7}` — where the plain
-    /// form prints a trusted key in that form and everything else bare
-    #[arg(long)]
-    tagged: bool,
 }
 
-/// The arguments for the weak-set subcommand.
+/// A [`Target`] and the value written there.
+///
+/// The value is always last, so one argument after the namespace is a
+/// value and two are a path and a value. Clap has no optional positional
+/// before a required one, so both arrive as one list and are told apart
+/// by how many there are.
 #[derive(Debug, Args)]
-struct WeakSetCommand {
+struct TargetValue {
     /// The namespace to write to
-    #[arg(value_parser = parse_namespace_key)]
+    #[arg(value_parser = parse_namespace_key, value_name = "NAMESPACE")]
     key: NamespaceKey,
 
-    /// The value to write, as a JSON literal — strings quoted
-    value: String,
-
-    /// The path within the namespace to set, written as `servers[0].host`
-    /// (a key with `.` or `[` in it bracket-quoted, `['my.key']`);
-    /// the whole namespace when left out
-    #[arg(long, short)]
-    path: Option<SubkeyPath>,
-
-    /// Read the value in the ledger's tagged JSON form,
-    /// `{"type": "int", "value": 7}`, which can spell a trusted key
-    #[arg(long)]
-    tagged: bool,
+    /// The path to write at, then what is written there; one argument on
+    /// its own writes the namespace as a whole
+    #[arg(
+        num_args = 1..=2,
+        required = true,
+        allow_negative_numbers = true,
+        value_name = "[PATH] VALUE"
+    )]
+    rest: Vec<String>,
 }
 
-impl WeakSetCommand {
-    /// The value these arguments write.
-    fn value(&self) -> Result<Value, MainError> {
-        parse_value(&self.value, self.tagged)
+impl TargetValue {
+    /// The path this writes at, and the value as it was written.
+    fn split(&self) -> Result<(Option<SubkeyPath>, &str), MainError> {
+        match self.rest.as_slice() {
+            [value] => Ok((None, value.as_str())),
+            [path, value] => path
+                .parse()
+                .map(|path| (Some(path), value.as_str()))
+                .map_err(|e| MainError::Other(format!("`{path}` is not a path: {e}"))),
+            _ => unreachable!("clap holds the list to one or two"),
+        }
     }
 }
 
-/// The arguments for the weak-push subcommand.
+/// How values are spelled, on the way in and on the way out.
 #[derive(Debug, Args)]
-struct WeakPushCommand {
-    /// The namespace to write to
-    #[arg(value_parser = parse_namespace_key)]
-    key: NamespaceKey,
-
-    /// The value to append, as a JSON literal — strings quoted
-    value: String,
-
-    /// The path of the array within the namespace, written as
-    /// `servers[0].tags` (a key with `.` or `[` in it bracket-quoted,
-    /// `['my.key']`); the namespace's whole value when left out
-    #[arg(long, short)]
-    path: Option<SubkeyPath>,
-
-    /// Read the value in the ledger's tagged JSON form,
-    /// `{"type": "int", "value": 7}`, which can spell a trusted key
+struct ValueArgs {
+    /// Speak values in the ledger's tagged JSON form,
+    /// `{"type": "int", "value": 7}`, which spells every value type and
+    /// can name a trusted key; plain JSON otherwise
     #[arg(long)]
     tagged: bool,
 }
 
-impl WeakPushCommand {
-    /// The value these arguments append.
-    fn value(&self) -> Result<Value, MainError> {
-        parse_value(&self.value, self.tagged)
-    }
+/// The arguments for the get subcommand.
+#[derive(Debug, Args)]
+struct GetCommand {
+    #[command(flatten)]
+    target: Target,
+
+    #[command(flatten)]
+    values: ValueArgs,
 }
 
-/// The arguments for the weak-delete subcommand.
+/// The arguments for the set subcommand.
 #[derive(Debug, Args)]
-struct WeakDeleteCommand {
-    /// The namespace to write to
-    #[arg(value_parser = parse_namespace_key)]
-    key: NamespaceKey,
+struct SetCommand {
+    #[command(flatten)]
+    target: TargetValue,
 
-    /// The path within the namespace to clear, written as
-    /// `servers[0].host` (a key with `.` or `[` in it bracket-quoted,
-    /// `['my.key']`); the whole namespace is deleted when left out
-    #[arg(long, short)]
-    path: Option<SubkeyPath>,
+    #[command(flatten)]
+    values: ValueArgs,
+}
 
-    /// Remove the entries of the map or array at the path whose value at
-    /// PATH is VALUE, written `id="web-1"` — repeatable, all must hold
-    #[arg(long, value_name = "PATH=VALUE")]
+/// The arguments for the append subcommand.
+#[derive(Debug, Args)]
+struct AppendCommand {
+    #[command(flatten)]
+    target: TargetValue,
+
+    #[command(flatten)]
+    values: ValueArgs,
+}
+
+/// The arguments for the unset subcommand.
+#[derive(Debug, Args)]
+struct UnsetCommand {
+    #[command(flatten)]
+    target: Target,
+}
+
+/// The arguments for the delete subcommand.
+#[derive(Debug, Args)]
+struct DeleteCommand {
+    #[command(flatten)]
+    target: Target,
+
+    /// Remove the entries whose value at PATH is VALUE, written
+    /// `id="web-1"`; an empty PATH matches the entry itself, `=7` —
+    /// repeatable, and every condition must hold
+    #[arg(long, value_name = "[PATH]=VALUE", required = true)]
     r#where: Vec<String>,
 
-    /// Remove the entries of the map or array at the path that are VALUE,
-    /// a JSON literal — repeatable, all must hold
-    #[arg(long, value_name = "VALUE")]
-    equals: Vec<String>,
-
-    /// Read the values in the ledger's tagged JSON form,
-    /// `{"type": "int", "value": 7}`, which can spell a trusted key
-    #[arg(long)]
-    tagged: bool,
+    #[command(flatten)]
+    values: ValueArgs,
 }
 
-impl WeakDeleteCommand {
-    /// The predicate these arguments describe, or `None` for a plain
-    /// clear.
-    fn predicate(&self) -> Result<Option<Predicate>, MainError> {
-        let wheres = self.r#where.iter().map(|text| {
-            let (path, value) = split_where(text).ok_or_else(|| {
-                MainError::Other(format!("`{text}` is not PATH=VALUE, as in id=\"web-1\""))
-            })?;
-            let path = path
-                .parse()
-                .map_err(|e| MainError::Other(format!("`{path}` is not a path: {e}")))?;
-            Ok(Match::at(path, parse_value(value, self.tagged)?))
-        });
-        let equals = self
-            .equals
+impl DeleteCommand {
+    /// The conditions an entry must all meet to be removed.
+    fn predicate(&self) -> Result<Predicate, MainError> {
+        let matches = self
+            .r#where
             .iter()
-            .map(|text| parse_value(text, self.tagged).map(Match::entry));
-        let matches = wheres.chain(equals).collect::<Result<Vec<_>, _>>()?;
+            .map(|text| {
+                let (path, value) = split_where(text).ok_or_else(|| {
+                    MainError::Other(format!(
+                        "`{text}` is not [PATH]=VALUE, as in id=\"web-1\" or =7"
+                    ))
+                })?;
+                let value = parse_value(value, self.values.tagged)?;
+                if path.is_empty() {
+                    return Ok(Match::entry(value));
+                }
+                path.parse()
+                    .map(|path| Match::at(path, value))
+                    .map_err(|e| MainError::Other(format!("`{path}` is not a path: {e}")))
+            })
+            .collect::<Result<Vec<_>, MainError>>()?;
+
         // The one way a predicate fails to build is having no conditions,
-        // which is the plain clear.
-        Ok(Predicate::try_new(matches).ok())
+        // which clap has already refused.
+        Predicate::try_new(matches)
+            .map_err(|e| MainError::Other(format!("`--where` builds no condition: {e}")))
     }
 }
 
-/// The arguments for the weak-increment subcommand.
+/// The arguments for the increment subcommand.
 #[derive(Debug, Args)]
-struct WeakIncrementCommand {
-    /// The namespace to write to
-    #[arg(value_parser = parse_namespace_key)]
-    key: NamespaceKey,
-
-    /// How much to add; negative to subtract
-    #[arg(allow_negative_numbers = true)]
-    delta: i64,
-
-    /// The path of the integer within the namespace, written as
-    /// `servers[0].weight` (a key with `.` or `[` in it bracket-quoted,
-    /// `['my.key']`); the namespace's whole value when left out
-    #[arg(long, short)]
-    path: Option<SubkeyPath>,
+struct IncrementCommand {
+    #[command(flatten)]
+    target: TargetValue,
 
     /// Clamp the sum up to this floor
     #[arg(long, allow_negative_numbers = true)]
@@ -330,9 +362,20 @@ struct WeakIncrementCommand {
     max: Option<i64>,
 }
 
+impl IncrementCommand {
+    /// The path this adds at, and how much it adds.
+    fn split(&self) -> Result<(Option<SubkeyPath>, i64), MainError> {
+        let (path, delta) = self.target.split()?;
+        delta
+            .parse()
+            .map(|delta| (path, delta))
+            .map_err(|_| MainError::Other(format!("`{delta}` is not a whole number to add")))
+    }
+}
+
 /// Splits a `--where` argument at the `=` between its path and value —
 /// the first one outside the path's brackets, so a bracket-quoted key
-/// may hold one: `['a=b']="x"`.
+/// may hold one: `['a=b']="x"`. An empty path is the entry itself, `=7`.
 fn split_where(text: &str) -> Option<(&str, &str)> {
     let mut quote: Option<char> = None;
     let mut escaped = false;
@@ -413,16 +456,16 @@ fn value_to_json(value: &Value) -> Result<serde_json::Value, MainError> {
     })
 }
 
-/// What `read` reports.
+/// What `get` reports.
 #[derive(Debug, serde::Serialize)]
-struct ReadLine {
+struct ValueLine {
     head: EnvelopeDigest,
     /// The value as JSON — plain or tagged as asked — or `null` when the
     /// daemon holds nothing at the path.
     value: serde_json::Value,
 }
 
-impl ReadLine {
+impl ValueLine {
     fn new(at: ValueAt, tagged: bool) -> Result<Self, MainError> {
         let value = match at.value {
             None => serde_json::Value::Null,
@@ -436,7 +479,7 @@ impl ReadLine {
     }
 }
 
-impl fmt::Display for ReadLine {
+impl fmt::Display for ValueLine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "head   {}", self.head.to_hex().as_ref())?;
         match &self.value {
@@ -446,7 +489,7 @@ impl fmt::Display for ReadLine {
     }
 }
 
-/// What `weak-set` reports.
+/// What every write reports.
 #[derive(Debug, serde::Serialize)]
 struct WrittenLine {
     envelope: EnvelopeDigest,
@@ -473,59 +516,53 @@ impl fmt::Display for WrittenLine {
 }
 
 /// The arguments for the watch subcommand.
+///
+/// One thing is watched per invocation: a connection carries one request,
+/// so watching two things means two invocations.
 #[derive(Debug, Args)]
+#[command(group = clap::ArgGroup::new("watched").required(true).args(["key", "head", "envelope"]))]
 struct WatchCommand {
-    #[command(subcommand)]
-    watch: WatchArgs,
+    /// The namespace to watch: any change anywhere under it, or to the
+    /// one value PATH addresses
+    #[arg(value_parser = parse_namespace_key, value_name = "NAMESPACE")]
+    key: Option<NamespaceKey>,
+
+    /// A path within it, written as `servers[0].host` (a key with `.` or
+    /// `[` in it bracket-quoted, `['my.key']`)
+    #[arg(requires = "key")]
+    path: Option<SubkeyPath>,
+
+    /// Watch every movement of the canonical head, whatever it changed
+    #[arg(long, conflicts_with_all = ["key", "path", "envelope"])]
+    head: bool,
+
+    /// Watch one envelope leaving the canonical chain, as a reorg
+    /// rewrites past it
+    #[arg(
+        long,
+        value_name = "DIGEST",
+        value_parser = parse_digest,
+        conflicts_with_all = ["key", "path", "head"],
+    )]
+    envelope: Option<EnvelopeDigest>,
 
     /// Stop after this many events rather than running until interrupted
-    ///
-    /// Global so it reads naturally after what is being watched:
-    /// `watch head -n 1`.
-    #[arg(long, short = 'n', global = true)]
+    #[arg(long, short = 'n')]
     count: Option<u32>,
 }
 
-/// What `watch` follows. One per invocation: a connection carries one
-/// request, so watching two things means two invocations.
-#[derive(Debug, Subcommand)]
-enum WatchArgs {
-    /// Every movement of the canonical head, whatever it changed
-    Head,
-    /// Any change anywhere under a namespace
-    Namespace {
-        /// The namespace to watch
-        #[arg(value_parser = parse_namespace_key)]
-        key: NamespaceKey,
-    },
-    /// A change to one value inside a namespace
-    Path {
-        /// The namespace the path is walked from
-        #[arg(value_parser = parse_namespace_key)]
-        key: NamespaceKey,
-        /// The path within it, written as `servers[0].host` (a key with `.`
-        /// or `[` in it bracket-quoted, `['my.key']`)
-        path: SubkeyPath,
-    },
-    /// An envelope leaving the canonical chain, as a reorg rewrites past it
-    Orphaned {
-        /// The envelope digest to watch, in hex
-        #[arg(value_parser = parse_digest)]
-        digest: EnvelopeDigest,
-    },
-}
-
-impl WatchArgs {
+impl WatchCommand {
     /// What this asks the daemon to watch.
     fn selector(&self) -> WatchSelector {
-        match self {
-            WatchArgs::Head => WatchSelector::Head,
-            WatchArgs::Namespace { key } => WatchSelector::Namespace(key.clone()),
-            WatchArgs::Path { key, path } => WatchSelector::Path(lotusd_rpc::WatchPath {
+        match (&self.key, &self.path, self.envelope) {
+            (Some(key), None, _) => WatchSelector::Namespace(key.clone()),
+            (Some(key), Some(path), _) => WatchSelector::Path(lotusd_rpc::WatchPath {
                 key: key.clone(),
                 path: path.clone(),
             }),
-            WatchArgs::Orphaned { digest } => WatchSelector::Orphaned(*digest),
+            (None, _, Some(digest)) => WatchSelector::Orphaned(digest),
+            // Clap's group leaves --head as the only one still standing.
+            (None, _, None) => WatchSelector::Head,
         }
     }
 }
@@ -817,78 +854,80 @@ async fn async_main() -> Result<(), MainError> {
                 )));
             }
         }
-        Command::Read(args) => {
+        Command::Get(args) => {
             let path = cli.global_args.local_sock_path()?;
             let at = call(
                 connect(&path).await?,
                 Read {
-                    key: args.key.clone(),
-                    path: args.path.clone(),
+                    key: args.target.key.clone(),
+                    path: args.target.path.clone(),
                 },
             )
             .await
             .map_err(MainError::Rpc)?;
-            let line = ReadLine::new(at, args.tagged)?;
+            let line = ValueLine::new(at, args.values.tagged)?;
 
             match cli.global_args.format {
                 Format::Text => print!("{line}"),
                 Format::Json => print_json(&line)?,
             }
         }
-        Command::WeakSet(args) => {
-            let value = args.value()?;
+        Command::Set(args) => {
+            let (path, value) = args.target.split()?;
+            let value = parse_value(value, args.values.tagged)?;
             write(
                 &cli.global_args,
                 WeakSet {
-                    key: args.key.clone(),
-                    path: args.path.clone(),
+                    key: args.target.key.clone(),
+                    path,
                     value,
                 },
             )
             .await?
         }
-        Command::WeakPush(args) => {
-            let value = args.value()?;
+        Command::Append(args) => {
+            let (path, value) = args.target.split()?;
+            let value = parse_value(value, args.values.tagged)?;
             write(
                 &cli.global_args,
                 WeakPush {
-                    key: args.key.clone(),
-                    path: args.path.clone(),
+                    key: args.target.key.clone(),
+                    path,
                     value,
                 },
             )
             .await?
         }
-        Command::WeakDelete(args) => match args.predicate()? {
-            Some(predicate) => {
-                write(
-                    &cli.global_args,
-                    WeakDeleteMatching {
-                        key: args.key.clone(),
-                        path: args.path.clone(),
-                        predicate,
-                    },
-                )
-                .await?
-            }
-            None => {
-                write(
-                    &cli.global_args,
-                    WeakDelete {
-                        key: args.key.clone(),
-                        path: args.path.clone(),
-                    },
-                )
-                .await?
-            }
-        },
-        Command::WeakIncrement(args) => {
+        Command::Unset(args) => {
+            write(
+                &cli.global_args,
+                WeakDelete {
+                    key: args.target.key.clone(),
+                    path: args.target.path.clone(),
+                },
+            )
+            .await?
+        }
+        Command::Delete(args) => {
+            let predicate = args.predicate()?;
+            write(
+                &cli.global_args,
+                WeakDeleteMatching {
+                    key: args.target.key.clone(),
+                    path: args.target.path.clone(),
+                    predicate,
+                },
+            )
+            .await?
+        }
+        Command::Increment(args) => {
+            let (path, delta) = args.split()?;
             write(
                 &cli.global_args,
                 WeakIncrement {
-                    key: args.key.clone(),
-                    path: args.path.clone(),
-                    delta: args.delta,
+                    key: args.target.key.clone(),
+                    path,
+                    delta,
                     min: args.min,
                     max: args.max,
                 },
@@ -929,7 +968,7 @@ async fn async_main() -> Result<(), MainError> {
             let mut call = Call::send(
                 connect(&path).await?,
                 Watch {
-                    selector: args.watch.selector(),
+                    selector: args.selector(),
                 },
             )
             .await

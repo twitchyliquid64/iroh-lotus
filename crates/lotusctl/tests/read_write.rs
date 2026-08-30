@@ -1,4 +1,4 @@
-//! `lotusctl read` and `lotusctl weak-set`, driven end to end: the real CLI
+//! `lotusctl get` and the write verbs, driven end to end: the real CLI
 //! binary, over a real control socket, against a real daemon — alone, and
 //! against a pair of nodes so a write on one is read back from the other.
 
@@ -240,27 +240,27 @@ fn digest_in(json: &serde_json::Value, field: &str) -> String {
 async fn reading_what_is_not_set_says_so() {
     let node = alone().await;
 
-    let text = output(&node.dir, &["read", "cfg"]).await;
+    let text = output(&node.dir, &["get", "cfg"]).await;
 
     assert_eq!(
         text,
         format!("head   {}\nvalue  — (not set)\n", hex(node.genesis))
     );
 
-    let json = json(&node.dir, &["read", "cfg"]).await;
+    let json = json(&node.dir, &["get", "cfg"]).await;
     assert_eq!(json["head"], json_digest(node.genesis));
     assert_eq!(json["value"], serde_json::Value::Null);
 }
 
 /// A namespace written whole reads back whole, and by path.
 #[tokio::test]
-async fn a_namespace_written_by_weak_set_reads_back() {
+async fn a_namespace_written_by_set_reads_back() {
     let node = alone().await;
 
     let written = json(
         &node.dir,
         &[
-            "weak-set",
+            "set",
             "cfg",
             r#"{"servers": [{"host": "a.example", "port": 80}], "on": true}"#,
         ],
@@ -271,34 +271,30 @@ async fn a_namespace_written_by_weak_set_reads_back() {
     assert_eq!(digest_in(&written, "envelope"), head);
     assert_ne!(head, hex(node.genesis));
 
-    let read = json(&node.dir, &["read", "cfg"]).await;
+    let read = json(&node.dir, &["get", "cfg"]).await;
     assert_eq!(digest_in(&read, "head"), head);
     assert_eq!(
         read["value"],
         serde_json::json!({"servers": [{"host": "a.example", "port": 80}], "on": true})
     );
 
-    let text = output(&node.dir, &["read", "cfg", "servers[0].host"]).await;
+    let text = output(&node.dir, &["get", "cfg", "servers[0].host"]).await;
     assert_eq!(text, format!("head   {head}\nvalue  \"a.example\"\n"));
 
-    let text = output(&node.dir, &["read", "cfg", "servers[0].port"]).await;
+    let text = output(&node.dir, &["get", "cfg", "servers[0].port"]).await;
     assert_eq!(text, format!("head   {head}\nvalue  80\n"));
 }
 
 /// A write at a path replaces that value and nothing beside it.
 #[tokio::test]
-async fn weak_set_at_a_path_replaces_one_value() {
+async fn set_at_a_path_replaces_one_value() {
     let node = alone().await;
-    json(
-        &node.dir,
-        &["weak-set", "cfg", r#"{"host": "a", "port": 80}"#],
-    )
-    .await;
+    json(&node.dir, &["set", "cfg", r#"{"host": "a", "port": 80}"#]).await;
 
-    let text = output(&node.dir, &["weak-set", "cfg", "--path", "port", "443"]).await;
+    let text = output(&node.dir, &["set", "cfg", "port", "443"]).await;
     assert!(text.contains("outcome   extended\n"), "got {text}");
 
-    let read = json(&node.dir, &["read", "cfg"]).await;
+    let read = json(&node.dir, &["get", "cfg"]).await;
     assert_eq!(read["value"], serde_json::json!({"host": "a", "port": 443}));
 }
 
@@ -308,19 +304,19 @@ async fn weak_set_at_a_path_replaces_one_value() {
 async fn a_value_is_always_json() {
     let node = alone().await;
 
-    json(&node.dir, &["weak-set", "cfg", "\"hello\""]).await;
-    assert_eq!(json(&node.dir, &["read", "cfg"]).await["value"], "hello");
+    json(&node.dir, &["set", "cfg", "\"hello\""]).await;
+    assert_eq!(json(&node.dir, &["get", "cfg"]).await["value"], "hello");
 
-    json(&node.dir, &["weak-set", "cfg", "\"7\""]).await;
-    assert_eq!(json(&node.dir, &["read", "cfg"]).await["value"], "7");
+    json(&node.dir, &["set", "cfg", "\"7\""]).await;
+    assert_eq!(json(&node.dir, &["get", "cfg"]).await["value"], "7");
 
-    json(&node.dir, &["weak-set", "cfg", "7"]).await;
-    assert_eq!(json(&node.dir, &["read", "cfg"]).await["value"], 7);
+    json(&node.dir, &["set", "cfg", "7"]).await;
+    assert_eq!(json(&node.dir, &["get", "cfg"]).await["value"], 7);
 
-    let (ok, _out, err) = run(&node.dir, &["weak-set", "cfg", "hello"]).await;
+    let (ok, _out, err) = run(&node.dir, &["set", "cfg", "hello"]).await;
     assert!(!ok, "a bare word should be refused");
     assert!(err.contains("is not JSON"), "got {err}");
-    assert_eq!(json(&node.dir, &["read", "cfg"]).await["value"], 7);
+    assert_eq!(json(&node.dir, &["get", "cfg"]).await["value"], 7);
 }
 
 /// The tagged form writes and reads every value type by name.
@@ -331,7 +327,7 @@ async fn the_tagged_form_round_trips() {
     json(
         &node.dir,
         &[
-            "weak-set",
+            "set",
             "cfg",
             "--tagged",
             r#"{"type": "array", "value": [{"type": "int", "value": 1}]}"#,
@@ -339,12 +335,12 @@ async fn the_tagged_form_round_trips() {
     )
     .await;
 
-    let read = json(&node.dir, &["read", "cfg", "--tagged"]).await;
+    let read = json(&node.dir, &["get", "cfg", "--tagged"]).await;
     assert_eq!(
         read["value"],
         serde_json::json!({"type": "array", "value": [{"type": "int", "value": 1}]})
     );
-    let read = json(&node.dir, &["read", "cfg"]).await;
+    let read = json(&node.dir, &["get", "cfg"]).await;
     assert_eq!(read["value"], serde_json::json!([1]));
 }
 
@@ -354,12 +350,12 @@ async fn a_value_the_ledger_cannot_hold_is_refused() {
     let node = alone().await;
 
     for bad in ["null", "1.5", "[null]", r#"{"a": 1e30}"#] {
-        let (ok, _out, err) = run(&node.dir, &["weak-set", "cfg", bad]).await;
+        let (ok, _out, err) = run(&node.dir, &["set", "cfg", bad]).await;
         assert!(!ok, "`{bad}` should be refused");
         assert!(err.contains("Error"), "got {err}");
     }
     assert_eq!(
-        json(&node.dir, &["read", "cfg"]).await["value"],
+        json(&node.dir, &["get", "cfg"]).await["value"],
         serde_json::Value::Null
     );
 }
@@ -369,11 +365,11 @@ async fn a_value_the_ledger_cannot_hold_is_refused() {
 async fn a_write_the_chain_refuses_fails() {
     let node = alone().await;
 
-    let (ok, _out, err) = run(&node.dir, &["weak-set", "cfg", "--path", "port", "443"]).await;
+    let (ok, _out, err) = run(&node.dir, &["set", "cfg", "port", "443"]).await;
     assert!(!ok);
     assert!(err.contains("Rejected"), "got {err}");
 
-    let read = json(&node.dir, &["read", "cfg"]).await;
+    let read = json(&node.dir, &["get", "cfg"]).await;
     assert_eq!(read["head"], json_digest(node.genesis));
 }
 
@@ -383,64 +379,52 @@ async fn a_write_the_chain_refuses_fails() {
 async fn a_write_on_one_node_is_read_from_its_peer() {
     let (a, b) = pair().await;
 
-    let written = json(&a.dir, &["weak-set", "cfg", r#"{"host": "a.example"}"#]).await;
+    let written = json(&a.dir, &["set", "cfg", r#"{"host": "a.example"}"#]).await;
     let head = digest_in(&written, "head");
     b.wait_for_head(&head).await;
 
-    let read = json(&b.dir, &["read", "cfg", "host"]).await;
+    let read = json(&b.dir, &["get", "cfg", "host"]).await;
     assert_eq!(digest_in(&read, "head"), head);
     assert_eq!(read["value"], "a.example");
 
     // And the other way round, onto the head both now share.
-    let written = json(
-        &b.dir,
-        &["weak-set", "cfg", "--path", "host", "\"b.example\""],
-    )
-    .await;
+    let written = json(&b.dir, &["set", "cfg", "host", "\"b.example\""]).await;
     let head = digest_in(&written, "head");
     a.wait_for_head(&head).await;
 
-    let read = json(&a.dir, &["read", "cfg"]).await;
+    let read = json(&a.dir, &["get", "cfg"]).await;
     assert_eq!(read["value"], serde_json::json!({"host": "b.example"}));
 }
 
-/// `weak-push` appends, `weak-increment` adds within bounds, and
-/// `weak-delete` clears a value or the whole namespace.
+/// `append` appends, `increment` adds within bounds, and `unset` clears
+/// a value or the whole namespace.
 #[tokio::test]
-async fn push_increment_and_delete_edit_in_place() {
+async fn append_increment_and_unset_edit_in_place() {
     let node = alone().await;
     let value = async |path: &[&str]| {
-        json(&node.dir, &[&["read", "cfg"], path].concat()).await["value"].clone()
+        json(&node.dir, &[&["get", "cfg"], path].concat()).await["value"].clone()
     };
 
-    json(&node.dir, &["weak-set", "cfg", r#"{"n": 1, "tags": []}"#]).await;
+    json(&node.dir, &["set", "cfg", r#"{"n": 1, "tags": []}"#]).await;
 
-    let text = output(&node.dir, &["weak-push", "cfg", "-p", "tags", "\"a\""]).await;
+    let text = output(&node.dir, &["append", "cfg", "tags", "\"a\""]).await;
     assert!(text.contains("outcome   extended\n"), "got {text}");
-    json(&node.dir, &["weak-push", "cfg", "--path", "tags", "2"]).await;
+    json(&node.dir, &["append", "cfg", "tags", "2"]).await;
     assert_eq!(value(&["tags"]).await, serde_json::json!(["a", 2]));
 
-    json(&node.dir, &["weak-increment", "cfg", "-p", "n", "5"]).await;
+    json(&node.dir, &["increment", "cfg", "n", "5"]).await;
     assert_eq!(value(&["n"]).await, 6);
-    json(
-        &node.dir,
-        &["weak-increment", "cfg", "-p", "n", "-10", "--min", "0"],
-    )
-    .await;
+    json(&node.dir, &["increment", "cfg", "n", "-10", "--min", "0"]).await;
     assert_eq!(value(&["n"]).await, 0);
-    json(
-        &node.dir,
-        &["weak-increment", "cfg", "-p", "n", "9", "--max", "3"],
-    )
-    .await;
+    json(&node.dir, &["increment", "cfg", "n", "9", "--max", "3"]).await;
     assert_eq!(value(&["n"]).await, 3);
 
-    json(&node.dir, &["weak-delete", "cfg", "-p", "tags[0]"]).await;
+    json(&node.dir, &["unset", "cfg", "tags[0]"]).await;
     assert_eq!(value(&[]).await, serde_json::json!({"n": 3, "tags": [2]}));
 
-    let written = json(&node.dir, &["weak-delete", "cfg"]).await;
+    let written = json(&node.dir, &["unset", "cfg"]).await;
     assert_eq!(written["outcome"], "extended");
-    let read = json(&node.dir, &["read", "cfg"]).await;
+    let read = json(&node.dir, &["get", "cfg"]).await;
     assert_eq!(read["head"], written["head"]);
     assert_eq!(read["value"], serde_json::Value::Null);
 }
@@ -449,20 +433,101 @@ async fn push_increment_and_delete_edit_in_place() {
 #[tokio::test]
 async fn an_edit_the_chain_refuses_fails() {
     let node = alone().await;
-    json(&node.dir, &["weak-set", "cfg", r#"{"n": 1}"#]).await;
+    json(&node.dir, &["set", "cfg", r#"{"n": 1}"#]).await;
 
     for args in [
-        &["weak-push", "cfg", "-p", "n", "1"][..],
-        &["weak-increment", "cfg", "-p", "missing", "1"],
-        &["weak-delete", "cfg", "-p", "missing"],
-        &["weak-delete", "gone"],
+        &["append", "cfg", "n", "1"][..],
+        &["increment", "cfg", "missing", "1"],
+        &["unset", "cfg", "missing"],
+        &["unset", "gone"],
     ] {
         let (ok, _out, err) = run(&node.dir, args).await;
         assert!(!ok, "{args:?} should be refused");
         assert!(err.contains("Rejected"), "{args:?} got {err}");
     }
     assert_eq!(
-        json(&node.dir, &["read", "cfg"]).await["value"],
+        json(&node.dir, &["get", "cfg"]).await["value"],
         serde_json::json!({"n": 1})
     );
+}
+
+/// The value is always the last argument, so a lone one writes the
+/// namespace whole and a pair names a path first.
+#[tokio::test]
+async fn a_write_names_its_path_before_its_value() {
+    let node = alone().await;
+
+    json(&node.dir, &["set", "cfg", r#"{"port": 80}"#]).await;
+    assert_eq!(
+        json(&node.dir, &["get", "cfg"]).await["value"],
+        serde_json::json!({"port": 80})
+    );
+
+    json(&node.dir, &["set", "cfg", "port", "443"]).await;
+    assert_eq!(json(&node.dir, &["get", "cfg", "port"]).await["value"], 443);
+
+    // A path that is not one is refused rather than read as a value.
+    let (ok, _out, err) = run(&node.dir, &["set", "cfg", "port[", "443"]).await;
+    assert!(!ok, "an unparseable path should be refused");
+    assert!(err.contains("is not a path"), "got {err}");
+}
+
+/// `delete` removes whichever entries meet every condition: a field of an
+/// entry with `PATH=VALUE`, the entry itself with `=VALUE`.
+#[tokio::test]
+async fn delete_removes_the_entries_that_match() {
+    let node = alone().await;
+    json(
+        &node.dir,
+        &[
+            "set",
+            "cfg",
+            r#"{"nodes": [{"id": "web-1", "on": true}, {"id": "web-2", "on": true}], "xs": [1, 7, 3]}"#,
+        ],
+    )
+    .await;
+
+    json(
+        &node.dir,
+        &["delete", "cfg", "nodes", "--where", r#"id="web-1""#],
+    )
+    .await;
+    assert_eq!(
+        json(&node.dir, &["get", "cfg", "nodes"]).await["value"],
+        serde_json::json!([{"id": "web-2", "on": true}])
+    );
+
+    json(&node.dir, &["delete", "cfg", "xs", "--where", "=7"]).await;
+    assert_eq!(
+        json(&node.dir, &["get", "cfg", "xs"]).await["value"],
+        serde_json::json!([1, 3])
+    );
+
+    // Every condition must hold, and matching nothing still lands.
+    let written = json(
+        &node.dir,
+        &[
+            "delete",
+            "cfg",
+            "nodes",
+            "--where",
+            r#"id="web-2""#,
+            "--where",
+            "on=false",
+        ],
+    )
+    .await;
+    assert_eq!(written["outcome"], "extended");
+    assert_eq!(
+        json(&node.dir, &["get", "cfg", "nodes"]).await["value"],
+        serde_json::json!([{"id": "web-2", "on": true}])
+    );
+
+    // A condition that is not [PATH]=VALUE is refused before anything is
+    // sent, and a delete with no condition at all is refused by clap.
+    let (ok, _out, err) = run(&node.dir, &["delete", "cfg", "nodes", "--where", "id"]).await;
+    assert!(!ok);
+    assert!(err.contains("is not [PATH]=VALUE"), "got {err}");
+    let (ok, _out, _err) = run(&node.dir, &["delete", "cfg", "nodes"]).await;
+    assert!(!ok, "a delete with no --where should be refused");
 }
