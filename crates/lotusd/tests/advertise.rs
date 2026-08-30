@@ -10,7 +10,7 @@ use state::{CLUSTER_NODES_KEY, MIN_ENVELOPE_WEIGHT_KEY};
 use tempfile::TempDir;
 use tokio::{net::UnixListener, task::JoinHandle, time::timeout};
 use wire::{
-    Envelope, Msg,
+    Envelope, EnvelopeDigest, Msg,
     msg::{Namespace, NamespaceKey, SetNamespace, SetNamespaceKey, Value},
     subkey::{Subkey, SubkeyPath},
 };
@@ -37,10 +37,73 @@ fn nodes_key() -> NamespaceKey {
 
 /// An address for this node's own endpoint with one transport on it.
 fn with_transport(core: &Core, port: u16) -> EndpointAddr {
+    with_transports(core, [port])
+}
+
+/// An address for this node's own endpoint with one IP transport per port.
+fn with_transports(core: &Core, ports: impl IntoIterator<Item = u16>) -> EndpointAddr {
     EndpointAddr::from_parts(
         core.iroh_secret().public(),
-        [TransportAddr::Ip(([10, 0, 0, 1], port).into())],
+        ports
+            .into_iter()
+            .map(|port| TransportAddr::Ip(([10, 0, 0, 1], port).into())),
     )
+}
+
+/// An address for this node's own endpoint with one relay per number.
+/// A relay makes a longer entry than an IP address does, which is what
+/// tips a wider change towards being written entry by entry.
+fn with_relays(core: &Core, relays: impl IntoIterator<Item = u16>) -> EndpointAddr {
+    EndpointAddr::from_parts(
+        core.iroh_secret().public(),
+        relays.into_iter().map(|relay| {
+            TransportAddr::Relay(
+                format!("https://relay-{relay:02}.example./")
+                    .parse()
+                    .unwrap(),
+            )
+        }),
+    )
+}
+
+/// The envelopes the chain gained past `head`, oldest first.
+fn written_since(core: &Core, head: EnvelopeDigest) -> Vec<Envelope> {
+    core.canonical_chain(None, None)
+        .unwrap()
+        .into_iter()
+        .skip_while(|(digest, _)| *digest != head)
+        .skip(1)
+        .map(|(_, entry)| entry.envelope)
+        .collect()
+}
+
+/// The path each envelope writes, as a person reads it.
+fn written_paths(envelopes: &[Envelope]) -> Vec<String> {
+    envelopes
+        .iter()
+        .map(|envelope| match envelope.payload() {
+            Msg::SetNamespaceKey(set) => set.path.to_string(),
+            Msg::AmendNamespaceKey(amend) => amend
+                .path
+                .as_ref()
+                .expect("a listing amend names a path")
+                .to_string(),
+            other => panic!("unexpected message {other:?}"),
+        })
+        .collect()
+}
+
+/// What a run of envelopes costs stored and gossiped.
+fn written_bytes(envelopes: &[Envelope]) -> usize {
+    envelopes
+        .iter()
+        .map(|envelope| wire::encode(envelope).unwrap().len())
+        .sum()
+}
+
+/// The path of this node's transport array, as a person reads it.
+fn addrs_path(core: &Core) -> String {
+    format!("{}.iroh.addrs", core.key_id().to_hex().as_ref())
 }
 
 /// The `iroh` address the ledger lists this node at, if it lists it.
@@ -379,4 +442,130 @@ async fn a_daemon_without_an_endpoint_publishes_nothing() {
     assert_eq!(handle.head().await.unwrap(), head);
     handle.shutdown().await.unwrap();
     join.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_transport_that_moved_is_written_over_where_it_stands() {
+    let (_dir, mut core) = core().await;
+    core.advertise(&with_transports(&core, 1000..1004)).unwrap();
+    let head = core.head();
+    let moved = with_transports(&core, [9999, 1001, 1002, 1003]);
+
+    core.advertise(&moved).unwrap();
+
+    // Entries stand in transport order, so the lowest port is the first.
+    assert_eq!(
+        written_paths(&written_since(&core, head)),
+        [format!("{}[0]", addrs_path(&core))],
+        "only the entry that moved is written, and never the endpoint id",
+    );
+    assert_eq!(listed(&core), Some(moved));
+}
+
+#[tokio::test]
+async fn a_transport_gained_is_appended() {
+    let (_dir, mut core) = core().await;
+    core.advertise(&with_transports(&core, 1000..1003)).unwrap();
+    let head = core.head();
+    let gained = with_transports(&core, 1000..1004);
+
+    core.advertise(&gained).unwrap();
+
+    let written = written_since(&core, head);
+    assert_eq!(written_paths(&written), [addrs_path(&core)]);
+    assert!(
+        matches!(written[0].payload(), Msg::AmendNamespaceKey(_)),
+        "the array is amended, not restated: {:?}",
+        written[0].payload(),
+    );
+    assert_eq!(listed(&core), Some(gained));
+}
+
+#[tokio::test]
+async fn a_transport_lost_is_dropped_where_it_stood() {
+    let (_dir, mut core) = core().await;
+    core.advertise(&with_transports(&core, 1000..1004)).unwrap();
+    let head = core.head();
+    let lost = with_transports(&core, 1000..1003);
+
+    core.advertise(&lost).unwrap();
+
+    let written = written_since(&core, head);
+    assert_eq!(
+        written_paths(&written),
+        [format!("{}[3]", addrs_path(&core))]
+    );
+    let Msg::SetNamespaceKey(set) = written[0].payload() else {
+        panic!("expected the entry to be cleared");
+    };
+    assert_eq!(set.value, None);
+    assert_eq!(listed(&core), Some(lost));
+}
+
+#[tokio::test]
+async fn an_address_that_moved_wholesale_is_written_as_one_array() {
+    let (_dir, mut core) = core().await;
+    core.advertise(&with_transports(&core, 1000..1004)).unwrap();
+    let head = core.head();
+    let moved = with_transports(&core, 2000..2004);
+
+    core.advertise(&moved).unwrap();
+
+    // Four entries written one at a time would cost four envelopes, and
+    // an envelope costs more than the entries it saves.
+    let written = written_since(&core, head);
+    assert_eq!(written_paths(&written), [addrs_path(&core)]);
+    let Msg::SetNamespaceKey(set) = written[0].payload() else {
+        panic!("expected the array to be written whole");
+    };
+    assert!(
+        matches!(&set.value, Some(Value::Array(entries)) if entries.len() == 4),
+        "got {:?}",
+        set.value,
+    );
+    assert_eq!(listed(&core), Some(moved));
+}
+
+#[tokio::test]
+async fn a_run_of_edits_is_written_gains_first_then_losses() {
+    let (_dir, mut core) = core().await;
+    core.advertise(&with_relays(&core, 0..10)).unwrap();
+    let head = core.head();
+    // One relay moves and another goes away: two edits still cost less
+    // than restating the eight that stay.
+    let moved = with_relays(&core, (1..9).chain([99]));
+
+    core.advertise(&moved).unwrap();
+
+    let path = addrs_path(&core);
+    assert_eq!(
+        written_paths(&written_since(&core, head)),
+        [format!("{path}[0]"), format!("{path}[9]")],
+        "the highest index is dropped last, so no earlier edit shifts it",
+    );
+    assert_eq!(listed(&core), Some(moved));
+}
+
+/// What it costs to advertise the transports `to` over a listing of
+/// `from`: the bytes of every envelope it takes.
+async fn cost_of_move(
+    from: impl IntoIterator<Item = u16>,
+    to: impl IntoIterator<Item = u16>,
+) -> usize {
+    let (_dir, mut core) = core().await;
+    core.advertise(&with_transports(&core, from)).unwrap();
+    let head = core.head();
+    core.advertise(&with_transports(&core, to)).unwrap();
+    written_bytes(&written_since(&core, head))
+}
+
+#[tokio::test]
+async fn editing_one_transport_costs_less_than_writing_the_array() {
+    let one = cost_of_move(1000..1004, [9999, 1001, 1002, 1003]).await;
+    let all = cost_of_move(1000..1004, 2000..2004).await;
+
+    assert!(
+        one < all,
+        "one transport moving must cost less than all four: {one} against {all}",
+    );
 }

@@ -347,7 +347,10 @@ dual_repr! {
 /// the `type` tags its transport addresses are written under. Named once
 /// so both directions of the conversion stay in step.
 const ENDPOINT_ID: &str = "endpoint_id";
-const ADDRS: &str = "addrs";
+/// The field holding the transport addresses, as an array. Public so a
+/// writer can amend that array entry by entry rather than rewriting the
+/// whole address around it.
+pub const ADDRS: &str = "addrs";
 const ADDR_TYPE: &str = "type";
 const ADDR: &str = "addr";
 const RELAY: &str = "relay";

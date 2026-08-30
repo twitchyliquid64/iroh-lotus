@@ -1,7 +1,7 @@
 //! The initialized internals for a lotus node.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fmt,
     path::{Path, PathBuf},
 };
@@ -15,7 +15,10 @@ use tokio::{fs, io::AsyncWriteExt};
 use wire::{
     Envelope, EnvelopeDigest, Key, KeyId, Msg, Signature,
     keys::{Ed25519PublicKey, Ed25519Signature, PublicKey},
-    msg::{FullCheckpoint, InitMsg, Namespace, NamespaceKey, SetNamespaceKey, Value},
+    msg::{
+        ADDRS, AmendNamespaceKey, AmendOp, FullCheckpoint, InitMsg, Namespace, NamespaceKey,
+        SetNamespaceKey, Value,
+    },
     subkey::{Subkey, SubkeyPath},
 };
 
@@ -515,8 +518,11 @@ impl Core {
     /// the address its endpoint is reachable at right now.
     ///
     /// Compares and writes under one borrow, so what was compared is what
-    /// the write chains onto. Only the `iroh` field of the entry is
-    /// rewritten; anything else listed under this node stays.
+    /// the write chains onto — and what the indices in an edit were
+    /// computed against. Only the transports under the entry's `iroh`
+    /// field are written, usually only the ones that moved: see
+    /// [`advertise_batch`](Self::advertise_batch). Anything else listed
+    /// under this node stays.
     ///
     /// Maintains the transports of the endpoint the ledger already names,
     /// nothing more. A node the ledger does not list is left unlisted, and
@@ -540,24 +546,174 @@ impl Core {
             return Ok(Advertised::CannotSign(reason));
         }
 
-        let value = Value::try_from(addr).map_err(AdvertiseError::Addr)?;
-        let key = NamespaceKey::try_new(CLUSTER_NODES_KEY).expect("the reserved key is static");
-        let path = SubkeyPath::try_new(vec![
-            Subkey::Key(self.key_id().to_hex().as_ref().to_owned()),
-            Subkey::Key("iroh".to_owned()),
-        ])
-        .expect("two segments are not empty");
-        let (digest, _) = self
-            .sign_write(|prev| {
-                Msg::SetNamespaceKey(SetNamespaceKey {
-                    prev,
-                    key,
-                    path,
-                    value: Some(value),
-                })
-            })
-            .map_err(AdvertiseError::Chain)?;
+        let batch = self.advertise_batch(addr)?;
+        let digest = batch
+            .last()
+            .expect("a run carries the whole write at the least")
+            .digest()
+            .map_err(wire_err)?;
+        self.insert(batch).map_err(AdvertiseError::Chain)?;
         Ok(Advertised::Written(digest))
+    }
+
+    /// The run of envelopes that takes the transports listed for this
+    /// node to `addr`'s: whichever is smaller of writing the array whole
+    /// and editing the entries that moved.
+    ///
+    /// The endpoint id is never written — a listing under another one is
+    /// refused above, so the id in the ledger is already the right one,
+    /// and a rewrite that carried it would spend those bytes saying so.
+    ///
+    /// An address usually moves one transport at a time, and an edit
+    /// carries the one entry where a rewrite carries every entry there
+    /// is. But an edit is a signed envelope of its own, and once enough
+    /// of them are needed that costs more than the entries they save. So
+    /// both runs are built and the cheaper wins, measured rather than
+    /// guessed at.
+    fn advertise_batch(&self, addr: &iroh::EndpointAddr) -> Result<Vec<Envelope>, AdvertiseError> {
+        let wanted = addr
+            .addrs
+            .iter()
+            .map(Value::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(AdvertiseError::Addr)?;
+        let whole = self.sign_updates([Update::Transports(wanted.clone())])?;
+        let Some(edits) = self
+            .transport_edits(&wanted)?
+            .filter(|edits| !edits.is_empty())
+        else {
+            return Ok(whole);
+        };
+        let edited = self.sign_updates(edits)?;
+        Ok(if batch_bytes(&edited)? < batch_bytes(&whole)? {
+            edited
+        } else {
+            whole
+        })
+    }
+
+    /// The edits that take the transports listed for this node to
+    /// `wanted`: an entry the listing no longer needs is spent on one it
+    /// lacks, what is left over is dropped or appended. `None` when the
+    /// listing holds no array to edit, leaving a whole write the only way
+    /// to mend it.
+    ///
+    /// Entries are compared as they are stored rather than as they parse,
+    /// so an entry naming a transport this build has none for is one to
+    /// spend — which is what a whole write does with it too. A duplicate
+    /// is spent the same way, for the same reason.
+    fn transport_edits(&self, wanted: &[Value]) -> Result<Option<Vec<Update>>, AdvertiseError> {
+        let key = NamespaceKey::try_new(CLUSTER_NODES_KEY).expect("the reserved key is static");
+        let path = self.listing_path([Subkey::Key(ADDRS.to_owned())]);
+        let listed = self
+            .storage
+            .value_at(self.head(), &key, path.as_ref())
+            .map_err(|e| AdvertiseError::Chain(ChainError::Storage(e)))?;
+        let Some(Value::Array(listed)) = listed else {
+            return Ok(None);
+        };
+
+        // The entries the listing keeps hold their indices; every other
+        // index is spare, to be written over or dropped.
+        let mut kept = HashSet::new();
+        let spare = listed
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| !(wanted.contains(entry) && kept.insert(*entry)))
+            .map(|(index, _)| u32::try_from(index))
+            .collect::<Result<Vec<_>, _>>();
+        // A listing longer than an index can address is not one to edit.
+        let Ok(spare) = spare else {
+            return Ok(None);
+        };
+        let missing = wanted
+            .iter()
+            .filter(|entry| !listed.contains(entry))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let paired = spare.len().min(missing.len());
+        let appended = missing[paired..].iter().cloned().map(Update::Append);
+        let replaced = spare[..paired]
+            .iter()
+            .zip(&missing[..paired])
+            .map(|(&index, entry)| Update::Replace(index, entry.clone()));
+        // Highest index first, so a drop never shifts an index a later
+        // edit was computed for.
+        let dropped = spare[paired..].iter().rev().copied().map(Update::Drop);
+
+        // Gains before losses, so every listing a peer can read between
+        // the envelopes names a superset of where this node is reachable:
+        // a run cut short leaves it reachable, never unreachable.
+        Ok(Some(appended.chain(replaced).chain(dropped).collect()))
+    }
+
+    /// Signs `updates` into a parent-first run, each envelope chained onto
+    /// the one before it and the first onto the current head.
+    ///
+    /// Signed rather than described, so a run can be weighed against
+    /// another by the bytes it really costs.
+    fn sign_updates(
+        &self,
+        updates: impl IntoIterator<Item = Update>,
+    ) -> Result<Vec<Envelope>, AdvertiseError> {
+        updates
+            .into_iter()
+            .try_fold((self.head(), Vec::new()), |(prev, mut batch), update| {
+                let envelope = self
+                    .keys
+                    .sign(Envelope::new(self.advertise_msg(prev, update)))
+                    .map_err(wire_err)?;
+                let next = envelope.digest().map_err(wire_err)?;
+                batch.push(envelope);
+                Ok((next, batch))
+            })
+            .map(|(_, batch)| batch)
+    }
+
+    /// The message `update` becomes, chained onto `prev`.
+    fn advertise_msg(&self, prev: EnvelopeDigest, update: Update) -> Msg {
+        let key = || NamespaceKey::try_new(CLUSTER_NODES_KEY).expect("the reserved key is static");
+        let addrs = || Subkey::Key(ADDRS.to_owned());
+        let set = |path, value| {
+            Msg::SetNamespaceKey(SetNamespaceKey {
+                prev,
+                key: key(),
+                path,
+                value,
+            })
+        };
+        match update {
+            Update::Transports(entries) => {
+                set(self.listing_path([addrs()]), Some(Value::Array(entries)))
+            }
+            Update::Replace(index, entry) => set(
+                self.listing_path([addrs(), Subkey::Index(index)]),
+                Some(entry),
+            ),
+            Update::Drop(index) => set(self.listing_path([addrs(), Subkey::Index(index)]), None),
+            Update::Append(entry) => Msg::AmendNamespaceKey(AmendNamespaceKey {
+                prev,
+                key: key(),
+                path: Some(self.listing_path([addrs()])),
+                op: AmendOp::AppendEntry(entry),
+            }),
+        }
+    }
+
+    /// The path to the `iroh` field of this node's own `cluster-nodes`
+    /// entry, with `below` beneath it.
+    fn listing_path(&self, below: impl IntoIterator<Item = Subkey>) -> SubkeyPath {
+        SubkeyPath::try_new(
+            [
+                Subkey::Key(self.key_id().to_hex().as_ref().to_owned()),
+                Subkey::Key("iroh".to_owned()),
+            ]
+            .into_iter()
+            .chain(below)
+            .collect(),
+        )
+        .expect("two segments are not empty")
     }
 
     /// Answers one sync-machine query against this node's chain — the
@@ -780,12 +936,40 @@ pub enum AdmitError {
     ServerGone,
 }
 
+/// One envelope's worth of change to the transports listed for this node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Update {
+    /// Writes the transport array whole.
+    Transports(Vec<Value>),
+    /// Writes over the entry at this index.
+    Replace(u32, Value),
+    /// Drops the entry at this index; the entries after it shift down.
+    Drop(u32),
+    /// Appends an entry to the transport array.
+    Append(Value),
+}
+
+/// What a run of envelopes costs stored and gossiped: the canonical
+/// encoding of each, signatures included, since that is what a peer
+/// receives.
+fn batch_bytes(batch: &[Envelope]) -> Result<usize, AdvertiseError> {
+    batch.iter().try_fold(0, |total, envelope| {
+        Ok(total + wire::encode(envelope).map_err(wire_err)?.len())
+    })
+}
+
+/// An encoding failure, as the error an advertisement reports.
+fn wire_err(e: wire::Error) -> AdvertiseError {
+    AdvertiseError::Chain(ChainError::Wire(e))
+}
+
 /// What [`Core::advertise`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Advertised {
     /// The ledger already listed this address.
     Unchanged,
-    /// The listing was rewritten; holds the digest of the envelope.
+    /// The listing was brought up to date; holds the digest of the last
+    /// envelope it took, which may be one of several.
     Written(EnvelopeDigest),
     /// The ledger does not list this node, so there is nothing to update.
     NotListed,
