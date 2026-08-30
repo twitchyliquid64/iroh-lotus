@@ -181,7 +181,8 @@ struct ReadCommand {
     #[arg(value_parser = parse_namespace_key)]
     key: NamespaceKey,
 
-    /// A path within it, written as `servers[0].host`; the whole
+    /// A path within it, written as `servers[0].host`
+    /// (a key with `.` or `[` in it bracket-quoted, `['my.key']`); the whole
     /// namespace when left out
     path: Option<SubkeyPath>,
 
@@ -202,7 +203,8 @@ struct WeakSetCommand {
     /// The value to write, as a JSON literal — strings quoted
     value: String,
 
-    /// The path within the namespace to set, written as `servers[0].host`;
+    /// The path within the namespace to set, written as `servers[0].host`
+    /// (a key with `.` or `[` in it bracket-quoted, `['my.key']`);
     /// the whole namespace when left out
     #[arg(long, short)]
     path: Option<SubkeyPath>,
@@ -231,7 +233,8 @@ struct WeakPushCommand {
     value: String,
 
     /// The path of the array within the namespace, written as
-    /// `servers[0].tags`; the namespace's whole value when left out
+    /// `servers[0].tags` (a key with `.` or `[` in it bracket-quoted,
+    /// `['my.key']`); the namespace's whole value when left out
     #[arg(long, short)]
     path: Option<SubkeyPath>,
 
@@ -256,7 +259,8 @@ struct WeakDeleteCommand {
     key: NamespaceKey,
 
     /// The path within the namespace to clear, written as
-    /// `servers[0].host`; the whole namespace is deleted when left out
+    /// `servers[0].host` (a key with `.` or `[` in it bracket-quoted,
+    /// `['my.key']`); the whole namespace is deleted when left out
     #[arg(long, short)]
     path: Option<SubkeyPath>,
 
@@ -281,7 +285,7 @@ impl WeakDeleteCommand {
     /// clear.
     fn predicate(&self) -> Result<Option<Predicate>, MainError> {
         let wheres = self.r#where.iter().map(|text| {
-            let (path, value) = text.split_once('=').ok_or_else(|| {
+            let (path, value) = split_where(text).ok_or_else(|| {
                 MainError::Other(format!("`{text}` is not PATH=VALUE, as in id=\"web-1\""))
             })?;
             let path = path
@@ -312,7 +316,8 @@ struct WeakIncrementCommand {
     delta: i64,
 
     /// The path of the integer within the namespace, written as
-    /// `servers[0].weight`; the namespace's whole value when left out
+    /// `servers[0].weight` (a key with `.` or `[` in it bracket-quoted,
+    /// `['my.key']`); the namespace's whole value when left out
     #[arg(long, short)]
     path: Option<SubkeyPath>,
 
@@ -323,6 +328,27 @@ struct WeakIncrementCommand {
     /// Clamp the sum down to this ceiling
     #[arg(long, allow_negative_numbers = true)]
     max: Option<i64>,
+}
+
+/// Splits a `--where` argument at the `=` between its path and value —
+/// the first one outside the path's brackets, so a bracket-quoted key
+/// may hold one: `['a=b']="x"`.
+fn split_where(text: &str) -> Option<(&str, &str)> {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    text.char_indices()
+        .find(|&(_, c)| {
+            let inside = quote.is_some();
+            match (quote, c) {
+                (_, _) if escaped => escaped = false,
+                (Some(_), '\\') => escaped = true,
+                (Some(open), c) if c == open => quote = None,
+                (None, '\'' | '"') => quote = Some(c),
+                _ => {}
+            }
+            !inside && c == '='
+        })
+        .map(|(at, _)| (&text[..at], &text[at + 1..]))
 }
 
 /// Reads a value from the command line: a JSON literal, or the ledger's
@@ -477,7 +503,8 @@ enum WatchArgs {
         /// The namespace the path is walked from
         #[arg(value_parser = parse_namespace_key)]
         key: NamespaceKey,
-        /// The path within it, written as `servers[0].host`
+        /// The path within it, written as `servers[0].host` (a key with `.`
+        /// or `[` in it bracket-quoted, `['my.key']`)
         path: SubkeyPath,
     },
     /// An envelope leaving the canonical chain, as a reorg rewrites past it
@@ -1113,6 +1140,19 @@ pub enum MainError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `=` that splits a `--where` is the first outside a quoted key,
+    /// so both the key and the value may hold one.
+    #[test]
+    fn a_where_splits_at_the_first_equals_outside_quotes() {
+        assert_eq!(split_where("id=\"x\""), Some(("id", "\"x\"")));
+        assert_eq!(split_where("id=\"a=b\""), Some(("id", "\"a=b\"")));
+        assert_eq!(split_where("['a=b']=1"), Some(("['a=b']", "1")));
+        assert_eq!(split_where("[\"a=b\"]=1"), Some(("[\"a=b\"]", "1")));
+        assert_eq!(split_where("['it\\'s=']=1"), Some(("['it\\'s=']", "1")));
+        assert_eq!(split_where("id"), None);
+        assert_eq!(split_where("['a=b']"), None);
+    }
 
     #[test]
     fn a_window_prints_in_its_largest_whole_unit() {
