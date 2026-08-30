@@ -1,4 +1,4 @@
-use std::{path::PathBuf, process::ExitCode};
+use std::{os::unix::fs::PermissionsExt, path::PathBuf, process::ExitCode};
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
@@ -13,6 +13,9 @@ use tokio::net::UnixListener;
 use tokio::runtime::Builder;
 use tokio::signal::unix::SignalKind;
 use tracing_subscriber::EnvFilter;
+
+/// Who may connect to the control socket: owner and group.
+const LOCAL_SOCK_MODE: u32 = 0o660;
 
 #[derive(Parser)]
 #[command(name = "lotusd", version = lotusd::VERSION, long_version = version::LONG_VERSION)]
@@ -344,6 +347,10 @@ async fn async_main() -> Result<(), MainError> {
         }
         let listener =
             UnixListener::bind(&local_path).map_err(|e| MainError::IO(e, "listening to socket"))?;
+        // `bind` honours the umask, so this is a chmod down from
+        // world-connectable; the 0750 state-dir covers the window.
+        std::fs::set_permissions(&local_path, PermissionsExt::from_mode(LOCAL_SOCK_MODE))
+            .map_err(|e| MainError::IO(e, "setting socket permissions"))?;
         tracing::info!("Control-socket listening on {}", local_path.display());
         tracing::info!("Node ID:     {}", core.key_id().to_hex().as_ref());
         tracing::info!("Endpoint ID: {}", core.iroh_secret().public().to_z32());

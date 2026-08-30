@@ -104,9 +104,7 @@ impl Core {
         state_dir: PathBuf,
         if_initialized: IfInitialized,
     ) -> Result<Self, InitError> {
-        fs::create_dir_all(&state_dir)
-            .await
-            .map_err(|e| InitError::IO(e, "creating state-dir"))?;
+        create_state_dir(&state_dir).await?;
 
         Self::refuse_initialized(&state_dir, if_initialized).await?;
 
@@ -187,9 +185,7 @@ impl Core {
         state_dir: PathBuf,
         if_initialized: IfInitialized,
     ) -> Result<NodeKeys, InitError> {
-        fs::create_dir_all(&state_dir)
-            .await
-            .map_err(|e| InitError::IO(e, "creating state-dir"))?;
+        create_state_dir(&state_dir).await?;
         Self::refuse_initialized(&state_dir, if_initialized).await?;
 
         NodeKeys::generate(&state_dir).await
@@ -1028,6 +1024,23 @@ fn draw_secret() -> Result<[u8; 32], InitError> {
         .try_fill_bytes(&mut secret)
         .map_err(InitError::Entropy)?;
     Ok(secret)
+}
+
+/// Creates the state directory, 0750 on unix: the group needs traverse to
+/// reach the control socket in it.
+async fn create_state_dir(state_dir: &Path) -> Result<(), InitError> {
+    fs::create_dir_all(state_dir)
+        .await
+        .map_err(|e| InitError::IO(e, "creating state-dir"))?;
+    // Set, not left to `create_dir_all`, which honours the umask.
+    #[cfg(unix)]
+    fs::set_permissions(
+        state_dir,
+        std::os::unix::fs::PermissionsExt::from_mode(0o750),
+    )
+    .await
+    .map_err(|e| InitError::IO(e, "setting state-dir permissions"))?;
+    Ok(())
 }
 
 /// Writes key material to `path`, reporting the two ways that fails under
