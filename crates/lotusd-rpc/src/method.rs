@@ -3,7 +3,7 @@
 use crate::{
     ChainRange, CreateInvite, EnvelopeFrame, Error, GetChainRange, GetEnvelopes, GetStatus,
     GetVersion, InviteCode, NodeStatus, Read, Request, Response, ValueAt, Watch, WatchEvent,
-    WeakDelete, WeakIncrement, WeakPush, WeakSet, Written,
+    WeakDelete, WeakDeleteMatching, WeakIncrement, WeakPush, WeakSet, Written,
 };
 
 /// One method of the local control protocol.
@@ -69,5 +69,6 @@ methods! {
     "weak push": WeakPush => Written(Written),
     "weak delete": WeakDelete => Written(Written),
     "weak increment": WeakIncrement => Written(Written),
+    "weak delete matching": WeakDeleteMatching => Written(Written),
     "create invite": CreateInvite => Invite(InviteCode),
 }

@@ -5,14 +5,15 @@ use clap_complete::Shell;
 use lotusd_rpc::{
     Call, ChainWalk, CreateInvite, EnvelopeFrame, GetChainRange, GetEnvelopes, GetStatus,
     GetVersion, InviteCode, NamespaceChange, NodeStatus, Read, ValueAt, Watch, WatchEvent,
-    WatchSelector, WeakDelete, WeakIncrement, WeakPush, WeakSet, WriteOutcome, Written, call,
+    WatchSelector, WeakDelete, WeakDeleteMatching, WeakIncrement, WeakPush, WeakSet, WriteOutcome,
+    Written, call,
 };
 use render::{ColorChoice, Entry, Render};
 use tokio::net::UnixStream;
 use tokio::runtime::Builder;
 use wire::{
     EnvelopeDigest,
-    msg::{NamespaceKey, Value},
+    msg::{Match, NamespaceKey, Predicate, Value},
     subkey::SubkeyPath,
 };
 
@@ -75,7 +76,12 @@ enum Command {
         Chained onto whatever head the daemon stands at, as weak-set is. With \
         --path, what the path addresses is removed — a key from its map, an \
         element from its array — and must exist. Without, the whole namespace \
-        is deleted."
+        is deleted.\n\n\
+        With --where or --equals, the path (or the whole namespace) must be a \
+        map or array instead, and every entry meeting all the conditions is \
+        removed: `--where id=\"web-1\"` matches an entry whose `id` field is \
+        the string web-1, `--equals 7` an entry that is the number 7. Nothing \
+        matching is fine — the write still lands."
     )]
     WeakDelete(WeakDeleteCommand),
     /// Adds to an integer in a namespace, signed by the daemon's own key
@@ -253,6 +259,45 @@ struct WeakDeleteCommand {
     /// `servers[0].host`; the whole namespace is deleted when left out
     #[arg(long, short)]
     path: Option<SubkeyPath>,
+
+    /// Remove the entries of the map or array at the path whose value at
+    /// PATH is VALUE, written `id="web-1"` — repeatable, all must hold
+    #[arg(long, value_name = "PATH=VALUE")]
+    r#where: Vec<String>,
+
+    /// Remove the entries of the map or array at the path that are VALUE,
+    /// a JSON literal — repeatable, all must hold
+    #[arg(long, value_name = "VALUE")]
+    equals: Vec<String>,
+
+    /// Read the values in the ledger's tagged JSON form,
+    /// `{"type": "int", "value": 7}`, which can spell a trusted key
+    #[arg(long)]
+    tagged: bool,
+}
+
+impl WeakDeleteCommand {
+    /// The predicate these arguments describe, or `None` for a plain
+    /// clear.
+    fn predicate(&self) -> Result<Option<Predicate>, MainError> {
+        let wheres = self.r#where.iter().map(|text| {
+            let (path, value) = text.split_once('=').ok_or_else(|| {
+                MainError::Other(format!("`{text}` is not PATH=VALUE, as in id=\"web-1\""))
+            })?;
+            let path = path
+                .parse()
+                .map_err(|e| MainError::Other(format!("`{path}` is not a path: {e}")))?;
+            Ok(Match::at(path, parse_value(value, self.tagged)?))
+        });
+        let equals = self
+            .equals
+            .iter()
+            .map(|text| parse_value(text, self.tagged).map(Match::entry));
+        let matches = wheres.chain(equals).collect::<Result<Vec<_>, _>>()?;
+        // The one way a predicate fails to build is having no conditions,
+        // which is the plain clear.
+        Ok(Predicate::try_new(matches).ok())
+    }
 }
 
 /// The arguments for the weak-increment subcommand.
@@ -787,16 +832,29 @@ async fn async_main() -> Result<(), MainError> {
             )
             .await?
         }
-        Command::WeakDelete(args) => {
-            write(
-                &cli.global_args,
-                WeakDelete {
-                    key: args.key.clone(),
-                    path: args.path.clone(),
-                },
-            )
-            .await?
-        }
+        Command::WeakDelete(args) => match args.predicate()? {
+            Some(predicate) => {
+                write(
+                    &cli.global_args,
+                    WeakDeleteMatching {
+                        key: args.key.clone(),
+                        path: args.path.clone(),
+                        predicate,
+                    },
+                )
+                .await?
+            }
+            None => {
+                write(
+                    &cli.global_args,
+                    WeakDelete {
+                        key: args.key.clone(),
+                        path: args.path.clone(),
+                    },
+                )
+                .await?
+            }
+        },
         Command::WeakIncrement(args) => {
             write(
                 &cli.global_args,

@@ -17,8 +17,8 @@ use wire::{
     Envelope, EnvelopeDigest, Msg,
     keys::{Ed25519PublicKey, Ed25519Signature, Key, KeyId, PublicKey, Signature},
     msg::{
-        AmendNamespaceKey, AmendOp, FullCheckpoint, IncrementDecrement, InitMsg, NamespaceKey,
-        Value,
+        AmendNamespaceKey, AmendOp, FullCheckpoint, IncrementDecrement, InitMsg, Match,
+        NamespaceKey, Predicate, Value,
     },
     subkey::{Subkey, SubkeyPath},
 };
@@ -141,6 +141,24 @@ fn msg_round_trips() {
             r#"{{"type":"amend_namespace_key","value":{{"prev":"ed:{}","key":"a","path":[{{"type":"key","value":"servers"}},{{"type":"index","value":0}}],"op":{{"type":"increment_decrement","value":{{"delta":5,"min":0,"max":null}}}}}}}}"#,
             "ab".repeat(32)
         ),
+    );
+}
+
+/// A predicate is a list of conditions; a condition's path is null for
+/// the entry itself.
+#[test]
+fn delete_matching_round_trips() {
+    let predicate = Predicate::try_new(vec![
+        Match::at(
+            SubkeyPath::try_new(vec![Subkey::Key("id".to_string())]).unwrap(),
+            Value::String("x".to_string()),
+        ),
+        Match::entry(Value::Int(3)),
+    ])
+    .unwrap();
+    assert_json(
+        &AmendOp::DeleteMatching(predicate),
+        r#"{"type":"delete_matching","value":[{"path":[{"type":"key","value":"id"}],"value":{"type":"string","value":"x"}},{"path":null,"value":{"type":"int","value":3}}]}"#,
     );
 }
 

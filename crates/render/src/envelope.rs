@@ -287,6 +287,10 @@ fn describe(msg: &Msg) -> String {
             match &amend.op {
                 AmendOp::AppendEntry(_) => format!("append an entry to {target}"),
                 AmendOp::IncrementDecrement(op) => format!("add {} to {target}", op.delta),
+                AmendOp::DeleteMatching(predicate) => format!(
+                    "delete entries of {target} matching {}",
+                    plural(predicate.as_ref().len(), "condition", "conditions")
+                ),
             }
         }
         Msg::DeleteNamespace(delete) => format!("delete namespace {}", delete.key),

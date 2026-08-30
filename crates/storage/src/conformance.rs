@@ -19,7 +19,9 @@ use std::collections::BTreeMap;
 use wire::{
     Envelope, EnvelopeDigest, Msg, VerificationStatus,
     keys::KeyId,
-    msg::{AmendOp, IncrementDecrement, Namespace, NamespaceKey, SetNamespace, Value},
+    msg::{
+        AmendOp, IncrementDecrement, Match, Namespace, NamespaceKey, Predicate, SetNamespace, Value,
+    },
     subkey::{Subkey, SubkeyPath},
 };
 
@@ -76,6 +78,10 @@ macro_rules! storage_conformance {
         #[test]
         fn conformance_amend_at_without_a_path_amends_the_root() {
             $crate::conformance::amend_at_without_a_path_amends_the_root($make);
+        }
+        #[test]
+        fn conformance_amend_at_deletes_matching_entries() {
+            $crate::conformance::amend_at_deletes_matching_entries($make);
         }
         #[test]
         fn conformance_value_at_reads_the_addressed_value() {
@@ -522,6 +528,139 @@ pub fn amend_at_increments_integers<S: Storage>(mut store: S) {
     assert_eq!(count_of(3), Some(Value::Int(-2)));
     assert_eq!(count_of(4), Some(Value::Int(10)));
     assert_eq!(count_of(5), Some(Value::Int(-1)));
+}
+
+fn predicate(matches: impl IntoIterator<Item = Match>) -> Predicate {
+    Predicate::try_new(matches.into_iter().collect()).expect("suite predicates are non-empty")
+}
+
+/// A delete-matching drops the entries its predicate matches — from an
+/// array with later indices shifted down, from a map, or from the
+/// namespace's root container with no path — and nothing when none match.
+pub fn amend_at_deletes_matching_entries<S: Storage>(mut store: S) {
+    let server =
+        |id: &str, up: bool| map([("id", Value::String(id.into())), ("up", Value::Bool(up))]);
+    store
+        .install(
+            digest(1),
+            namespaces([(
+                "n",
+                Namespace {
+                    value: map([
+                        (
+                            "servers",
+                            Value::Array(vec![
+                                server("a", true),
+                                server("b", false),
+                                server("c", false),
+                            ]),
+                        ),
+                        (
+                            "flags",
+                            map([("x", Value::Bool(true)), ("y", Value::Bool(false))]),
+                        ),
+                    ]),
+                },
+            )]),
+        )
+        .expect("install");
+    let id_is = |id: &str| Match::at(path([sub("id")]), Value::String(id.into()));
+
+    // Two conditions, one entry meets both.
+    store
+        .commit(
+            digest(1),
+            digest(2),
+            amend_at(
+                path([sub("servers")]),
+                AmendOp::DeleteMatching(predicate([
+                    id_is("b"),
+                    Match::at(path([sub("up")]), Value::Bool(false)),
+                ])),
+            ),
+        )
+        .expect("commit");
+    // Nothing matches: a new version that is the same.
+    store
+        .commit(
+            digest(2),
+            digest(3),
+            amend_at(
+                path([sub("servers")]),
+                AmendOp::DeleteMatching(predicate([id_is("zzz")])),
+            ),
+        )
+        .expect("commit");
+    // A map's entries are judged by value too.
+    store
+        .commit(
+            digest(3),
+            digest(4),
+            amend_at(
+                path([sub("flags")]),
+                AmendOp::DeleteMatching(predicate([Match::entry(Value::Bool(false))])),
+            ),
+        )
+        .expect("commit");
+    // No path: the root map's entries.
+    store
+        .commit(
+            digest(4),
+            digest(5),
+            amend_root(
+                "n",
+                AmendOp::DeleteMatching(predicate([Match::entry(map([("x", Value::Bool(true))]))])),
+            ),
+        )
+        .expect("commit");
+
+    let after_first = map([
+        (
+            "servers",
+            Value::Array(vec![server("a", true), server("c", false)]),
+        ),
+        (
+            "flags",
+            map([("x", Value::Bool(true)), ("y", Value::Bool(false))]),
+        ),
+    ]);
+    assert_eq!(fetch(&store, 2, "n").expect("n exists").value, after_first);
+    assert_eq!(fetch(&store, 3, "n").expect("n exists").value, after_first);
+    assert_eq!(
+        fetch(&store, 4, "n").expect("n exists").value,
+        map([
+            (
+                "servers",
+                Value::Array(vec![server("a", true), server("c", false)]),
+            ),
+            ("flags", map([("x", Value::Bool(true))])),
+        ])
+    );
+    assert_eq!(
+        fetch(&store, 5, "n").expect("n exists").value,
+        map([(
+            "servers",
+            Value::Array(vec![server("a", true), server("c", false)]),
+        )])
+    );
+    assert_eq!(
+        fetch(&store, 1, "n").expect("n exists").value,
+        map([
+            (
+                "servers",
+                Value::Array(vec![
+                    server("a", true),
+                    server("b", false),
+                    server("c", false),
+                ]),
+            ),
+            (
+                "flags",
+                map([("x", Value::Bool(true)), ("y", Value::Bool(false))]),
+            ),
+        ]),
+        "the parent version must not move"
+    );
 }
 
 /// A `path` of `None` amends the namespace's value itself — a namespace

@@ -236,8 +236,10 @@ impl Ledger {
     /// as a fresh key under an existing map — nothing else is conjured,
     /// same as [`validate_set_key`](Ledger::validate_set_key). An
     /// increment lands on an existing integer only, its bounds must not
-    /// be inverted, and the sum must clamp or stay inside `i64`. No path
-    /// at all amends the namespace's value itself.
+    /// be inverted, and the sum must clamp or stay inside `i64`. A
+    /// delete-matching lands on an existing map or array, and may match
+    /// none of its entries — it is idempotent by design. No path at all
+    /// amends the namespace's value itself.
     fn validate_amend_key<S: Storage>(
         &self,
         storage: &S,
@@ -306,6 +308,10 @@ impl Ledger {
                 }
             }
             (AmendOp::IncrementDecrement(_), Resolution::Node(_)) => return Err(cannot_amend()),
+            (AmendOp::DeleteMatching(_), Resolution::Node(NodeKind::Map | NodeKind::Array)) => {}
+            (AmendOp::DeleteMatching(_), Resolution::Node(NodeKind::Leaf)) => {
+                return Err(cannot_amend());
+            }
             (_, Resolution::Missing { .. }) => return Err(miss(Miss::NotFound)),
             (_, Resolution::Mismatch { .. }) => return Err(miss(Miss::TypeMismatch)),
         }
@@ -778,7 +784,9 @@ mod tests {
     use storage::MemStorage;
     use wire::{
         keys::{Ed25519PublicKey, Ed25519Signature, PublicKey, Signature},
-        msg::{AddrError, DeleteNamespace, IncrementDecrement, InitMsg, SetNamespace},
+        msg::{
+            AddrError, DeleteNamespace, IncrementDecrement, InitMsg, Match, Predicate, SetNamespace,
+        },
     };
 
     use super::*;
@@ -1413,6 +1421,247 @@ mod tests {
 
     fn inc(delta: i64) -> AmendOp {
         AmendOp::IncrementDecrement(IncrementDecrement::new(delta))
+    }
+
+    fn delete_matching(matches: impl IntoIterator<Item = Match>) -> AmendOp {
+        AmendOp::DeleteMatching(Predicate::try_new(matches.into_iter().collect()).unwrap())
+    }
+
+    /// A ledger whose `n` namespace holds `servers`, an array of
+    /// `{id, up}` maps.
+    fn servers_ledger() -> (MemStorage, Ledger) {
+        setup(&Envelope::new(Msg::Init(InitMsg {
+            state: FullCheckpoint {
+                namespaces: [(
+                    key("n"),
+                    Namespace {
+                        value: Value::Map(
+                            [(
+                                "servers".to_string(),
+                                Value::Array(vec![server("a", true), server("b", false)]),
+                            )]
+                            .into(),
+                        ),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            },
+        })))
+    }
+
+    fn server(id: &str, up: bool) -> Value {
+        Value::Map(
+            [
+                ("id".to_string(), Value::String(id.into())),
+                ("up".to_string(), Value::Bool(up)),
+            ]
+            .into(),
+        )
+    }
+
+    fn id_is(id: &str) -> Match {
+        Match::at(path([sub("id")]), Value::String(id.into()))
+    }
+
+    /// An entry is found by what it holds, not where it sits: no index
+    /// to resolve, and later entries shift down.
+    #[test]
+    fn amend_delete_matching_removes_array_entries_by_content() {
+        let (mut store, mut ledger) = servers_ledger();
+        let envelope = amend(
+            ledger.head(),
+            path([sub("servers")]),
+            delete_matching([id_is("a")]),
+        );
+        ledger.apply(&mut store, &envelope).unwrap();
+
+        assert_eq!(
+            at(&store, &ledger, &[sub("servers")]),
+            Some(Value::Array(vec![server("b", false)]))
+        );
+        assert_eq!(ledger.head(), envelope.digest().unwrap());
+    }
+
+    /// Every condition must hold on one entry.
+    #[test]
+    fn amend_delete_matching_requires_every_condition() {
+        let (mut store, mut ledger) = servers_ledger();
+        let up = |up: bool| Match::at(path([sub("up")]), Value::Bool(up));
+
+        ledger
+            .apply(
+                &mut store,
+                &amend(
+                    ledger.head(),
+                    path([sub("servers")]),
+                    delete_matching([id_is("a"), up(false)]),
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            at(&store, &ledger, &[sub("servers")]),
+            Some(Value::Array(vec![server("a", true), server("b", false)])),
+            "no entry is both a and down"
+        );
+
+        ledger
+            .apply(
+                &mut store,
+                &amend(
+                    ledger.head(),
+                    path([sub("servers")]),
+                    delete_matching([id_is("b"), up(false)]),
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            at(&store, &ledger, &[sub("servers")]),
+            Some(Value::Array(vec![server("a", true)]))
+        );
+    }
+
+    /// Matching nothing is not an error: the envelope applies and the
+    /// head moves, the state unchanged.
+    #[test]
+    fn amend_delete_matching_is_idempotent() {
+        let (mut store, mut ledger) = servers_ledger();
+        let before = at(&store, &ledger, &[sub("servers")]);
+        let envelope = amend(
+            ledger.head(),
+            path([sub("servers")]),
+            delete_matching([id_is("nobody")]),
+        );
+
+        ledger.apply(&mut store, &envelope).unwrap();
+
+        assert_eq!(at(&store, &ledger, &[sub("servers")]), before);
+        assert_eq!(ledger.head(), envelope.digest().unwrap());
+    }
+
+    /// A map's entries are judged by their values; with no path, the
+    /// container is the namespace's root.
+    #[test]
+    fn amend_delete_matching_removes_map_entries_and_root_entries() {
+        let (mut store, mut ledger) = nested_ledger();
+        ledger
+            .apply(
+                &mut store,
+                &amend(
+                    ledger.head(),
+                    path([sub("a")]),
+                    delete_matching([Match::entry(Value::String("1".into()))]),
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            at(&store, &ledger, &[sub("a")]),
+            Some(Value::Map(BTreeMap::new()))
+        );
+
+        ledger
+            .apply(
+                &mut store,
+                &amend_root(
+                    ledger.head(),
+                    "n",
+                    delete_matching([Match::entry(Value::Map(BTreeMap::new()))]),
+                ),
+            )
+            .unwrap();
+        assert_eq!(at(&store, &ledger, &[sub("a")]), None);
+        assert!(at(&store, &ledger, &[sub("list")]).is_some());
+    }
+
+    /// The simplest predicate: no path, the entry itself must equal a
+    /// leaf. On a namespace that is one bare array, with no path either.
+    #[test]
+    fn amend_delete_matching_removes_a_leaf_entry_from_a_root_array() {
+        let (mut store, mut ledger) = setup(&Envelope::new(Msg::Init(InitMsg {
+            state: FullCheckpoint {
+                namespaces: [(
+                    key("test"),
+                    Namespace {
+                        value: Value::Array(vec![Value::Int(2), Value::Int(3), Value::Int(4)]),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            },
+        })));
+
+        ledger
+            .apply(
+                &mut store,
+                &amend_root(
+                    ledger.head(),
+                    "test",
+                    delete_matching([Match::entry(Value::Int(3))]),
+                ),
+            )
+            .unwrap();
+
+        assert_eq!(
+            ledger.namespace(&store, &key("test")).unwrap(),
+            Some(Namespace {
+                value: Value::Array(vec![Value::Int(2), Value::Int(4)])
+            })
+        );
+    }
+
+    /// The container must be a map or array; a leaf has no entries to
+    /// judge.
+    #[test]
+    fn amend_delete_matching_rejects_a_leaf_target() {
+        let (mut store, mut ledger) = nested_ledger();
+        let head = ledger.head();
+        let p = path([sub("a"), sub("b")]);
+
+        let err = ledger
+            .apply(
+                &mut store,
+                &amend(head, p.clone(), delete_matching([id_is("a")])),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(err, ApplyError::AmendTypeMismatch { key: k, path: pp }
+            if k == key("n") && pp.as_ref() == Some(&p))
+        );
+        assert_eq!(ledger.head(), head, "head must not move");
+
+        let (mut store, mut ledger) = root_ledger();
+        let head = ledger.head();
+        let err = ledger
+            .apply(
+                &mut store,
+                &amend_root(head, "total", delete_matching([id_is("a")])),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, ApplyError::AmendTypeMismatch { key: k, path: None }
+            if k == key("total"))
+        );
+    }
+
+    /// Idempotent over the entries, not over the container: a path that
+    /// addresses nothing is still refused.
+    #[test]
+    fn amend_delete_matching_rejects_a_missing_container() {
+        let (mut store, mut ledger) = nested_ledger();
+        let head = ledger.head();
+        let p = path([sub("nope")]);
+
+        let err = ledger
+            .apply(
+                &mut store,
+                &amend(head, p.clone(), delete_matching([id_is("a")])),
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, ApplyError::UnknownPath { key: k, path: pp }
+            if k == key("n") && pp == p));
+        assert_eq!(ledger.head(), head, "head must not move");
     }
 
     /// A key is a leaf, so neither writing through one nor amending one is
@@ -2861,14 +3110,15 @@ mod tests {
     #[test]
     fn a_nested_amend_cannot_corrupt_the_cluster_nodes() {
         let id = node_id(0xaa);
-        let amend_nodes = |prev, p| {
+        let amend_nodes_with = |prev, p, op| {
             Envelope::new(Msg::AmendNamespaceKey(AmendNamespaceKey {
                 prev,
                 key: key(CLUSTER_NODES_KEY),
                 path: Some(p),
-                op: append("x"),
+                op,
             }))
         };
+        let amend_nodes = |prev, p| amend_nodes_with(prev, p, append("x"));
 
         let (mut store, mut ledger) = setup(&init());
         let stored = nodes([(id.clone(), node(1))]);
@@ -2905,6 +3155,23 @@ mod tests {
             .apply(&mut store, &amend_nodes(head, path([sub(&fresh)])))
             .unwrap_err();
         assert_eq!(refusal(&err), format!("{fresh}: not a map"));
+
+        // The address deleted out from under the node by what it holds:
+        // a legal delete on a map, leaving a node no one can reach.
+        let err = ledger
+            .apply(
+                &mut store,
+                &amend_nodes_with(
+                    head,
+                    path([sub(&id)]),
+                    delete_matching([Match::entry(iroh_addr(1))]),
+                ),
+            )
+            .unwrap_err();
+        assert_eq!(
+            refusal(&err),
+            format!("{id}: missing or invalid `iroh` value")
+        );
 
         assert_eq!(ledger.head(), head, "head must not move");
         assert_eq!(

@@ -125,6 +125,13 @@ pub fn amend_at(root: &mut Value, path: Option<&SubkeyPath>, op: AmendOp) {
                 _ => unreachable!("AmendAt is pre-validated: the target is an integer"),
             }
         }
+        AmendOp::DeleteMatching(predicate) => {
+            match walk_mut(root, segments).expect("AmendAt is pre-validated: the target exists") {
+                Value::Map(map) => map.retain(|_, entry| !predicate.matches(entry)),
+                Value::Array(array) => array.retain(|entry| !predicate.matches(entry)),
+                _ => unreachable!("AmendAt is pre-validated: the target is a map or array"),
+            }
+        }
     }
 }
 

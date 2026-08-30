@@ -91,6 +91,13 @@ pub enum WeakWrite {
     Push(rpc::WeakPush),
     Delete(rpc::WeakDelete),
     Increment(rpc::WeakIncrement),
+    DeleteMatching(rpc::WeakDeleteMatching),
+}
+
+impl From<rpc::WeakDeleteMatching> for WeakWrite {
+    fn from(delete: rpc::WeakDeleteMatching) -> Self {
+        WeakWrite::DeleteMatching(delete)
+    }
 }
 
 impl From<rpc::WeakSet> for WeakWrite {
@@ -175,6 +182,16 @@ impl WeakWrite {
                 key,
                 path,
                 op: AmendOp::IncrementDecrement(IncrementDecrement { delta, min, max }),
+            }),
+            WeakWrite::DeleteMatching(rpc::WeakDeleteMatching {
+                key,
+                path,
+                predicate,
+            }) => Msg::AmendNamespaceKey(AmendNamespaceKey {
+                prev,
+                key,
+                path,
+                op: AmendOp::DeleteMatching(predicate),
             }),
         }
     }
@@ -590,6 +607,7 @@ impl rpc::Handler for Rpc {
             rpc::Request::WeakPush(push) => self.write(push, responses).await,
             rpc::Request::WeakDelete(delete) => self.write(delete, responses).await,
             rpc::Request::WeakIncrement(increment) => self.write(increment, responses).await,
+            rpc::Request::WeakDeleteMatching(delete) => self.write(delete, responses).await,
             rpc::Request::CreateInvite(create) => {
                 let Issued { invite, ttl } = self
                     .0

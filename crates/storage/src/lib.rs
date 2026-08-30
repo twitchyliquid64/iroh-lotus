@@ -98,7 +98,9 @@ pub enum NamespaceOp {
     /// (or, for an append only, a missing key under a map) for
     /// [`AmendOp::AppendEntry`], and for
     /// [`AmendOp::IncrementDecrement`] an integer whose sum clamps or
-    /// stays inside `i64`, under bounds that aren't inverted.
+    /// stays inside `i64`, under bounds that aren't inverted, and for
+    /// [`AmendOp::DeleteMatching`] a map or array — whose entries the
+    /// predicate may match none of.
     AmendAt {
         key: NamespaceKey,
         /// The path to the value being amended, or `None` to amend the

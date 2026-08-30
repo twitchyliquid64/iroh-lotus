@@ -7,8 +7,8 @@ use lotusd_rpc::{
     Call, ChainRange, ChainWalk, Changed, EnvelopeFrame, EnvelopeSelector, Error, Failure,
     FailureKind, GetChainRange, GetEnvelopes, GetVersion, Handler, InviteCode, MAX_FRAME_LEN,
     NamespaceChange, NodeStatus, Read, Reorged, Request, Response, Responses, ValueAt,
-    Verification, Watch, WatchEvent, WatchPath, WatchSelector, WeakDelete, WeakIncrement, WeakPush,
-    WeakSet, WriteOutcome, Written, call, serve,
+    Verification, Watch, WatchEvent, WatchPath, WatchSelector, WeakDelete, WeakDeleteMatching,
+    WeakIncrement, WeakPush, WeakSet, WriteOutcome, Written, call, serve,
 };
 use std::time::Duration;
 
@@ -16,7 +16,7 @@ use tokio::io::{AsyncWriteExt, DuplexStream, duplex};
 use wire::{
     Envelope, EnvelopeDigest, Msg, VerificationStatus,
     keys::{Ed25519PublicKey, Key, KeyId, PublicKey},
-    msg::{FullCheckpoint, InitMsg, NamespaceKey, Value},
+    msg::{FullCheckpoint, InitMsg, Match, NamespaceKey, Predicate, Value},
     subkey::SubkeyPath,
 };
 
@@ -110,6 +110,7 @@ struct Fake {
     push: Option<WeakPush>,
     delete: Option<WeakDelete>,
     increment: Option<WeakIncrement>,
+    delete_matching: Option<WeakDeleteMatching>,
     /// Fails every request with this, rather than answering.
     fail: Option<Failure>,
 }
@@ -125,6 +126,7 @@ impl Fake {
             push: None,
             delete: None,
             increment: None,
+            delete_matching: None,
             fail: None,
         }
     }
@@ -230,6 +232,10 @@ impl Handler for Fake {
             }
             Request::WeakIncrement(increment) => {
                 self.increment = Some(increment);
+                responses.send(Response::Written(written())).await
+            }
+            Request::WeakDeleteMatching(delete) => {
+                self.delete_matching = Some(delete);
                 responses.send(Response::Written(written())).await
             }
             Request::CreateInvite(create) => {
@@ -705,6 +711,27 @@ async fn a_push_delete_and_increment_carry_across() {
     });
     assert_eq!(call(client, increment.clone()).await.unwrap(), written());
     assert_eq!(served.await.unwrap(), Some(increment));
+
+    let delete_matching = WeakDeleteMatching {
+        key: key("a"),
+        path: Some(path("servers")),
+        predicate: Predicate::try_new(vec![Match::at(
+            path("id"),
+            Value::String("web-1".to_string()),
+        )])
+        .unwrap(),
+    };
+    let (client, mut server) = duplex(64 * 1024);
+    let served = tokio::spawn(async move {
+        let mut handler = Fake::new();
+        serve(&mut server, &mut handler).await.unwrap();
+        handler.delete_matching
+    });
+    assert_eq!(
+        call(client, delete_matching.clone()).await.unwrap(),
+        written()
+    );
+    assert_eq!(served.await.unwrap(), Some(delete_matching));
 }
 
 /// A write the chain refused is the client's problem, and is told apart

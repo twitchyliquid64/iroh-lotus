@@ -10,7 +10,12 @@ use std::collections::BTreeMap;
 use cbor2::Cbor;
 use nutype::nutype;
 
-use crate::{EnvelopeDigest, codec::dual_repr, keys::Key, subkey::SubkeyPath};
+use crate::{
+    EnvelopeDigest,
+    codec::dual_repr,
+    keys::Key,
+    subkey::{Subkey, SubkeyPath},
+};
 
 /// The name a namespace is stored under in the ledger.
 #[nutype(
@@ -164,12 +169,76 @@ pub enum AmendOp {
     /// Adds a delta to the integer at the path, which must exist,
     /// clamping the sum to the bounds that are set.
     IncrementDecrement(IncrementDecrement),
+    /// Removes every entry of the map or array at the path — which must
+    /// exist — that the predicate matches. Later array indices shift
+    /// down. Idempotent: matching nothing removes nothing.
+    DeleteMatching(Predicate),
 }
 
 dual_repr! {
     AmendOp {
         AppendEntry(Value) = 1 | "append_entry",
         IncrementDecrement(IncrementDecrement) = 2 | "increment_decrement",
+        DeleteMatching(Predicate) = 3 | "delete_matching",
+    }
+}
+
+/// The conditions an entry must meet, every one of them, for
+/// [`AmendOp::DeleteMatching`] to remove it.
+///
+/// Never empty: with no condition every entry would match, and emptying
+/// a container is [`SetNamespaceKey`]'s job, said outright.
+#[nutype(
+    validate(predicate = |matches| !matches.is_empty()),
+    derive(Debug, Clone, PartialEq, Eq, Hash, AsRef, Serialize, Deserialize)
+)]
+pub struct Predicate(Vec<Match>);
+
+impl Predicate {
+    /// Whether `entry` meets every condition.
+    pub fn matches(&self, entry: &Value) -> bool {
+        self.as_ref().iter().all(|m| m.matches(entry))
+    }
+}
+
+/// One condition of a [`Predicate`]: the value at `path` inside an entry
+/// equals `value`. An entry the path does not reach — a leaf where a map
+/// is expected, a key it lacks, an index past its end — does not match.
+#[derive(Debug, Clone, Cbor, Hash, PartialEq, Eq)]
+pub struct Match {
+    /// Where to look inside the entry, or `None` for the entry itself.
+    #[cbor(key = 1)]
+    pub path: Option<SubkeyPath>,
+    #[cbor(key = 2)]
+    pub value: Value,
+}
+
+impl Match {
+    /// Matches the entry itself against `value`.
+    pub fn entry(value: Value) -> Self {
+        Self { path: None, value }
+    }
+
+    /// Matches what `path` addresses inside the entry against `value`.
+    pub fn at(path: SubkeyPath, value: Value) -> Self {
+        Self {
+            path: Some(path),
+            value,
+        }
+    }
+
+    /// Whether `entry` meets this condition.
+    pub fn matches(&self, entry: &Value) -> bool {
+        self.path
+            .as_ref()
+            .map_or(&[][..], |path| path.as_ref())
+            .iter()
+            .try_fold(entry, |value, segment| match (value, segment) {
+                (Value::Map(map), Subkey::Key(key)) => map.get(key),
+                (Value::Array(array), Subkey::Index(index)) => array.get(*index as usize),
+                _ => None,
+            })
+            .is_some_and(|found| found == &self.value)
     }
 }
 
@@ -880,6 +949,80 @@ mod tests {
         assert_wire(
             &AmendOp::IncrementDecrement(IncrementDecrement::new(-2).with_min(-3)),
             "a102a30121022203f6",
+        );
+        // A predicate is an array of conditions, each an `a2` of path
+        // (`f6` for the entry itself) and value.
+        assert_wire(
+            &AmendOp::DeleteMatching(predicate([Match::entry(Value::Int(7))])),
+            "a10381a201f602a10207",
+        );
+        assert_wire(
+            &AmendOp::DeleteMatching(predicate([
+                Match::at(path([Subkey::Key("id".into())]), val("x")),
+                Match::at(path([Subkey::Index(0)]), Value::Bool(true)),
+            ])),
+            "a10382a20181a10162696402a1016178a20181a1020002a103f5",
+        );
+    }
+
+    fn predicate(matches: impl IntoIterator<Item = Match>) -> Predicate {
+        Predicate::try_new(matches.into_iter().collect()).unwrap()
+    }
+
+    #[test]
+    fn predicate_rejects_empty() {
+        assert!(Predicate::try_new(vec![]).is_err());
+    }
+
+    /// A condition looks at the entry itself, or at a path inside it; an
+    /// entry the path does not reach never matches, whatever the value.
+    #[test]
+    fn match_compares_what_its_path_reaches() {
+        let entry = Value::Map(BTreeMap::from([
+            ("id".to_string(), val("x")),
+            ("tags".to_string(), Value::Array(vec![Value::Int(1)])),
+        ]));
+
+        assert!(Match::entry(entry.clone()).matches(&entry));
+        assert!(!Match::entry(val("x")).matches(&entry));
+
+        let id = || path([Subkey::Key("id".into())]);
+        assert!(Match::at(id(), val("x")).matches(&entry));
+        assert!(!Match::at(id(), val("y")).matches(&entry));
+        assert!(
+            !Match::at(id(), val("x")).matches(&val("x")),
+            "a leaf has no fields"
+        );
+        assert!(!Match::at(path([Subkey::Key("nope".into())]), val("x")).matches(&entry));
+
+        let first_tag = || path([Subkey::Key("tags".into()), Subkey::Index(0)]);
+        assert!(Match::at(first_tag(), Value::Int(1)).matches(&entry));
+        assert!(
+            !Match::at(
+                path([Subkey::Key("tags".into()), Subkey::Index(1)]),
+                Value::Int(1)
+            )
+            .matches(&entry)
+        );
+        assert!(
+            !Match::at(path([Subkey::Key("id".into()), Subkey::Index(0)]), val("x"))
+                .matches(&entry)
+        );
+
+        // Every condition must hold.
+        assert!(
+            predicate([
+                Match::at(id(), val("x")),
+                Match::at(first_tag(), Value::Int(1))
+            ])
+            .matches(&entry)
+        );
+        assert!(
+            !predicate([
+                Match::at(id(), val("x")),
+                Match::at(first_tag(), Value::Int(2))
+            ])
+            .matches(&entry)
         );
     }
 

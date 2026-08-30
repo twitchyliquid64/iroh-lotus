@@ -66,7 +66,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use wire::{
     Envelope, EnvelopeDigest, VerificationStatus,
     keys::KeyId,
-    msg::{AmendOp, IncrementDecrement, Namespace, NamespaceKey, Value},
+    msg::{AmendOp, IncrementDecrement, Namespace, NamespaceKey, Predicate, Value},
     subkey::Subkey,
 };
 
@@ -538,6 +538,50 @@ fn increment_leaf(conn: &Connection, old: i64, inc: &IncrementDecrement) -> Resu
     insert_node(conn, LEAF, Some(&bytes))
 }
 
+/// A new container node with `old`'s edges minus those whose child
+/// `predicate` matches. O(container): every child is materialized to be
+/// judged.
+fn new_container_retaining(
+    conn: &Connection,
+    old: i64,
+    predicate: &Predicate,
+) -> Result<i64, Error> {
+    // `Err` for a read that failed, `Ok(None)` for a child to drop.
+    let keep = |child: i64| -> Result<Option<i64>, Error> {
+        Ok((!predicate.matches(&value_of(conn, child)?)).then_some(child))
+    };
+    match node_kind(conn, old)? {
+        NodeKind::Map => {
+            let edges: Vec<(String, i64)> = conn
+                .prepare_cached("SELECT key, child FROM map_edges WHERE parent = ?1")?
+                .query_map([old], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<_, _>>()?;
+            let id = insert_node(conn, MAP, None)?;
+            edges.into_iter().try_for_each(|(key, child)| {
+                keep(child)?.map_or(Ok(()), |child| insert_map_edge(conn, id, &key, child))
+            })?;
+            Ok(id)
+        }
+        NodeKind::Array => {
+            let children: Vec<i64> = conn
+                .prepare_cached("SELECT child FROM array_edges WHERE parent = ?1 ORDER BY idx")?
+                .query_map([old], |row| row.get(0))?
+                .collect::<Result<_, _>>()?;
+            let kept = children
+                .into_iter()
+                .filter_map(|child| keep(child).transpose())
+                .collect::<Result<Vec<_>, _>>()?;
+            let id = insert_node(conn, ARRAY, None)?;
+            kept.into_iter().enumerate().try_for_each(|(idx, child)| {
+                let idx = i64::try_from(idx).expect("an array's length fits an i64");
+                insert_array_edge(conn, id, idx, child)
+            })?;
+            Ok(id)
+        }
+        NodeKind::Leaf => unreachable!("AmendAt is pre-validated: the target is a map or array"),
+    }
+}
+
 /// Path-copies `node` along `path`: every node on the path is cloned, the
 /// clone pointing at the original's children except where the path
 /// continues, and `terminal` decides what the last segment addresses —
@@ -594,6 +638,7 @@ fn amend_node(conn: &Connection, node: i64, op: AmendOp) -> Result<i64, Error> {
             new_array_appending(conn, node, entry)
         }
         AmendOp::IncrementDecrement(inc) => increment_leaf(conn, node, &inc),
+        AmendOp::DeleteMatching(predicate) => new_container_retaining(conn, node, &predicate),
     }
 }
 
@@ -739,9 +784,10 @@ impl Storage for SqliteStorage {
                                 }
                             }
                         }
-                        AmendOp::IncrementDecrement(inc) => {
+                        // Every other op lands on an existing target.
+                        op => {
                             let target = old.expect("AmendAt is pre-validated: the target exists");
-                            increment_leaf(conn, target, &inc).map(Some)
+                            amend_node(conn, target, op).map(Some)
                         }
                     })?,
                 };

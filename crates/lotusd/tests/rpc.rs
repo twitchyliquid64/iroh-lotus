@@ -9,8 +9,8 @@ use std::{
 use lotusd::{Core, IfInitialized, Server, ServerHandle, VERSION};
 use lotusd_rpc::{
     Call, ChainWalk, EnvelopeFrame, Error, FailureKind, GetChainRange, GetEnvelopes, GetVersion,
-    Read, Verification, Watch, WatchSelector, WeakDelete, WeakIncrement, WeakPush, WeakSet,
-    WriteOutcome, Written, call,
+    Read, Verification, Watch, WatchSelector, WeakDelete, WeakDeleteMatching, WeakIncrement,
+    WeakPush, WeakSet, WriteOutcome, Written, call,
 };
 use std::collections::BTreeMap;
 use tempfile::TempDir;
@@ -18,7 +18,7 @@ use tokio::{net::UnixStream, task::JoinHandle, time::timeout};
 
 use wire::{
     Envelope, EnvelopeDigest, Msg, VerificationStatus,
-    msg::{Namespace, NamespaceKey, SetNamespace, Value},
+    msg::{Match, Namespace, NamespaceKey, Predicate, SetNamespace, Value},
     subkey::SubkeyPath,
 };
 
@@ -721,6 +721,67 @@ async fn a_weak_delete_clears_a_value_or_a_namespace() {
     write(&socket, delete(None)).await.unwrap();
     assert_eq!(value_at(&socket, key("cfg"), None).await, None);
     assert!(rejected(write(&socket, delete(None)).await));
+}
+
+/// A delete-matching removes the entries a predicate picks out of an
+/// array by their content, lands even when nothing matches, and is
+/// rejected where there is no container to search.
+#[tokio::test]
+async fn a_weak_delete_matching_removes_entries_by_content() {
+    let dir = TempDir::new().unwrap();
+    let (_genesis, socket, _handle, _join) = serve(&dir).await;
+    let server = |id: &str| {
+        Value::Map(BTreeMap::from([(
+            "id".to_owned(),
+            Value::String(id.to_owned()),
+        )]))
+    };
+    let delete = |path: Option<SubkeyPath>, id: &str| WeakDeleteMatching {
+        key: key("cfg"),
+        path,
+        predicate: Predicate::try_new(vec![Match::at(
+            "id".parse().unwrap(),
+            Value::String(id.to_owned()),
+        )])
+        .unwrap(),
+    };
+
+    weak_set(
+        &socket,
+        key("cfg"),
+        None,
+        Value::Map(BTreeMap::from([(
+            "servers".to_owned(),
+            Value::Array(vec![server("a"), server("b"), server("c")]),
+        )])),
+    )
+    .await
+    .unwrap();
+
+    let written = write(&socket, delete(Some(path("servers")), "b"))
+        .await
+        .unwrap();
+    assert_eq!(written.outcome, WriteOutcome::Extended);
+    assert_eq!(
+        value_at(&socket, key("cfg"), Some(path("servers"))).await,
+        Some(Value::Array(vec![server("a"), server("c")]))
+    );
+
+    let written = write(&socket, delete(Some(path("servers")), "b"))
+        .await
+        .unwrap();
+    assert_eq!(written.outcome, WriteOutcome::Extended, "idempotent");
+    assert_eq!(
+        value_at(&socket, key("cfg"), Some(path("servers"))).await,
+        Some(Value::Array(vec![server("a"), server("c")]))
+    );
+
+    assert!(rejected(
+        write(&socket, delete(Some(path("servers[0].id")), "a")).await
+    ));
+    assert!(rejected(
+        write(&socket, delete(Some(path("nope")), "a")).await
+    ));
 }
 
 /// An increment adds to the integer at a path, clamps to the bounds

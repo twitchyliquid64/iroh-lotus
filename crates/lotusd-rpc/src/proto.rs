@@ -14,7 +14,7 @@ use chrono::{DateTime, Utc};
 use wire::{
     Envelope, EnvelopeDigest, VerificationStatus,
     keys::KeyId,
-    msg::{NamespaceKey, Value},
+    msg::{NamespaceKey, Predicate, Value},
     subkey::SubkeyPath,
 };
 
@@ -42,6 +42,8 @@ pub enum Request {
     WeakDelete(WeakDelete),
     /// See [`WeakIncrement`].
     WeakIncrement(WeakIncrement),
+    /// See [`WeakDeleteMatching`].
+    WeakDeleteMatching(WeakDeleteMatching),
     /// See [`CreateInvite`].
     CreateInvite(CreateInvite),
 }
@@ -167,8 +169,22 @@ pub struct WeakIncrement {
     pub max: Option<i64>,
 }
 
-/// Answers every weak write: [`WeakSet`], [`WeakPush`], [`WeakDelete`]
-/// and [`WeakIncrement`].
+/// Asks the daemon to remove every entry of the map or array `path`
+/// addresses in `key` — the namespace's whole value when no path is
+/// given — that `predicate` matches. Signed and chained like a
+/// [`WeakSet`]; the container must exist, but matching nothing is fine.
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+pub struct WeakDeleteMatching {
+    #[cbor(key = 1)]
+    pub key: NamespaceKey,
+    #[cbor(key = 2)]
+    pub path: Option<SubkeyPath>,
+    #[cbor(key = 3)]
+    pub predicate: Predicate,
+}
+
+/// Answers every weak write: [`WeakSet`], [`WeakPush`], [`WeakDelete`],
+/// [`WeakIncrement`] and [`WeakDeleteMatching`].
 #[derive(Debug, Clone, Cbor, PartialEq, Eq)]
 pub struct Written {
     /// The digest of the envelope the write was signed into.
