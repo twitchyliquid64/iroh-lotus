@@ -2,7 +2,11 @@ use std::{path::PathBuf, process::ExitCode};
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
-use iroh::{Endpoint, endpoint::presets};
+use iroh::{
+    Endpoint, RelayMode,
+    address_lookup::{AddrFilter, DnsAddressLookup, PkarrPublisher, PkarrResolver},
+    endpoint::{default_relay_mode, presets},
+};
 use lotusd::{Core, IfInitialized, Server, bootstrap, invite::Invite, peer_ingress::Protocol};
 use render::{ColorChoice, Entry, Render};
 use tokio::net::UnixListener;
@@ -111,26 +115,74 @@ pub struct GlobalArgs {
     state_dir: Option<PathBuf>,
 
     /// Which relay infrastructure the iroh endpoint uses
-    #[arg(long, value_enum, global = true, default_value_t = Relay::None)]
+    #[arg(long, value_enum, global = true, default_value_t = Relay::N0)]
     relay: Relay,
+
+    /// Which address-discovery service the iroh endpoint publishes to and
+    /// resolves peers through
+    #[arg(long, value_enum, global = true, default_value_t = AddrDiscovery::None)]
+    addr_discovery: AddrDiscovery,
 }
 
 /// The relay infrastructure an endpoint binds with, as `--relay` names it.
+///
+/// Relays carry traffic; whether this node is *findable* is
+/// [`AddrDiscovery`]'s concern. With relays on, this node registers with a
+/// home relay (which then appears in its ledger listing) and can dial
+/// peers through *their* listed or discovered relays; with them off it
+/// can do neither, and reaches peers only by direct addresses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Relay {
-    /// No relays: direct connections only (iroh's `Minimal` preset)
+    /// No relays: direct connections only
     None,
-    /// The n0 public relay network (iroh's `N0` preset)
+    /// The n0 public relay network
+    N0,
+}
+
+/// The address-discovery service an endpoint uses, as `--addr-discovery`
+/// names it.
+///
+/// Discovery is what re-finds a peer whose ledger listing went stale
+/// (say, a restart onto a new port). Publishing is the private side of
+/// the trade: with `n0`, this node's reachability — its relay URL, or
+/// its direct addresses when relays are off — sits in public DNS under
+/// its endpoint id. A node that wants to stay unlisted runs `none` and
+/// relies on its own ledger listing; it can still *resolve* nobody, so
+/// it depends on peers keeping their listings fresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AddrDiscovery {
+    /// Nothing published, nothing resolved: peers are reached only as the
+    /// ledger lists them
+    None,
+    /// n0's public pkarr/DNS service
     N0,
 }
 
 impl GlobalArgs {
-    /// EndpointBuilder returns an iroh endpoint builder configured with the
-    /// preset `--relay` selected.
+    /// EndpointBuilder returns an iroh endpoint builder configured as
+    /// `--relay` and `--addr-discovery` select.
     pub fn endpoint_builder(&self) -> iroh::endpoint::Builder {
-        match self.relay {
-            Relay::None => Endpoint::builder(presets::Minimal),
-            Relay::N0 => Endpoint::builder(presets::N0),
+        let builder = Endpoint::builder(presets::Minimal).relay_mode(match self.relay {
+            Relay::None => RelayMode::Disabled,
+            Relay::N0 => default_relay_mode(),
+        });
+        match self.addr_discovery {
+            AddrDiscovery::None => builder,
+            AddrDiscovery::N0 => {
+                // n0's publisher keeps direct addresses out of public DNS
+                // by default. Without relays that filter would leave the
+                // record empty, and a peer with a stale listing could
+                // never re-find this node — the direct addresses are the
+                // only way in, so publish them.
+                let publisher = match self.relay {
+                    Relay::None => PkarrPublisher::n0_dns().addr_filter(AddrFilter::unfiltered()),
+                    Relay::N0 => PkarrPublisher::n0_dns(),
+                };
+                builder
+                    .address_lookup(publisher)
+                    .address_lookup(PkarrResolver::n0_dns())
+                    .address_lookup(DnsAddressLookup::n0_dns())
+            }
         }
     }
 
