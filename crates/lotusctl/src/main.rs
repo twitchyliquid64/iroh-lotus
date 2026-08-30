@@ -17,11 +17,8 @@ use wire::{
     subkey::SubkeyPath,
 };
 
-/// The version of this CLI.
-const VERSION: &str = env!("CARGO_PKG_VERSION");
-
 #[derive(Parser)]
-#[command(name = "lotusctl", version = VERSION)]
+#[command(name = "lotusctl", version = version::VERSION, long_version = version::LONG_VERSION)]
 #[command(about = "Controls a running iroh-lotus daemon")]
 struct Cli {
     #[command(subcommand)]
@@ -1004,7 +1001,7 @@ async fn async_main() -> Result<(), MainError> {
                 .map_err(MainError::Rpc)?;
 
             let versions = Versions {
-                client: VERSION.to_string(),
+                client: version::VERSION.to_string(),
                 daemon,
             };
 

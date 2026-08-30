@@ -2104,6 +2104,7 @@ dependencies = [
  "state",
  "tempfile",
  "tokio",
+ "version",
  "wire",
 ]
 
@@ -2136,6 +2137,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "version",
  "wire",
 ]
 
@@ -4368,6 +4370,10 @@ name = "vcpkg"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
+
+[[package]]
+name = "version"
+version = "0.0.1"
 
 [[package]]
 name = "version_check"

@@ -32,6 +32,7 @@ render = { workspace = true, features = ["clap"] }
 state.workspace = true
 storage.workspace = true
 sync.workspace = true
+version.workspace = true
 wire.workspace = true
 
 [dev-dependencies]

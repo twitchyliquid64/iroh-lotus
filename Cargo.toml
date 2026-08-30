@@ -7,6 +7,7 @@ members = [
     "crates/state",
     "crates/storage",
     "crates/sync",
+    "crates/version",
     "crates/wire",
 ]
 resolver = "3"
@@ -58,4 +59,5 @@ render = { path = "crates/render" }
 state = { path = "crates/state" }
 storage = { path = "crates/storage" }
 sync = { path = "crates/sync" }
+version = { path = "crates/version" }
 wire = { path = "crates/wire" }

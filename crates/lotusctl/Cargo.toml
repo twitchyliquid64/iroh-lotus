@@ -17,6 +17,7 @@ tokio.workspace = true
 # Our crates
 lotusd-rpc.workspace = true
 render = { workspace = true, features = ["clap"] }
+version.workspace = true
 wire.workspace = true
 
 # The end-to-end tests drive this CLI against a real daemon.

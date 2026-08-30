@@ -30,7 +30,7 @@ pub mod peer_link;
 pub mod sync_driver;
 
 /// The version this daemon reports over the control socket.
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const VERSION: &str = version::VERSION;
 
 /// Encapsulates the return channel for messages back from an actor.
 #[derive(Debug)]

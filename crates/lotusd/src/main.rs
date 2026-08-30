@@ -15,7 +15,7 @@ use tokio::signal::unix::SignalKind;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "lotusd", version = "0.0.1")]
+#[command(name = "lotusd", version = lotusd::VERSION, long_version = version::LONG_VERSION)]
 #[command(about = "The iroh-lotus daemon")]
 struct Cli {
     #[command(subcommand)]
