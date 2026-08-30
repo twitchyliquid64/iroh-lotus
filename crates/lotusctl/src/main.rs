@@ -640,7 +640,7 @@ struct CompletionsArgs {
 #[derive(Debug, Args)]
 struct GlobalArgs {
     /// Override the directory where state is stored (default: $XDG_STATE_DIR/iroh-lotus)
-    #[arg(long, alias = "sd")]
+    #[arg(long, alias = "sd", env = "LOTUS_STATE_DIR")]
     state_dir: Option<PathBuf>,
 
     /// How to render output
@@ -663,8 +663,9 @@ enum Format {
 
 impl GlobalArgs {
     /// StateDir returns the directory where daemon state is stored: the `--state-dir`
-    /// override when given, otherwise `iroh-lotus` under the platform state directory
-    /// (`$XDG_STATE_HOME`, falling back to `~/.local/state`, on Linux).
+    /// override (or `LOTUS_STATE_DIR`) when given, otherwise `iroh-lotus` under the
+    /// platform state directory (`$XDG_STATE_HOME`, falling back to `~/.local/state`,
+    /// on Linux).
     ///
     /// Fails only when no home directory can be determined.
     fn state_dir(&self) -> Result<PathBuf, MainError> {

@@ -111,16 +111,16 @@ fn parse_invite(text: &str) -> Result<Invite, String> {
 #[derive(Debug, Args)]
 pub struct GlobalArgs {
     /// Override the directory where state is stored (default: $XDG_STATE_DIR/iroh-lotus)
-    #[arg(long, alias = "sd")]
+    #[arg(long, alias = "sd", env = "LOTUS_STATE_DIR")]
     state_dir: Option<PathBuf>,
 
     /// Which relay infrastructure the iroh endpoint uses
-    #[arg(long, value_enum, global = true, default_value_t = Relay::N0)]
+    #[arg(long, value_enum, global = true, env = "LOTUS_RELAY", default_value_t = Relay::N0)]
     relay: Relay,
 
     /// Which address-discovery service the iroh endpoint publishes to and
     /// resolves peers through
-    #[arg(long, value_enum, global = true, default_value_t = AddrDiscovery::None)]
+    #[arg(long, value_enum, global = true, env = "LOTUS_ADDR_DISCOVERY", default_value_t = AddrDiscovery::None)]
     addr_discovery: AddrDiscovery,
 }
 
@@ -187,8 +187,9 @@ impl GlobalArgs {
     }
 
     /// StateDir returns the directory where daemon state is stored: the `--state-dir`
-    /// override when given, otherwise `iroh-lotus` under the platform state directory
-    /// (`$XDG_STATE_HOME`, falling back to `~/.local/state`, on Linux).
+    /// override (or `LOTUS_STATE_DIR`) when given, otherwise `iroh-lotus` under the
+    /// platform state directory (`$XDG_STATE_HOME`, falling back to `~/.local/state`,
+    /// on Linux).
     ///
     /// Fails only when no home directory can be determined.
     pub fn state_dir(&self) -> Result<PathBuf, MainError> {
