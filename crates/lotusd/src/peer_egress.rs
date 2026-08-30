@@ -16,10 +16,11 @@
 //! One task per peer, owning that peer's connection and redialling it with
 //! backoff. Over each connection it announces this node's head as it
 //! moves — a second subscription, fanned out to the peer tasks — and
-//! serves whatever pull the peer opens in answer. The actor's own loop
-//! never awaits the mainloop: on shutdown the mainloop awaits *this*, so
-//! a read of the ledger runs on a task of its own and posts its result
-//! back here.
+//! serves whatever pull the peer opens in answer. The actor never awaits
+//! the mainloop — not its loop, and not the subscribing it does before
+//! that loop: on shutdown, and for a status query, the mainloop awaits
+//! *this*, so a read of the ledger runs on a task of its own and posts
+//! its result back here.
 
 use std::{collections::BTreeMap, fmt, ops::ControlFlow, time::Duration};
 
@@ -35,7 +36,7 @@ use tracing::Instrument;
 use wire::{EnvelopeDigest, KeyId, msg::NamespaceKey};
 
 use crate::{
-    ChangeFilter, RequestError, Responder, ServerHandle, SubscriptionHandle,
+    ChangeFilter, Core, RequestError, Responder, ServerHandle, SubscriptionHandle,
     peer_ingress::CloseReason, peer_link::Link, server::WeakServerHandle,
 };
 
@@ -123,18 +124,29 @@ impl PeerEgress {
 
     /// Starts the actor on its own task, returning the handle the server
     /// drives it by.
-    pub(crate) fn spawn(self) -> PeerEgressHandle {
+    ///
+    /// Registers the subscriptions here, off the core the caller still
+    /// holds, rather than asking the mainloop for them once running: an
+    /// actor that awaits the mainloop before it serves its own channel
+    /// deadlocks against a mainloop that reaches for it first. It also
+    /// puts the subscriptions in place before the mainloop takes its
+    /// first message, so nothing can move underneath them.
+    pub(crate) fn spawn(self, core: &Core) -> PeerEgressHandle {
+        let key = NamespaceKey::try_new(CLUSTER_NODES_KEY).expect("the reserved key is static");
+        let nodes = core.subscribe(ChangeFilter::namespace(key));
+        let heads = core.subscribe(ChangeFilter::head());
         let (tx, rx) = mpsc::channel(8);
-        let join = tokio::spawn(self.run(tx.clone(), rx));
+        let join = tokio::spawn(self.run(tx.clone(), rx, nodes, heads));
         PeerEgressHandle { tx, join }
     }
 
-    async fn run(self, tx: mpsc::Sender<EgressMsg>, mut cmd: mpsc::Receiver<EgressMsg>) {
-        // Subscribed before the first read, so nothing can move between
-        // the read and the subscription taking effect.
-        let Some((mut nodes, mut heads)) = self.subscribe().await else {
-            return;
-        };
+    async fn run(
+        self,
+        tx: mpsc::Sender<EgressMsg>,
+        mut cmd: mpsc::Receiver<EgressMsg>,
+        mut nodes: SubscriptionHandle,
+        mut heads: SubscriptionHandle,
+    ) {
         // Seeded from where the subscription opened: every later movement
         // arrives as a notification, so nothing is announced stale.
         let (head, _) = watch::channel(heads.opened_at());
@@ -200,16 +212,6 @@ impl PeerEgress {
                 },
             }
         }
-    }
-
-    /// Registers for changes to the node set and to the head, or `None`
-    /// when the server is already gone.
-    async fn subscribe(&self) -> Option<(SubscriptionHandle, SubscriptionHandle)> {
-        let server = self.server.upgrade()?;
-        let key = NamespaceKey::try_new(CLUSTER_NODES_KEY).expect("the reserved key is static");
-        let nodes = server.subscribe(ChangeFilter::namespace(key)).await.ok()?;
-        let heads = server.subscribe(ChangeFilter::head()).await.ok()?;
-        Some((nodes, heads))
     }
 
     /// Brings the table in line with `desired`.

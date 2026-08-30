@@ -15,10 +15,11 @@
 //! An endpoint's address flaps: every interface or relay event moves it,
 //! and every publish is a signed envelope on a permanent chain. So a wake
 //! arms a settle timer rather than publishing at once, and the publish
-//! takes whatever the address is when the timer fires. The actor's own
-//! loop never awaits the mainloop — on shutdown the mainloop awaits
-//! *this* — so the publish runs on a task of its own and posts its
-//! outcome back here.
+//! takes whatever the address is when the timer fires. The actor never
+//! awaits the mainloop — not its loop, and not the subscribing it does
+//! before that loop: on shutdown, and for a status query, the mainloop
+//! awaits *this* — so the publish runs on a task of its own and posts
+//! its outcome back here.
 
 use std::{fmt, pin::Pin, time::Duration};
 
@@ -36,7 +37,7 @@ use wire::{
 };
 
 use crate::{
-    AdvertiseError, Advertised, CannotSignAlone, ChangeFilter, Responder, SubscriptionHandle,
+    AdvertiseError, Advertised, CannotSignAlone, ChangeFilter, Core, Responder, SubscriptionHandle,
     server::WeakServerHandle,
 };
 
@@ -126,18 +127,26 @@ where
 
     /// Starts the actor on its own task, returning the handle the server
     /// drives it by.
-    pub(crate) fn spawn(self) -> AddrPublishHandle {
+    ///
+    /// Registers the subscription here, off the core the caller still
+    /// holds, rather than asking the mainloop for it once running: an
+    /// actor that awaits the mainloop before it serves its own channel
+    /// deadlocks against a mainloop that reaches for it first. It also
+    /// puts the subscription in place before the mainloop takes its first
+    /// message, so nothing can move underneath it.
+    pub(crate) fn spawn(self, core: &Core) -> AddrPublishHandle {
+        let ledger = core.subscribe(Self::filter(self.node));
         let (tx, rx) = mpsc::channel(8);
-        let join = tokio::spawn(self.run(tx.clone(), rx));
+        let join = tokio::spawn(self.run(tx.clone(), rx, ledger));
         AddrPublishHandle { tx, join }
     }
 
-    async fn run(mut self, tx: mpsc::Sender<PublishMsg>, mut cmd: mpsc::Receiver<PublishMsg>) {
-        // Subscribed before the first publish, so nothing can move between
-        // the compare and the subscription taking effect.
-        let Some(mut ledger) = Self::subscribe(&self.server, self.node).await else {
-            return;
-        };
+    async fn run(
+        mut self,
+        tx: mpsc::Sender<PublishMsg>,
+        mut cmd: mpsc::Receiver<PublishMsg>,
+        mut ledger: SubscriptionHandle,
+    ) {
         let mut state = PublishState::Unchecked;
         let mut publish = Publish::default();
         let mut timer = Settle::default();
@@ -186,18 +195,14 @@ where
         }
     }
 
-    /// Registers for changes to this node's own listing and to the trusted
-    /// key set, or `None` when the server is already gone.
-    async fn subscribe(server: &WeakServerHandle, node: KeyId) -> Option<SubscriptionHandle> {
-        let server = server.upgrade()?;
+    /// The changes that wake the actor: this node's own listing, and the
+    /// trusted key set that says whether it can write one.
+    fn filter(node: KeyId) -> ChangeFilter {
         let nodes = NamespaceKey::try_new(CLUSTER_NODES_KEY).expect("the reserved key is static");
         let keys = NamespaceKey::try_new(TRUSTED_KEYS_KEY).expect("the reserved key is static");
         let own = SubkeyPath::try_new(vec![Subkey::Key(node.to_hex().as_ref().to_owned())])
             .expect("one segment is not empty");
-        server
-            .subscribe(ChangeFilter::path(nodes, own).and_namespace(keys))
-            .await
-            .ok()
+        ChangeFilter::path(nodes, own).and_namespace(keys)
     }
 
     /// What a publish outcome leaves the state at, logged as it deserves.

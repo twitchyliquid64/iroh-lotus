@@ -282,16 +282,19 @@ impl Server {
             }
             .spawn()
         });
+        // Both are handed the core to register their subscriptions
+        // against: neither may await the mainloop before it is serving
+        // its own channel, since the mainloop awaits them in turn.
         let egress = endpoint
             .clone()
-            .map(|ep| PeerEgress::new(ep, weak.clone(), core.key_id()).spawn());
+            .map(|ep| PeerEgress::new(ep, weak.clone(), core.key_id()).spawn(&core));
         let publisher = endpoint.as_ref().map(|ep| {
             let publisher = AddrPublish::new(ep.watch_addr(), weak.clone(), core.key_id());
             match advertise_settle {
                 Some(settle) => publisher.with_settle(settle),
                 None => publisher,
             }
-            .spawn()
+            .spawn(&core)
         });
 
         let join_hnd = tokio::spawn(async move {

@@ -4,7 +4,8 @@
 
 use std::time::Duration;
 
-use lotusd::{Core, IfInitialized, Server, ServerHandle};
+use iroh::{Endpoint, RelayMode, endpoint::presets};
+use lotusd::{Core, IfInitialized, Server, ServerHandle, peer_ingress::Protocol};
 use tempfile::TempDir;
 use tokio::{net::UnixListener, task::JoinHandle, time::timeout};
 use wire::EnvelopeDigest;
@@ -25,6 +26,64 @@ async fn serve(dir: &TempDir) -> (EnvelopeDigest, ServerHandle, JoinHandle<()>) 
     let (handle, join) = Server::new(core, listener).unwrap().run().await;
 
     (head, handle, join)
+}
+
+/// Starts a server serving peers on its own endpoint, so the mainloop has
+/// the child actors under it that a bare one has not.
+async fn serve_with_peers(dir: &TempDir) -> (ServerHandle, JoinHandle<()>) {
+    let core = Core::create_in_state_dir(dir.path().to_path_buf(), IfInitialized::Fail)
+        .await
+        .unwrap();
+    let listener = UnixListener::bind(dir.path().join("s.sock")).unwrap();
+    let endpoint = Endpoint::builder(presets::Minimal)
+        .relay_mode(RelayMode::Disabled)
+        .alpns(Protocol::alpns())
+        .bind()
+        .await
+        .unwrap();
+    Server::new(core, listener)
+        .unwrap()
+        .with_endpoint(endpoint)
+        .run()
+        .await
+}
+
+/// The first thing asked of a just-started server is answered — the
+/// child actors have not been polled yet, so an actor that had to ask
+/// the mainloop for anything before serving its own channel would wedge
+/// the pair: the mainloop waiting on the actor, the actor on the mainloop.
+#[tokio::test]
+async fn the_first_query_after_start_is_answered_before_the_actors_run() {
+    let dir = TempDir::new().unwrap();
+    let (handle, _join) = serve_with_peers(&dir).await;
+
+    let peers = timeout(GRACE, handle.peers())
+        .await
+        .expect("peers deadlocked against the actors starting")
+        .unwrap();
+    assert!(peers.is_empty());
+    timeout(GRACE, handle.peer_connections())
+        .await
+        .expect("peer connections deadlocked against the actors starting")
+        .unwrap();
+    timeout(GRACE, handle.published())
+        .await
+        .expect("published deadlocked against the actors starting")
+        .unwrap();
+}
+
+/// Same race, on the way out: a shutdown that lands before the actors
+/// have run must still bring them down.
+#[tokio::test]
+async fn shutdown_before_the_actors_run_still_completes() {
+    let dir = TempDir::new().unwrap();
+    let (handle, join) = serve_with_peers(&dir).await;
+
+    timeout(GRACE, handle.shutdown())
+        .await
+        .expect("shutdown deadlocked against the actors starting")
+        .unwrap();
+    timeout(GRACE, join).await.unwrap().unwrap();
 }
 
 #[tokio::test]
