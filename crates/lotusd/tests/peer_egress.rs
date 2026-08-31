@@ -184,6 +184,21 @@ impl Node {
         .unwrap_or_else(|_| panic!("timed out waiting for head {}", head.to_hex().as_ref()));
     }
 
+    /// Waits until this node is serving at least `n` inbound connections.
+    ///
+    /// For a node its own peers dial too: once the list naming them is
+    /// gossiped they connect to each other, so an exact count is a
+    /// moving target.
+    async fn wait_for_at_least_connections(&self, n: usize) {
+        timeout(GRACE, async {
+            while self.handle.peer_connections().await.unwrap() < n {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("expected at least {n} inbound connections"));
+    }
+
     /// Waits until this node is serving `n` inbound connections.
     async fn wait_for_connections(&self, n: usize) {
         timeout(GRACE, async {
@@ -323,12 +338,20 @@ async fn a_node_added_later_is_dialled_alongside() {
     a.list([(node_id(1), b.addr()), (node_id(2), c.addr())])
         .await;
 
-    a.wait_for_peers("a connected to both", |peers| {
-        connected_to(peers, node_id(1), &b.endpoint) && connected_to(peers, node_id(2), &c.endpoint)
+    a.wait_for_peers("a connected to c", |peers| {
+        connected_to(peers, node_id(2), &c.endpoint)
     })
     .await;
-    assert_eq!(b.handle.peer_connections().await.unwrap(), 1);
-    c.wait_for_connections(1).await;
+    // Read straight after c connects, so a redial of b — a second of
+    // backoff at least — would still be pending and show as anything but
+    // connected. Counting inbound connections at b would not say: b and c
+    // dial each other as soon as they pull the list a has just written,
+    // so b's count is on its way to two whatever a does.
+    assert!(
+        connected_to(&a.handle.peers().await.unwrap(), node_id(1), &b.endpoint),
+        "a dropped the connection it had to b when c was added"
+    );
+    c.wait_for_at_least_connections(1).await;
 }
 
 #[tokio::test]
