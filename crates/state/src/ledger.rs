@@ -116,6 +116,25 @@ impl Ledger {
             .ok_or(Error::UnknownHead(head))
     }
 
+    /// Opens a ledger at `envelope`'s digest, installing `state` into storage. This
+    /// bootstraps operation from this head & state without the rest of the chain.
+    pub fn adopt<S: Storage>(
+        storage: &mut S,
+        envelope: &Envelope,
+        state: &FullCheckpoint,
+    ) -> Result<Self, Error<S::Error>> {
+        state
+            .namespaces
+            .iter()
+            .try_for_each(|(key, namespace)| Self::validate_value(key, &namespace.value))?;
+
+        let head = envelope.digest()?;
+        storage
+            .install(head, state.namespaces.clone())
+            .map_err(Error::Storage)?;
+        Ok(Self { head })
+    }
+
     /// Replays a whole chain into `storage`, `Init` envelope first.
     pub fn replay<'a, S: Storage>(
         storage: &mut S,

@@ -77,9 +77,7 @@ pub enum PullOutcome {
     /// duplicates included.
     Synced { head: EnvelopeDigest, ingested: u64 },
     /// The chains share nothing: a foreign cluster's peer, or one of our
-    /// own past the compaction horizon — indistinguishable in-band, and
-    /// only checkpoint sync (unbuilt) with out-of-band trust could go
-    /// further.
+    /// own past the compaction horizon. Its not possible to reconcile.
     NoCommonHistory,
 }
 

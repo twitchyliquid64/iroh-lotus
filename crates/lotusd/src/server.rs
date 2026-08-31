@@ -4,6 +4,7 @@
 use core::fmt;
 use std::{
     collections::BTreeMap,
+    num::NonZeroU32,
     ops::ControlFlow,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -26,8 +27,8 @@ use wire::{
 };
 
 use crate::{
-    AdmitError, AdvertiseError, Advertised, ChainError, ChangeFilter, ChangeSelector, Core,
-    InitError, Responder, SubscriptionHandle, VERSION,
+    AdmitError, AdvertiseError, Advertised, ChainError, ChangeFilter, ChangeSelector, CompactError,
+    Compacted, Core, InitError, Responder, SubscriptionHandle, VERSION,
     addr_publish::{AddrPublish, AddrPublishHandle, PublishState},
     bootstrap::{InviteError, Invites, Welcomed},
     invite::{self, Invite, Token},
@@ -38,6 +39,18 @@ use crate::{
 /// The longest an invite may be good for. A token is a bearer secret:
 /// one that outlives the operator's attention is one they forgot.
 pub const MAX_INVITE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How many of the newest envelopes compaction keeps regardless of age,
+/// until [`Server::with_keep_envelopes`] says otherwise.
+pub const DEFAULT_KEEP_ENVELOPES: NonZeroU32 = NonZeroU32::new(32).unwrap();
+
+/// How often the mainloop looks for envelopes to prune.
+const COMPACT_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// The fewest prunable envelopes the periodic pass acts on: the sweep is
+/// not worth paying for less. A [`ServerHandle::compact`] prunes eagerly
+/// instead.
+const COMPACT_MIN_PRUNE: u64 = 64;
 
 /// A freshly issued invite and the window the sponsor will honour it for.
 /// `ttl` is the granted window, capped at [`MAX_INVITE_TTL`], not a clock
@@ -71,6 +84,7 @@ enum ServerMsg {
     Identity(Responder<Identity, ()>),
     Read(rpc::Read, Responder<rpc::ValueAt, ChainError>),
     WeakWrite(WeakWrite, Responder<rpc::Written, ChainError>),
+    Compact(Responder<Compacted, CompactError>),
     CreateInvite(u32, Duration, Responder<Issued, InviteError>),
     RedeemInvite(Token, Responder<Welcomed, InviteError>),
     Admit(
@@ -218,6 +232,7 @@ pub struct Server {
     endpoint: Option<Endpoint>,
     peer_connection_limit: Option<usize>,
     advertise_settle: Option<Duration>,
+    keep_envelopes: NonZeroU32,
 }
 
 impl Server {
@@ -228,6 +243,7 @@ impl Server {
             endpoint: None,
             peer_connection_limit: None,
             advertise_settle: None,
+            keep_envelopes: DEFAULT_KEEP_ENVELOPES,
         })
     }
 
@@ -256,6 +272,15 @@ impl Server {
         self
     }
 
+    /// How many of the newest envelopes compaction keeps regardless of
+    /// age, overriding [`DEFAULT_KEEP_ENVELOPES`]. The ledger's
+    /// min-keep-minutes floor binds either way; this knob only ever keeps
+    /// more.
+    pub fn with_keep_envelopes(mut self, keep: NonZeroU32) -> Self {
+        self.keep_envelopes = keep;
+        self
+    }
+
     /// Consumes the initialized server and starts an async task for its mainloop, returning
     /// a handle that can be used to query and control the server.
     ///
@@ -269,6 +294,7 @@ impl Server {
             endpoint,
             peer_connection_limit,
             advertise_settle,
+            keep_envelopes,
         } = self;
         let (hnd_tx, mut hnd_recv) = mpsc::channel(8);
         let handle = ServerHandle(hnd_tx);
@@ -305,6 +331,8 @@ impl Server {
                 endpoint,
             };
             let mut invites = Invites::default();
+            let mut compact = tokio::time::interval(COMPACT_INTERVAL);
+            compact.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
                     // Control messages win over new connections, so a shutdown is not held
@@ -316,7 +344,7 @@ impl Server {
                         let Some(msg) = msg else {
                             return peers.close().await;
                         };
-                        if let ControlFlow::Break(r) = Self::handle_message(&mut core, &peers, &mut invites, msg).await {
+                        if let ControlFlow::Break(r) = Self::handle_message(&mut core, &peers, &mut invites, keep_envelopes, msg).await {
                             // Shutdown, r is to respond when we are done shutting down.
                             peers.close().await;
                             r.respond(Ok(()));
@@ -334,6 +362,23 @@ impl Server {
                         },
                         Err(e) => tracing::warn!(error = %e, "accepting local connection"),
                     },
+                    // Lazy on purpose: the pass runs only when enough is
+                    // prunable to be worth a sweep. `lotusctl compact`
+                    // prunes eagerly.
+                    _ = compact.tick() => {
+                        let pinned = invites.pinned_roots(Instant::now());
+                        match core.compact(keep_envelopes, COMPACT_MIN_PRUNE, &pinned).await {
+                            Ok(compacted) if compacted.pruned > 0 => {
+                                tracing::info!(
+                                    pruned = compacted.pruned,
+                                    oldest = %compacted.to.to_hex().as_ref(),
+                                    "compacted the envelope log",
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!(error = %e, "compaction failed"),
+                        }
+                    }
                 }
             }
         });
@@ -350,6 +395,7 @@ impl Server {
         core: &mut Core,
         peers: &Peers,
         invites: &mut Invites,
+        keep_envelopes: NonZeroU32,
         msg: ServerMsg,
     ) -> ControlFlow<Responder<(), ()>> {
         match msg {
@@ -390,6 +436,11 @@ impl Server {
                         outcome: outcome(insert),
                     }),
             ),
+            ServerMsg::Compact(r) => {
+                // Eager: however little is past the policy goes.
+                let pinned = invites.pinned_roots(Instant::now());
+                r.respond(core.compact(keep_envelopes, 1, &pinned).await);
+            }
             ServerMsg::CreateInvite(weight, ttl, r) => {
                 r.respond(Self::create_invite(core, peers, invites, weight, ttl));
             }
@@ -398,12 +449,13 @@ impl Server {
                     .redeem(&token, Instant::now())
                     .map_err(InviteError::Redeem)
                     .and_then(|redeemed| {
-                        core.root_envelope()
-                            .map(|root| Welcomed {
+                        core.welcome_root()
+                            .map(|(root, state)| Welcomed {
                                 root,
+                                state,
                                 weight: redeemed.weight,
                             })
-                            .map_err(|e| InviteError::Chain(ChainError::Storage(e)))
+                            .map_err(InviteError::Chain)
                     }),
             ),
             // On the mainloop like any write: signed onto the head the core
@@ -439,7 +491,7 @@ impl Server {
 
         let ttl = ttl.min(MAX_INVITE_TTL);
         let token = Token::from_bytes(crate::core::draw_token().map_err(InviteError::Entropy)?);
-        invites.issue(token, weight, ttl, Instant::now());
+        invites.issue(token, weight, ttl, Instant::now(), core.root());
 
         let expires_at = SystemTime::now()
             .checked_add(ttl)
@@ -611,6 +663,20 @@ impl rpc::Handler for Rpc {
             rpc::Request::WeakDelete(delete) => self.write(delete, responses).await,
             rpc::Request::WeakIncrement(increment) => self.write(increment, responses).await,
             rpc::Request::WeakDeleteMatching(delete) => self.write(delete, responses).await,
+            rpc::Request::Compact(_) => {
+                let compacted = self
+                    .0
+                    .compact()
+                    .await
+                    .map_err(|err| rpc::Failure::internal(err.to_string()))?;
+                responses
+                    .send(rpc::Response::Compacted(rpc::Compacted {
+                        from: compacted.from,
+                        to: compacted.to,
+                        pruned: compacted.pruned,
+                    }))
+                    .await
+            }
             rpc::Request::CreateInvite(create) => {
                 let Issued { invite, ttl } = self
                     .0
@@ -1020,6 +1086,16 @@ impl ServerHandle {
         let (send, recv) = Responder::channel();
         let _ = self.0.send(ServerMsg::WeakWrite(write.into(), send)).await;
         Self::answer(recv.await)
+    }
+
+    /// Prunes the envelope log past the daemon's retention policy,
+    /// eagerly: however little is eligible goes. What the policy keeps —
+    /// the newest envelopes, the ledger's min-keep floor, the roots
+    /// pending invites pinned — stays either way.
+    pub async fn compact(&self) -> Result<Compacted, CompactError> {
+        let (send, recv) = Responder::channel();
+        let _ = self.0.send(ServerMsg::Compact(send)).await;
+        recv.await.map_err(|_| CompactError::ServerGone)?
     }
 
     /// Issues an invite admitting one node at `weight`, honoured for `ttl`

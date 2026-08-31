@@ -2,7 +2,12 @@
 //! iroh endpoints on an in-memory network: the invite issued on a running
 //! node, the pull, the admission, and the node serving afterwards.
 
-use std::{collections::BTreeMap, path::PathBuf, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    num::NonZeroU32,
+    path::PathBuf,
+    time::Duration,
+};
 
 use iroh::{Endpoint, RelayMode, endpoint::presets, test_utils::test_transport::TestNetwork};
 use lotusd::{
@@ -13,6 +18,7 @@ use lotusd::{
 };
 use lotusd_rpc::WeakSet;
 use state::MIN_ENVELOPE_WEIGHT_KEY;
+use storage::StoredAt;
 use tempfile::TempDir;
 use tokio::{net::UnixListener, task::JoinHandle, time::timeout};
 use wire::{
@@ -169,6 +175,55 @@ impl Blank {
         .await
         .expect("the join did not finish")
     }
+}
+
+/// A sponsor that compacted its `Init` away still takes a joiner: the
+/// invite pins the cut, and the welcome carries the checkpoint the pruned
+/// history folded down to.
+#[tokio::test]
+async fn a_blank_node_joins_a_compacted_sponsor() {
+    let network = TestNetwork::new();
+    let dir = TempDir::new().unwrap();
+    let mut core = Core::create_in_state_dir(dir.path().to_path_buf(), IfInitialized::Fail)
+        .await
+        .unwrap();
+    for label in ["one", "two", "three", "four"] {
+        core.sign_write(|prev| {
+            Msg::SetNamespace(SetNamespace {
+                prev,
+                key: NamespaceKey::try_new(label).unwrap(),
+                namespace: Namespace {
+                    value: Value::String("v".to_owned()),
+                },
+            })
+        })
+        .unwrap();
+    }
+    // Compact the `Init` away: only the two newest envelopes stay. The
+    // cutoff is far future so the test needn't wait out the real floor.
+    let compacted = core
+        .compact_before(
+            StoredAt::from_timestamp_millis(4_102_444_800_000),
+            NonZeroU32::new(2).unwrap(),
+            1,
+            &BTreeSet::new(),
+        )
+        .await
+        .unwrap();
+    assert!(compacted.pruned > 0, "the fixture must actually compact");
+    let endpoint = endpoint(&network, core.iroh_secret().clone()).await;
+    let a = Node::start(dir, core, Some(endpoint)).await;
+
+    let invite = a.invite(3).await;
+    assert_eq!(invite.root, a.handle.root().await.unwrap());
+
+    let b = Blank::new(&network).await;
+    let joined = b.join(&invite).await.unwrap();
+
+    assert_eq!(joined.core.root(), invite.root);
+    assert_eq!(joined.core.head(), a.handle.head().await.unwrap());
+    let trusted = joined.core.trusted_keys().unwrap();
+    assert_eq!(trusted[&b.keys.key_id()].weight(), 3);
 }
 
 #[tokio::test]

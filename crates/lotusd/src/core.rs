@@ -3,14 +3,17 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     fmt,
+    num::NonZeroU32,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use ed25519_zebra::SigningKey;
 use iroh::SecretKey;
 use rand::{TryRng, rngs::SysRng};
 use state::{
-    CLUSTER_NODES_KEY, Chain, ChangeDiffer, Insert, MIN_ENVELOPE_SIGNATURES_KEY, TRUSTED_KEYS_KEY,
+    CLUSTER_NODES_KEY, Chain, ChangeDiffer, Insert, Ledger, MIN_ENVELOPE_SIGNATURES_KEY,
+    TRUSTED_KEYS_KEY,
 };
 use storage::{LogEntry, SqliteStorage, Storage, StoredAt};
 use tokio::{fs, io::AsyncWriteExt};
@@ -161,7 +164,7 @@ impl Core {
 
         // Written only once the genesis is durable, so the file never names an
         // envelope the store is missing.
-        fs::write(state_dir.join(OLDEST_ENVELOPE_FILENAME), oldest.as_bytes())
+        write_oldest(&state_dir, oldest)
             .await
             .map_err(|e| InitError::IO(e, "writing oldest-envelope"))?;
 
@@ -191,24 +194,28 @@ impl Core {
         NodeKeys::generate(&state_dir).await
     }
 
-    /// Opens a cluster in `state_dir` from `root`, the oldest envelope a
-    /// peer holds, and returns it standing there — the second half of a
-    /// join, for the keys [`Core::prepare_join`] left behind. Everything
-    /// after the root is pulled from the peer like any other sync.
-    ///
-    /// The root is taken on trust: whoever handed it over vouched for it,
-    /// and its digest is what they vouched by. Checking that the digest is
-    /// the one expected is the caller's job.
-    pub async fn join_in_state_dir(state_dir: PathBuf, root: Envelope) -> Result<Self, InitError> {
+    /// Initializes this nodes' state in `state_dir`, using the given root
+    /// envelope and state (which were obtained during bootstrap). This is
+    /// the second phase of `Core` initialization based on a bootstrap, and it
+    /// follows [`Core::prepare_join`].
+    pub async fn join_in_state_dir(
+        state_dir: PathBuf,
+        root: Envelope,
+        state: Option<FullCheckpoint>,
+    ) -> Result<Self, InitError> {
         let keys = NodeKeys::load(&state_dir).await?;
         let mut storage =
             SqliteStorage::open(state_dir.join(SQLITE_DB_FILENAME)).map_err(InitError::Storage)?;
-        let chain = Chain::init(&mut storage, root).map_err(InitError::Chain)?;
+        let chain = match state {
+            None => Chain::init(&mut storage, root),
+            Some(state) => Chain::adopt(&mut storage, root, &state),
+        }
+        .map_err(InitError::Chain)?;
         let oldest = chain.root();
 
         // Written only once the root is durable, so the file never names an
         // envelope the store is missing.
-        fs::write(state_dir.join(OLDEST_ENVELOPE_FILENAME), oldest.as_bytes())
+        write_oldest(&state_dir, oldest)
             .await
             .map_err(|e| InitError::IO(e, "writing oldest-envelope"))?;
 
@@ -350,6 +357,93 @@ impl Core {
         self.oldest
     }
 
+    /// Prunes envelopes past this node's retention policy, moving the
+    /// oldest envelope forward. What stays: the newest `keep_envelopes`
+    /// on the canonical path, everything held for less than the chain's
+    /// [`MIN_KEEP_MINUTES_KEY`] floor (by this node's own clock — how
+    /// long *it* held an envelope is what the floor promises), and
+    /// everything back to any digest in `pinned` — the roots outstanding
+    /// invites promise a joiner. Prunes only when at least `min_prune`
+    /// envelopes would go, so a periodic pass doesn't pay the sweep for
+    /// one stale envelope.
+    ///
+    /// [`MIN_KEEP_MINUTES_KEY`]: state::MIN_KEEP_MINUTES_KEY
+    pub async fn compact(
+        &mut self,
+        keep_envelopes: NonZeroU32,
+        min_prune: u64,
+        pinned: &BTreeSet<EnvelopeDigest>,
+    ) -> Result<Compacted, CompactError> {
+        let minutes = self
+            .chain
+            .min_keep_minutes(&self.storage)
+            .map_err(|e| CompactError::Chain(ChainError::Storage(e)))?;
+        let cutoff = StoredAt::ago(Duration::from_secs(u64::from(minutes) * 60));
+        self.compact_before(cutoff, keep_envelopes, min_prune, pinned)
+            .await
+    }
+
+    /// The clock-free half of [`compact`](Self::compact), the floor
+    /// already resolved to a cutoff: envelopes stored at or after it are
+    /// kept, and `None` keeps everything. `compact` is the production
+    /// caller; exposed so a test can compact without waiting out the
+    /// floor.
+    pub async fn compact_before(
+        &mut self,
+        cutoff: Option<StoredAt>,
+        keep_envelopes: NonZeroU32,
+        min_prune: u64,
+        pinned: &BTreeSet<EnvelopeDigest>,
+    ) -> Result<Compacted, CompactError> {
+        let from = self.oldest;
+
+        // The canonical path newest-first — digest and arrival time — as
+        // far down as the log reaches, which an interrupted prune can
+        // have left below the root.
+        let mut path = Vec::new();
+        let mut next = Some(self.chain.head());
+        while let Some(digest) = next {
+            let Some(entry) = self
+                .storage
+                .logged_envelope(digest)
+                .map_err(|e| CompactError::Chain(ChainError::Storage(e)))?
+            else {
+                break;
+            };
+            next = entry.envelope.payload().prev_digest().copied();
+            path.push((digest, entry.stored_at));
+        }
+
+        let unchanged = Compacted {
+            from,
+            to: from,
+            pruned: 0,
+        };
+        let Some((cut, eligible)) = choose_cut(&path, keep_envelopes, cutoff, pinned) else {
+            return Ok(unchanged);
+        };
+        if eligible < min_prune {
+            return Ok(unchanged);
+        }
+
+        // The new root is durable before anything is pruned: reopened
+        // mid-prune, the chain must never stand on a pruned envelope.
+        write_oldest(&self.state_dir, cut)
+            .await
+            .map_err(CompactError::IO)?;
+        self.oldest = cut;
+
+        let pruned = self
+            .chain
+            .compact(&mut self.storage, cut)
+            .map_err(CompactError::Chain)?;
+        Ok(Compacted {
+            from,
+            to: cut,
+            pruned,
+        })
+    }
+
     /// The canonical chain, oldest envelope first, of at most `limit`
     /// envelopes counted back from the head and no further back than
     /// `since`.
@@ -445,6 +539,23 @@ impl Core {
             .storage
             .envelope(self.oldest)?
             .expect("the oldest-envelope file names an envelope the store holds"))
+    }
+
+    /// What a joining node is handed to build on: the root envelope and —
+    /// when compaction has moved the root past the `Init` — the
+    /// checkpoint of the state standing at it, both under one borrow so
+    /// they cannot straddle a compaction.
+    pub fn welcome_root(&self) -> Result<(Envelope, Option<FullCheckpoint>), ChainError> {
+        let root = self.root_envelope().map_err(ChainError::Storage)?;
+        let state = match root.payload() {
+            Msg::Init(_) => None,
+            _ => Some(
+                Ledger::open(&self.storage, self.oldest)?
+                    .checkpoint(&self.storage)
+                    .map_err(ChainError::Storage)?,
+            ),
+        };
+        Ok((root, state))
     }
 
     /// The keys the ledger trusts at the current head.
@@ -1043,6 +1154,77 @@ async fn create_state_dir(state_dir: &Path) -> Result<(), InitError> {
     Ok(())
 }
 
+/// What a compaction pass did to the envelope log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Compacted {
+    /// Where the oldest envelope stood before.
+    pub from: EnvelopeDigest,
+    /// Where it stands now — `from`, when nothing moved it.
+    pub to: EnvelopeDigest,
+    /// How many envelopes were pruned — removed from the log.
+    pub pruned: u64,
+}
+
+/// Why a compaction pass failed.
+#[derive(Debug, thiserror::Error)]
+pub enum CompactError {
+    #[error("pruning the chain")]
+    Chain(#[source] ChainError),
+    /// Recording the new root failed; nothing was pruned.
+    #[error("recording the new oldest envelope")]
+    IO(#[source] std::io::Error),
+    /// The server is not running, or is on its way down.
+    #[error("the server is shutting down")]
+    ServerGone,
+}
+
+/// Where compaction cuts the canonical path — the oldest envelope kept —
+/// and how many envelopes fall past it; `None` when none do. `path` is
+/// the canonical walk newest-first, each entry with when this node first
+/// stored it.
+///
+/// An envelope is kept while any clause holds: it is among the newest
+/// `keep_envelopes`; it was stored at or after `cutoff` (`None` keeps
+/// everything); or a digest in `pinned` has not been walked past yet — one
+/// that never turns up keeps the whole path, until the invite pinning it
+/// expires. Arrival is parent-first, so along the path the times only
+/// fall: past the first envelope failing every clause, the rest fail too.
+fn choose_cut(
+    path: &[(EnvelopeDigest, StoredAt)],
+    keep_envelopes: NonZeroU32,
+    cutoff: Option<StoredAt>,
+    pinned: &BTreeSet<EnvelopeDigest>,
+) -> Option<(EnvelopeDigest, u64)> {
+    let cutoff = cutoff?;
+    let keep = keep_envelopes.get() as usize;
+    let mut unseen = pinned.clone();
+    for (index, &(digest, stored_at)) in path.iter().enumerate() {
+        let pins = unseen.remove(&digest);
+        if pins || !unseen.is_empty() || index < keep || stored_at >= cutoff {
+            continue;
+        }
+        // `index >= 1`: the head is always kept, `keep_envelopes` being
+        // at least one.
+        let (cut, _) = path[index - 1];
+        return Some((cut, (path.len() - index) as u64));
+    }
+    None
+}
+
+/// Durably records `oldest` as the digest the chain reopens from: staged
+/// beside the final name and renamed over it, so a crash leaves the old
+/// reading or the new, never a truncated one.
+async fn write_oldest(state_dir: &Path, oldest: EnvelopeDigest) -> Result<(), std::io::Error> {
+    let staged = state_dir.join(format!("{OLDEST_ENVELOPE_FILENAME}.next"));
+    let mut file = fs::File::create(&staged).await?;
+    file.write_all(oldest.as_bytes()).await?;
+    // `write_all` only queues the bytes; `sync_all` waits, so the rename
+    // cannot land ahead of the content it names.
+    file.sync_all().await?;
+    drop(file);
+    fs::rename(&staged, state_dir.join(OLDEST_ENVELOPE_FILENAME)).await
+}
+
 /// Writes key material to `path`, reporting the two ways that fails under
 /// the labels given.
 async fn write_secret(
@@ -1141,5 +1323,75 @@ impl core::error::Error for InitError {
             | InitError::IrohSecretLength(..)
             | InitError::OldestDigestLength(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn digest(byte: u8) -> EnvelopeDigest {
+        EnvelopeDigest::from_bytes([byte; 32])
+    }
+
+    fn at(millis: i64) -> StoredAt {
+        StoredAt::from_timestamp_millis(millis).unwrap()
+    }
+
+    const KEEP_TWO: NonZeroU32 = NonZeroU32::new(2).unwrap();
+
+    /// A canonical path newest-first: digests 9, 8, …, stored one
+    /// millisecond apart, the newest at `newest` millis.
+    fn path(len: u8, newest: i64) -> Vec<(EnvelopeDigest, StoredAt)> {
+        (0..len)
+            .map(|n| (digest(9 - n), at(newest - i64::from(n))))
+            .collect()
+    }
+
+    #[test]
+    fn the_newest_envelopes_are_kept_by_count() {
+        // Everything is old; only the count clause holds anything.
+        let cut = choose_cut(&path(5, 1_000), KEEP_TWO, Some(at(2_000)), &BTreeSet::new());
+        assert_eq!(cut, Some((digest(8), 3)));
+    }
+
+    #[test]
+    fn young_envelopes_are_kept_past_the_count() {
+        // The three newest are at or after the cutoff, so the time clause
+        // outholds the count clause.
+        let cut = choose_cut(&path(5, 1_000), KEEP_TWO, Some(at(998)), &BTreeSet::new());
+        assert_eq!(cut, Some((digest(7), 2)));
+    }
+
+    #[test]
+    fn a_pinned_digest_holds_the_walk_open() {
+        let pinned = BTreeSet::from([digest(6)]);
+        let cut = choose_cut(&path(5, 1_000), KEEP_TWO, Some(at(2_000)), &pinned);
+        assert_eq!(cut, Some((digest(6), 1)), "the pin itself is kept");
+    }
+
+    #[test]
+    fn a_pin_that_never_turns_up_keeps_everything() {
+        let pinned = BTreeSet::from([digest(0xEE)]);
+        assert_eq!(
+            choose_cut(&path(5, 1_000), KEEP_TWO, Some(at(2_000)), &pinned),
+            None
+        );
+    }
+
+    #[test]
+    fn no_cutoff_keeps_everything() {
+        assert_eq!(
+            choose_cut(&path(5, 1_000), KEEP_TWO, None, &BTreeSet::new()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_path_within_the_count_has_no_cut() {
+        assert_eq!(
+            choose_cut(&path(2, 1_000), KEEP_TWO, Some(at(2_000)), &BTreeSet::new()),
+            None
+        );
     }
 }

@@ -4,11 +4,11 @@
 use std::collections::BTreeMap;
 
 use lotusd_rpc::{
-    Call, ChainRange, ChainWalk, Changed, EnvelopeFrame, EnvelopeSelector, Error, Failure,
-    FailureKind, GetChainRange, GetEnvelopes, GetVersion, Handler, InviteCode, MAX_FRAME_LEN,
-    NamespaceChange, NodeStatus, Read, Reorged, Request, Response, Responses, ValueAt,
-    Verification, Watch, WatchEvent, WatchPath, WatchSelector, WeakDelete, WeakDeleteMatching,
-    WeakIncrement, WeakPush, WeakSet, WriteOutcome, Written, call, serve,
+    Call, ChainRange, ChainWalk, Changed, Compact, Compacted, EnvelopeFrame, EnvelopeSelector,
+    Error, Failure, FailureKind, GetChainRange, GetEnvelopes, GetVersion, Handler, InviteCode,
+    MAX_FRAME_LEN, NamespaceChange, NodeStatus, Read, Reorged, Request, Response, Responses,
+    ValueAt, Verification, Watch, WatchEvent, WatchPath, WatchSelector, WeakDelete,
+    WeakDeleteMatching, WeakIncrement, WeakPush, WeakSet, WriteOutcome, Written, call, serve,
 };
 use std::time::Duration;
 
@@ -246,6 +246,15 @@ impl Handler for Fake {
                     }))
                     .await
             }
+            Request::Compact(_) => {
+                responses
+                    .send(Response::Compacted(Compacted {
+                        from: range().root,
+                        to: range().head,
+                        pruned: 5,
+                    }))
+                    .await
+            }
         }
     }
 }
@@ -257,6 +266,19 @@ fn connect(mut handler: Fake) -> DuplexStream {
         serve(&mut server, &mut handler).await.unwrap();
     });
     client
+}
+
+#[tokio::test]
+async fn compact_answers_with_the_move() {
+    let compacted = call(connect(Fake::new()), Compact {}).await.unwrap();
+    assert_eq!(
+        compacted,
+        Compacted {
+            from: range().root,
+            to: range().head,
+            pruned: 5,
+        }
+    );
 }
 
 #[tokio::test]

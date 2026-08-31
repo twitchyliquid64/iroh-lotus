@@ -40,7 +40,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     time::timeout,
 };
-use wire::{Envelope, EnvelopeDigest, Key, KeyId, PublicKey};
+use wire::{Envelope, EnvelopeDigest, Key, KeyId, PublicKey, msg::FullCheckpoint};
 
 use crate::{
     AdmitError, CannotSignAlone, ChainError, Core, InitError, NodeKeys, ServerHandle,
@@ -53,7 +53,10 @@ use crate::{
 pub const ALPN: &[u8] = b"iroh-lotus/bootstrap/1";
 
 /// The protocol version spoken by this build. Exact match required.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// 2 taught [`Welcome`] to carry the checkpoint a compacted root stands
+/// for.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// How long either side waits on the other for one step of the control
 /// stream before giving up on the join.
@@ -77,6 +80,14 @@ pub struct Join {
 pub struct Welcome {
     #[cbor(key = 1)]
     pub root: Envelope,
+    /// The checkpoint of the state standing at `root`, when compaction
+    /// has moved the sponsor's root past the `Init` — an `Init` carries
+    /// its own state and sends none.
+    ///
+    /// The invite pins `root`'s digest, which attests the envelope alone:
+    /// the checkpoint rides on the sponsor's vouch, like the root itself.
+    #[cbor(key = 2)]
+    pub state: Option<FullCheckpoint>,
 }
 
 /// The sponsor's answer when the join cannot go on. Ends the session.
@@ -100,7 +111,9 @@ pub struct Admitted {
 #[serde(rename_all = "snake_case")]
 pub enum Message {
     Join(Join),
-    Welcome(Welcome),
+    // Boxed for size alone: a Welcome carries an envelope and possibly a
+    // checkpoint, dwarfing its siblings. Box is transparent on the wire.
+    Welcome(Box<Welcome>),
     Refused(Refused),
     Admitted(Admitted),
 }
@@ -213,6 +226,9 @@ struct Pending {
     token: Token,
     weight: u32,
     expires: Instant,
+    /// The root the invite promised the joiner — compaction must not
+    /// prune it while the invite can still be redeemed.
+    root: EnvelopeDigest,
 }
 
 /// What redeeming a token entitles the joiner to.
@@ -224,13 +240,21 @@ pub(crate) struct Redeemed {
 
 impl Invites {
     /// Records a fresh invite, good for `ttl` from `now`, admitting one
-    /// node at `weight`.
-    pub(crate) fn issue(&mut self, token: Token, weight: u32, ttl: Duration, now: Instant) {
+    /// node at `weight` onto the chain rooted at `root`.
+    pub(crate) fn issue(
+        &mut self,
+        token: Token,
+        weight: u32,
+        ttl: Duration,
+        now: Instant,
+        root: EnvelopeDigest,
+    ) {
         self.prune(now);
         self.pending.push(Pending {
             token,
             weight,
             expires: now.checked_add(ttl).unwrap_or(now),
+            root,
         });
     }
 
@@ -267,6 +291,17 @@ impl Invites {
 
     fn prune(&mut self, now: Instant) {
         self.pending.retain(|pending| pending.expires > now);
+    }
+
+    /// The roots outstanding invites promise a joiner, for compaction to
+    /// keep: a redeemed [`Welcome`] must still hold what the invite
+    /// pinned.
+    pub(crate) fn pinned_roots(&self, now: Instant) -> std::collections::BTreeSet<EnvelopeDigest> {
+        self.pending
+            .iter()
+            .filter(|pending| pending.expires > now)
+            .map(|pending| pending.root)
+            .collect()
     }
 
     /// How many invites are outstanding.
@@ -389,7 +424,10 @@ async fn serve_join(server: &ServerHandle, conn: &Connection) -> Result<KeyId, S
     };
     step(write_frame(
         &mut send,
-        &Message::Welcome(Welcome { root: welcome.root }),
+        &Message::Welcome(Box::new(Welcome {
+            root: welcome.root,
+            state: welcome.state,
+        })),
     ))
     .await
     .map_err(ServeError::Frame)?;
@@ -462,6 +500,8 @@ async fn refuse(send: &mut SendStream, reason: &str) {
 #[derive(Debug, Clone)]
 pub(crate) struct Welcomed {
     pub(crate) root: Envelope,
+    /// The checkpoint at the root, when the root is not an `Init`.
+    pub(crate) state: Option<FullCheckpoint>,
     pub(crate) weight: u32,
 }
 
@@ -558,11 +598,11 @@ pub async fn join(
     .await
     .map_err(JoinError::Frame)?;
 
-    let root = match step(read_frame(&mut recv))
+    let welcome = match step(read_frame(&mut recv))
         .await
         .map_err(JoinError::Frame)?
     {
-        Message::Welcome(welcome) => welcome.root,
+        Message::Welcome(welcome) => *welcome,
         Message::Refused(refused) => return Err(JoinError::Refused(refused.reason)),
         other => {
             return Err(JoinError::Unexpected {
@@ -571,7 +611,7 @@ pub async fn join(
             });
         }
     };
-    let got = root.digest().map_err(JoinError::Undigestable)?;
+    let got = welcome.root.digest().map_err(JoinError::Undigestable)?;
     if got != invite.root {
         return Err(JoinError::RootMismatch {
             expected: invite.root.to_hex().as_ref().to_owned(),
@@ -579,7 +619,7 @@ pub async fn join(
         });
     }
 
-    let mut core = Core::join_in_state_dir(state_dir, root)
+    let mut core = Core::join_in_state_dir(state_dir, welcome.root, welcome.state)
         .await
         .map_err(JoinError::Init)?;
     pull(&conn, &mut core).await?;
@@ -636,6 +676,10 @@ async fn pull(conn: &Connection, core: &mut Core) -> Result<(), JoinError> {
 mod tests {
     use super::*;
 
+    fn root(byte: u8) -> EnvelopeDigest {
+        EnvelopeDigest::from_bytes([byte; 32])
+    }
+
     fn token(byte: u8) -> Token {
         Token::from_bytes([byte; 32])
     }
@@ -644,7 +688,7 @@ mod tests {
     fn a_token_redeems_once() {
         let now = Instant::now();
         let mut invites = Invites::default();
-        invites.issue(token(1), 3, Duration::from_secs(60), now);
+        invites.issue(token(1), 3, Duration::from_secs(60), now, root(0));
 
         assert_eq!(invites.redeem(&token(1), now), Ok(Redeemed { weight: 3 }));
         assert_eq!(invites.redeem(&token(1), now), Err(RedeemError::Unknown));
@@ -655,7 +699,7 @@ mod tests {
     fn an_unknown_token_is_unknown_and_changes_nothing() {
         let now = Instant::now();
         let mut invites = Invites::default();
-        invites.issue(token(1), 1, Duration::from_secs(60), now);
+        invites.issue(token(1), 1, Duration::from_secs(60), now, root(0));
 
         assert_eq!(invites.redeem(&token(2), now), Err(RedeemError::Unknown));
         assert_eq!(invites.pending(), 1);
@@ -665,7 +709,7 @@ mod tests {
     fn an_expired_token_says_so_once_then_is_gone() {
         let now = Instant::now();
         let mut invites = Invites::default();
-        invites.issue(token(1), 1, Duration::from_secs(10), now);
+        invites.issue(token(1), 1, Duration::from_secs(10), now, root(0));
         let later = now + Duration::from_secs(10);
 
         assert_eq!(invites.redeem(&token(1), later), Err(RedeemError::Expired));
@@ -676,12 +720,13 @@ mod tests {
     fn issuing_prunes_what_expired() {
         let now = Instant::now();
         let mut invites = Invites::default();
-        invites.issue(token(1), 1, Duration::from_secs(1), now);
+        invites.issue(token(1), 1, Duration::from_secs(1), now, root(0));
         invites.issue(
             token(2),
             1,
             Duration::from_secs(60),
             now + Duration::from_secs(5),
+            root(0),
         );
         assert_eq!(invites.pending(), 1);
     }

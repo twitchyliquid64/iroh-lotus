@@ -36,7 +36,7 @@ enum Command {
     )]
     Completions(CompletionsArgs),
     /// Runs the daemon in the foreground
-    Run,
+    Run(RunArgs),
     /// Initializes a new cluster
     Init(InitArgs),
     /// Joins an existing cluster with an invite from `lotusctl invite`
@@ -71,6 +71,17 @@ struct ChainArgs {
     /// When to colour the output
     #[arg(long, value_enum, default_value_t = ColorChoice::Auto)]
     color: ColorChoice,
+}
+
+/// The arguments for the run subcommand.
+#[derive(Debug, clap::Args)]
+struct RunArgs {
+    /// Keep at least this many of the newest envelopes when compacting.
+    ///
+    /// The ledger's _lotus_min_keep_minutes floor binds regardless; this
+    /// knob only ever keeps more.
+    #[arg(long, env = "LOTUS_KEEP_ENVELOPES", default_value_t = lotusd::DEFAULT_KEEP_ENVELOPES)]
+    keep_envelopes: std::num::NonZeroU32,
 }
 
 /// The arguments for the completions subcommand.
@@ -254,7 +265,7 @@ async fn async_main() -> Result<(), MainError> {
             let name = cmd.get_name().to_string();
             clap_complete::generate(args.shell, &mut cmd, name, &mut std::io::stdout());
         }
-        Command::Run => {}
+        Command::Run(_) => {}
         Command::Init(a) => {
             let core = Core::create_in_state_dir(
                 cli.global_args.state_dir()?,
@@ -333,7 +344,7 @@ async fn async_main() -> Result<(), MainError> {
     }
 
     // Handle run
-    if let Command::Run = cli.command {
+    if let Command::Run(run) = cli.command {
         let core = Core::init_with_state_dir(cli.global_args.state_dir()?)
             .await
             .map_err(MainError::Init)?;
@@ -367,6 +378,7 @@ async fn async_main() -> Result<(), MainError> {
         let (serv, join_hnd) = Server::new(core, listener)
             .map_err(MainError::Init)?
             .with_endpoint(endpoint)
+            .with_keep_envelopes(run.keep_envelopes)
             .run()
             .await;
 

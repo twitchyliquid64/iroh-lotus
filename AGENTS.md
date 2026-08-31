@@ -13,8 +13,8 @@ as long as compaction has not run on the oldest trustworthy message.
 | Crate  | Role |
 |--------|------|
 | `wire` | Types for serializing messages on the wire. CBOR2 canonical used so messages have hash stability and can be signed. |
-| `state` | The state a chain folds down to. `Ledger::apply` advances it one envelope at a time, like replaying a database log. `Chain` is like ledger except it resolves forks (multiple envelopes with the same parent) into the canonical path: at every fork the highest verified signature weight wins, ties broken by the highest envelope digest. |
-| `storage` | Where ledger state lives: a content-addressed version store keyed by envelope digest, so many ledgers (forks, rewrites, old positions) share one backend, plus the envelope log those versions fold down from. The log also stamps each envelope with a `StoredAt` — when *this* node first saw it, for inspection only. Namespace/path-granular reads and writes, the in-memory backend, the SQLite backend (default feature `sqlite`), and the conformance suite every backend must pass. |
+| `state` | The state a chain folds down to. `Ledger::apply` advances it one envelope at a time, like replaying a database log. `Chain` is like ledger except it resolves forks (multiple envelopes with the same parent) into the canonical path: at every fork the highest verified signature weight wins, ties broken by the highest envelope digest. `Chain::compact` prunes the log and versions below a cut on the canonical path — the cut's version stands in for the pruned history — and `Chain::adopt` opens a chain on a blank node from a cut envelope plus the checkpoint of its state. |
+| `storage` | Where ledger state lives: a content-addressed version store keyed by envelope digest, so many ledgers (forks, rewrites, old positions) share one backend, plus the envelope log those versions fold down from. The log also stamps each envelope with a `StoredAt` — when *this* node first saw it: inspection, and the clock compaction's retention floor runs on. Namespace/path-granular reads and writes, the in-memory backend, the SQLite backend (default feature `sqlite`), and the conformance suite every backend must pass. |
 | `render` | How an envelope is shown to a person: one stanza format, optionally coloured. The value a message writes is previewed in the stanza — JSON-shaped, broken over lines and elided at a fixed width and line budget, so a small write reads whole and a checkpoint doesn't flood the screen. A genesis's namespaces share that one budget between them, an equal share each, so no one of them spends the lines the rest are shown in. |
 | `sync` | Node-to-node sync: the peer wire protocol and sans-io session machines. A `Puller` catches a node up from one peer, a `Server` serves the peer's pull; both consume `Input`s and emit `Effect`s — storage access included, as `Ask`/`Ingest` effects the driver resolves — so sessions run without sockets, clocks, or a runtime. Each node offers only its own canonical path; fork resolution in `state` does all merging. |
 | `lotusd-rpc` | The protocol lotusd speaks on its local socket. Length-prefixed canonical CBOR frames; one connection carries one request and the stream of responses to it. A `Method` pairs a request with the response type that answers it, so callers never name the response. `GetStatus` answers with everything `lotusctl status` prints — identity, endpoint, chain range, kept peers, inbound count — carrying iroh ids as strings so clients need not depend on iroh. |
@@ -45,11 +45,19 @@ actor messages through a `ServerHandle`; each local connection gets its own task
    over a copied state dir must not capture the original's entry). `lotusctl status` reports where the listing stands.
  - `invite` is the one-word text (`lotus1…`) an operator carries from a running node to a blank one: sponsor id, endpoint
    address, pinned root digest, one-time token.
- - `bootstrap` is the join protocol under its own ALPN: the joiner redeems the token, gets the root envelope, pulls the
-   chain (through `sync_driver` against a bare `Core` — there is no server yet), and only then is admitted by the
-   sponsor's signature alone (`Core::admit`: trusted key, then `cluster-nodes` entry). Tokens live in the server
-   mainloop's memory only, expire, and redeem once; an invite is refused up front when the sponsor could not sign an
-   admission alone.
+ - `bootstrap` is the join protocol under its own ALPN: the joiner redeems the token, gets the root envelope — plus the
+   checkpoint of its state, when the sponsor's root is a compaction cut (`Chain::adopt`; the digest pins the envelope
+   alone, the checkpoint rides on the sponsor's vouch) — pulls the chain (through `sync_driver` against a bare `Core` —
+   there is no server yet), and only then is admitted by the sponsor's signature alone (`Core::admit`: trusted key,
+   then `cluster-nodes` entry). Tokens live in the server mainloop's memory only, expire, and redeem once; an invite is
+   refused up front when the sponsor could not sign an admission alone.
+ - Compaction runs on the mainloop: an hourly pass — and `lotusctl compact`, eagerly — moves the oldest envelope forward
+   (`Core::compact` over `Chain::compact`), pruning the log and versions below a cut on the canonical path. Kept
+   regardless: the newest `--keep-envelopes` (default 32), everything held for less than the ledger's
+   `_lotus_min_keep_minutes` floor (by `StoredAt`, this node's own clock — the floor promises how long *this* node keeps
+   a message), and the roots pending invites pinned. The `oldest_envelope` file names the cut durably *before* the
+   prune, so a crash mid-prune reopens at the cut and the next pass finishes the sweep. A peer that falls behind the
+   horizon gets `NoCommonHistory` from sync and recovers by re-joining with an invite.
 
 ## Signature verification
 

@@ -46,6 +46,8 @@ pub enum Request {
     WeakDeleteMatching(WeakDeleteMatching),
     /// See [`CreateInvite`].
     CreateInvite(CreateInvite),
+    /// See [`Compact`].
+    Compact(Compact),
 }
 
 /// Asks the daemon for an invite: one word a blank node joins the cluster
@@ -232,6 +234,30 @@ impl fmt::Display for WriteOutcome {
 pub struct Reorged {
     #[cbor(key = 1)]
     pub from: EnvelopeDigest,
+}
+
+/// Asks the daemon to prune envelopes past its retention policy, now and
+/// eagerly — the periodic pass it runs anyway waits for enough to be
+/// worth a sweep. What the policy keeps — the newest envelopes, the
+/// ledger's min-keep-minutes floor, roots pinned by pending invites —
+/// stays either way.
+///
+/// Answered with one [`Compacted`].
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+pub struct Compact {}
+
+/// Answers [`Compact`]: how the oldest held envelope moved.
+#[derive(Debug, Clone, Copy, Cbor, PartialEq, Eq)]
+pub struct Compacted {
+    /// Where the oldest envelope stood before.
+    #[cbor(key = 1)]
+    pub from: EnvelopeDigest,
+    /// Where it stands now — `from`, when nothing was eligible.
+    #[cbor(key = 2)]
+    pub to: EnvelopeDigest,
+    /// How many envelopes were pruned — removed from the log.
+    #[cbor(key = 3)]
+    pub pruned: u64,
 }
 
 /// Asks the daemon for its version.
@@ -687,6 +713,8 @@ pub enum Response {
     Written(Written),
     /// Answers [`CreateInvite`].
     Invite(InviteCode),
+    /// Answers [`Compact`].
+    Compacted(Compacted),
     /// Ends the stream: the request could not be served to completion.
     Failed(Failure),
 }
@@ -704,6 +732,7 @@ impl Response {
             Response::Value(_) => "value",
             Response::Written(_) => "write outcome",
             Response::Invite(_) => "invite",
+            Response::Compacted(_) => "compaction",
             Response::Failed(_) => "failure",
         }
     }

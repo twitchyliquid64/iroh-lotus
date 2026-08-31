@@ -1,12 +1,13 @@
 //! Two real daemons syncing over an in-memory pipe: the full stack —
 //! actor, storage, framing — with only the network swapped out.
 
-use std::path::Path;
+use std::{collections::BTreeSet, num::NonZeroU32, path::Path};
 
 use lotusd::{
     Core, IfInitialized, NodeKeys, Server, ServerHandle,
     sync_driver::{self, SyncError},
 };
+use storage::StoredAt;
 use sync::{Message, PullOutcome, ServeOutcome};
 use tempfile::TempDir;
 use tokio::{io::AsyncWriteExt, net::UnixListener};
@@ -114,6 +115,144 @@ async fn sync_once(
         sync_driver::pull(pull_end, puller),
         sync_driver::serve(serve_end, server),
     )
+}
+
+/// A compacted node still serves a peer standing at or above its cut:
+/// the shared envelope anchors the session and the pull is an ordinary
+/// suffix.
+#[tokio::test]
+async fn a_compacted_node_serves_a_peer_above_the_horizon() {
+    let dir_a = TempDir::new().unwrap();
+    let dir_b = TempDir::new().unwrap();
+
+    // B copies the cluster two envelopes in; A then moves on two more
+    // and compacts down to the three newest — the cut lands exactly on
+    // B's head, so they still share it.
+    let mut core = Core::create_in_state_dir(dir_a.path().to_path_buf(), IfInitialized::Fail)
+        .await
+        .unwrap();
+    let keys = core.keys().clone();
+    let genesis = core.head();
+    core.insert(run_of(&keys, genesis, "s", 2)).unwrap();
+    let shared = core.head();
+    drop(core); // closes the store before the copy
+    copy_state_dir(dir_a.path(), dir_b.path());
+
+    let mut core = Core::init_with_state_dir(dir_a.path().to_path_buf())
+        .await
+        .unwrap();
+    core.insert(run_of(&keys, shared, "t", 2)).unwrap();
+    let compacted = core
+        .compact_before(
+            StoredAt::from_timestamp_millis(4_102_444_800_000),
+            NonZeroU32::new(3).unwrap(),
+            1,
+            &BTreeSet::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(compacted.to, shared, "the cut must land on the shared head");
+    assert_eq!(compacted.pruned, 2, "the genesis and the first write go");
+    let listener = UnixListener::bind(dir_a.path().join("a.sock")).unwrap();
+    let (a, _join) = Server::new(core, listener).unwrap().run().await;
+
+    let b = serve_dir(&dir_b).await;
+    let (pulled, served) = sync_once(&b, &a).await;
+
+    let head = a.head().await.unwrap();
+    assert_eq!(pulled.unwrap(), PullOutcome::Synced { head, ingested: 2 });
+    assert_eq!(served.unwrap(), ServeOutcome::Served { head, sent: 2 });
+    assert_eq!(b.head().await.unwrap(), head);
+}
+
+/// The other direction: a compacted node pulls what it lacks from a peer
+/// that moved on — its locator ends at the cut, which the peer still
+/// holds, so the session anchors there.
+#[tokio::test]
+async fn a_compacted_node_pulls_what_it_lacks_from_a_peer() {
+    let dir_a = TempDir::new().unwrap();
+    let dir_b = TempDir::new().unwrap();
+
+    let mut core = Core::create_in_state_dir(dir_a.path().to_path_buf(), IfInitialized::Fail)
+        .await
+        .unwrap();
+    let keys = core.keys().clone();
+    let genesis = core.head();
+    core.insert(run_of(&keys, genesis, "s", 2)).unwrap();
+    let shared = core.head();
+    drop(core); // closes the store before the copy
+    copy_state_dir(dir_a.path(), dir_b.path());
+
+    // B moves on; A compacts down to its two newest and pulls.
+    let b = serve_dir(&dir_b).await;
+    b.insert(run_of(&keys, shared, "t", 2)).await.unwrap();
+
+    let mut core = Core::init_with_state_dir(dir_a.path().to_path_buf())
+        .await
+        .unwrap();
+    let compacted = core
+        .compact_before(
+            StoredAt::from_timestamp_millis(4_102_444_800_000),
+            NonZeroU32::new(2).unwrap(),
+            1,
+            &BTreeSet::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(compacted.pruned, 1, "the genesis goes");
+    let listener = UnixListener::bind(dir_a.path().join("a.sock")).unwrap();
+    let (a, _join) = Server::new(core, listener).unwrap().run().await;
+
+    let (pulled, served) = sync_once(&a, &b).await;
+
+    let head = b.head().await.unwrap();
+    assert_eq!(pulled.unwrap(), PullOutcome::Synced { head, ingested: 2 });
+    assert_eq!(served.unwrap(), ServeOutcome::Served { head, sent: 2 });
+    assert_eq!(a.head().await.unwrap(), head);
+}
+
+/// A node that lagged past a peer's compaction horizon shares no held
+/// history with it any more: the pull ends with `NoCommonHistory` on
+/// both ends, and only a re-join by invite could recover it.
+#[tokio::test]
+async fn a_node_behind_the_horizon_cannot_pull() {
+    let dir_a = TempDir::new().unwrap();
+    let dir_b = TempDir::new().unwrap();
+
+    // B copies the cluster while it holds only the genesis; A then moves
+    // on and compacts the genesis away — the cutoff far future so the
+    // test needn't wait out the floor.
+    let core = Core::create_in_state_dir(dir_a.path().to_path_buf(), IfInitialized::Fail)
+        .await
+        .unwrap();
+    let genesis = core.head();
+    let keys = core.keys().clone();
+    drop(core); // closes the store before the copy
+    copy_state_dir(dir_a.path(), dir_b.path());
+
+    let mut core = Core::init_with_state_dir(dir_a.path().to_path_buf())
+        .await
+        .unwrap();
+    core.insert(run_of(&keys, genesis, "a", 4)).unwrap();
+    let compacted = core
+        .compact_before(
+            StoredAt::from_timestamp_millis(4_102_444_800_000),
+            NonZeroU32::new(2).unwrap(),
+            1,
+            &BTreeSet::new(),
+        )
+        .await
+        .unwrap();
+    assert!(compacted.pruned > 0, "the fixture must actually compact");
+    let listener = UnixListener::bind(dir_a.path().join("a.sock")).unwrap();
+    let (a, _join) = Server::new(core, listener).unwrap().run().await;
+
+    let b = serve_dir(&dir_b).await;
+    let (pulled, served) = sync_once(&b, &a).await;
+
+    assert_eq!(pulled.unwrap(), PullOutcome::NoCommonHistory);
+    assert_eq!(served.unwrap(), ServeOutcome::NoCommonHistory);
+    assert_eq!(b.head().await.unwrap(), genesis, "b stands where it stood");
 }
 
 #[tokio::test]

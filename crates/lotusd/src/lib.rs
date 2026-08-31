@@ -7,13 +7,15 @@ use tokio::sync::oneshot;
 
 mod core;
 pub use crate::core::{
-    AdmitError, AdvertiseError, Advertised, CannotSignAlone, ChainError, Core,
-    IROH_SECRET_FILENAME, IfInitialized, InitError, NodeKeys, OLDEST_ENVELOPE_FILENAME,
+    AdmitError, AdvertiseError, Advertised, CannotSignAlone, ChainError, CompactError, Compacted,
+    Core, IROH_SECRET_FILENAME, IfInitialized, InitError, NodeKeys, OLDEST_ENVELOPE_FILENAME,
     SIGNING_KEY_FILENAME, SQLITE_DB_FILENAME,
 };
 
 mod server;
-pub use server::{Identity, Issued, RequestError, Server, ServerHandle, WeakWrite};
+pub use server::{
+    DEFAULT_KEEP_ENVELOPES, Identity, Issued, RequestError, Server, ServerHandle, WeakWrite,
+};
 
 pub mod addr_publish;
 

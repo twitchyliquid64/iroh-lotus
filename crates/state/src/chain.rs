@@ -1,5 +1,7 @@
 //! Fork resolution over the envelopes a node has seen.
 
+use std::collections::HashSet;
+
 use storage::Storage;
 use wire::{Envelope, EnvelopeDigest, Msg, msg::FullCheckpoint};
 
@@ -73,25 +75,120 @@ impl Chain {
     /// Reopens the chain rooted at `root`, re-deriving the canonical head
     /// from the envelopes the store's log already holds — how a node
     /// resumes after a restart.
+    ///
+    /// The root is an `Init` until [`compact`](Self::compact) moves it:
+    /// after that it is the cut, any envelope whose version — the state
+    /// everything pruned folded down to — the store still holds. A root
+    /// whose envelope the log lacks, or whose version the store lacks, is
+    /// [`Error::UnknownHead`].
     pub fn open<S: Storage>(
         storage: &mut S,
         root: EnvelopeDigest,
     ) -> Result<Self, Error<S::Error>> {
-        match storage
+        storage
             .envelope(root)
             .map_err(Error::Storage)?
-            .ok_or(Error::UnknownHead(root))?
-            .payload()
-        {
-            Msg::Init(_) => {}
-            _ => return Err(Error::NotInit),
-        }
+            .ok_or(Error::UnknownHead(root))?;
         let mut chain = Self {
             root,
             ledger: Ledger::open(storage, root)?,
         };
         chain.ledger = chain.canonicalize(storage)?;
         Ok(chain)
+    }
+
+    /// Opens a chain using `envelope` as the oldest message, and its
+    /// corresponding `state`.
+    ///
+    /// The envelope is stored with the status it arrived with, unverified:
+    /// the key set that could attest it stood at its parent, which is
+    /// exactly what was pruned. A root's status decides nothing — only
+    /// children compete at forks, and they verify against the checkpoint.
+    pub fn adopt<S: Storage>(
+        storage: &mut S,
+        envelope: Envelope,
+        state: &FullCheckpoint,
+    ) -> Result<Self, Error<S::Error>> {
+        if matches!(envelope.payload(), Msg::Init(_)) {
+            return Err(Error::Apply(ApplyError::UnexpectedInit));
+        }
+        let ledger = Ledger::adopt(storage, &envelope, state)?;
+        let root = ledger.head();
+
+        storage
+            .put_envelope(root, envelope)
+            .map_err(Error::Storage)?;
+        Ok(Self { root, ledger })
+    }
+
+    /// Prunes everything strictly older than `cut`. Upon success, returns
+    /// how many envelopes were removed from the log. The head
+    /// does not move.
+    ///
+    /// `cut` must be an envelope on the canonical path below head, otherwise
+    /// [`Error::Diverged`] is returned.
+    ///
+    /// In addition to envelopes older than `cut`, dead fork branches & the
+    /// state at all pruned envelopes is also deleted.
+    pub fn compact<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        cut: EnvelopeDigest,
+    ) -> Result<u64, Error<S::Error>> {
+        // The canonical path head..cut — the versions that must survive.
+        let mut keep = vec![self.head()];
+        while let Some(&at) = keep.last().filter(|&&at| at != cut) {
+            match storage.parent(at).map_err(Error::Storage)? {
+                Some(parent) => keep.push(parent),
+                None => {
+                    return Err(Error::Diverged {
+                        from: self.head(),
+                        to: cut,
+                    });
+                }
+            }
+        }
+
+        // The cut's ancestors, nearest first, as far down as the log
+        // still reaches. The deepest can be a digest the log no longer
+        // holds — a parent hop names it before the log is consulted.
+        let mut ancestors = Vec::new();
+        let mut at = cut;
+        while let Some(parent) = storage.parent(at).map_err(Error::Storage)? {
+            ancestors.push(parent);
+            at = parent;
+        }
+        let on_path: HashSet<EnvelopeDigest> = ancestors.iter().copied().chain([cut]).collect();
+
+        // Oldest ancestor first, its dead branches before it: at any
+        // interruption everything still doomed remains reachable from the
+        // cut — by parent hops to an ancestor, then the children index,
+        // which outlives the parent envelope it keys on.
+        let mut pruned = 0u64;
+        for (index, &ancestor) in ancestors.iter().enumerate().rev() {
+            let children: Vec<EnvelopeDigest> = storage
+                .children(ancestor)
+                .collect::<Result<_, _>>()
+                .map_err(Error::Storage)?;
+            for child in children {
+                if !on_path.contains(&child) {
+                    pruned += remove_subtree(storage, child)?;
+                }
+            }
+            let stored = index + 1 < ancestors.len()
+                || storage
+                    .envelope(ancestor)
+                    .map_err(Error::Storage)?
+                    .is_some();
+            if stored {
+                storage.remove_envelope(ancestor).map_err(Error::Storage)?;
+                pruned += 1;
+            }
+        }
+
+        storage.retain(&keep).map_err(Error::Storage)?;
+        self.root = cut;
+        Ok(pruned)
     }
 
     /// Stores `envelope` in the log and re-derives the canonical head.
@@ -266,7 +363,8 @@ impl Chain {
         &self.ledger
     }
 
-    /// The digest of the `Init` envelope this chain grew from.
+    /// The digest of the envelope this chain is rooted at: the `Init` it
+    /// grew from, until [`compact`](Self::compact) moves it onto a cut.
     pub fn root(&self) -> EnvelopeDigest {
         self.root
     }
@@ -382,6 +480,31 @@ fn descends<S: Storage>(
             .and_then(|envelope| envelope.payload().prev_digest().copied());
     }
     Ok(false)
+}
+
+/// Removes `root` and every stored descendant from the log, children
+/// before their parent — an interruption must leave no envelope its
+/// parent's children index can no longer name. Returns how many went.
+fn remove_subtree<S: Storage>(
+    storage: &mut S,
+    root: EnvelopeDigest,
+) -> Result<u64, Error<S::Error>> {
+    let mut removed = 0;
+    let mut stack = vec![(root, false)];
+    while let Some((at, expanded)) = stack.pop() {
+        if expanded {
+            storage.remove_envelope(at).map_err(Error::Storage)?;
+            removed += 1;
+            continue;
+        }
+        stack.push((at, true));
+        let children: Vec<EnvelopeDigest> = storage
+            .children(at)
+            .collect::<Result<_, _>>()
+            .map_err(Error::Storage)?;
+        stack.extend(children.into_iter().map(|child| (child, false)));
+    }
+    Ok(removed)
 }
 
 #[cfg(test)]
@@ -1225,5 +1348,226 @@ mod tests {
             .collect();
 
         assert!(outcomes.windows(2).all(|pair| pair[0] == pair[1]));
+    }
+
+    /// A linear chain to compact: the store, the chain, and the canonical
+    /// digests oldest-first, the root at index 0.
+    fn compactable() -> (MemStorage, Chain, Vec<EnvelopeDigest>) {
+        let (mut store, mut chain) = setup();
+        let mut path = vec![chain.root()];
+        for (k, v) in [("a", "1"), ("b", "2"), ("c", "3"), ("d", "4")] {
+            let envelope = set(chain.head(), k, v);
+            path.push(digest(&envelope));
+            chain.insert(&mut store, envelope).unwrap();
+        }
+        (store, chain, path)
+    }
+
+    #[test]
+    fn compact_prunes_the_log_and_versions_below_the_cut() {
+        let (mut store, mut chain, path) = compactable();
+
+        let pruned = chain.compact(&mut store, path[3]).unwrap();
+
+        assert_eq!(pruned, 3);
+        for &gone in &path[..3] {
+            assert!(store.envelope(gone).unwrap().is_none());
+            assert!(!store.contains_version(gone).unwrap());
+        }
+        for &kept in &path[3..] {
+            assert!(store.envelope(kept).unwrap().is_some());
+            assert!(store.contains_version(kept).unwrap());
+        }
+        // The state below the cut lives on in the versions above it.
+        assert_eq!(
+            chain.ledger().namespace(&store, &key("a")).unwrap(),
+            Some(ns("1"))
+        );
+    }
+
+    /// The cut is what a restart reopens from — and the chain keeps
+    /// advancing from there.
+    #[test]
+    fn a_compacted_chain_reopens_at_the_cut() {
+        let (mut store, mut chain, path) = compactable();
+        chain.compact(&mut store, path[3]).unwrap();
+
+        let mut reopened = Chain::open(&mut store, path[3]).unwrap();
+        assert_eq!(reopened.root(), path[3]);
+        assert_eq!(reopened.head(), chain.head());
+
+        reopened
+            .insert(&mut store, set(reopened.head(), "e", "5"))
+            .unwrap();
+        assert_eq!(
+            reopened.ledger().namespace(&store, &key("e")).unwrap(),
+            Some(ns("5"))
+        );
+    }
+
+    #[test]
+    fn compact_at_the_root_prunes_nothing() {
+        let (mut store, mut chain, path) = compactable();
+        assert_eq!(chain.compact(&mut store, chain.root()).unwrap(), 0);
+        assert!(path.iter().all(|&d| store.envelope(d).unwrap().is_some()));
+    }
+
+    /// Everything below the cut goes, dead branches included: the losing
+    /// sibling and the child that grew on it.
+    #[test]
+    fn compact_prunes_dead_branches_below_the_cut() {
+        let (mut store, mut chain) = setup();
+        let (winner, loser) = ranked(set(chain.head(), "a", "1"), set(chain.head(), "a", "2"));
+        chain.insert(&mut store, loser.clone()).unwrap();
+        chain.insert(&mut store, winner.clone()).unwrap();
+        let stale = set(digest(&loser), "z", "9");
+        chain.insert(&mut store, stale.clone()).unwrap();
+        let next = set(digest(&winner), "b", "2");
+        chain.insert(&mut store, next.clone()).unwrap();
+
+        let pruned = chain.compact(&mut store, digest(&next)).unwrap();
+
+        // The loser, its child, the winner, and the root.
+        assert_eq!(pruned, 4);
+        for gone in [digest(&loser), digest(&stale), digest(&winner)] {
+            assert!(store.envelope(gone).unwrap().is_none());
+        }
+        assert_eq!(chain.head(), digest(&next));
+        assert!(store.envelope(digest(&next)).unwrap().is_some());
+    }
+
+    /// A fork above the cut is still live — its envelope stays, only its
+    /// version is dropped, to be re-derived if it ever wins a walk.
+    #[test]
+    fn a_fork_above_the_cut_survives_the_prune() {
+        let (mut store, mut chain, path) = compactable();
+        let loser = (0..64)
+            .map(|n| set(path[3], "d", &format!("other{n}")))
+            .find(|candidate| digest(candidate) < path[4])
+            .expect("some sibling digest falls below the canonical one");
+        chain.insert(&mut store, loser.clone()).unwrap();
+        assert_eq!(chain.head(), path[4], "the fixture's tip must keep winning");
+
+        chain.compact(&mut store, path[3]).unwrap();
+
+        assert!(store.envelope(digest(&loser)).unwrap().is_some());
+        assert!(!store.contains_version(digest(&loser)).unwrap());
+    }
+
+    #[test]
+    fn compact_refuses_a_cut_off_the_canonical_path() {
+        let (mut store, mut chain, _) = compactable();
+        let stranger = EnvelopeDigest::from_bytes([0xee; 32]);
+        assert!(matches!(
+            chain.compact(&mut store, stranger),
+            Err(Error::Diverged { .. })
+        ));
+    }
+
+    /// An envelope chaining onto pruned history is refused outright:
+    /// there is no version left to validate it against.
+    #[test]
+    fn inserting_below_the_horizon_is_refused() {
+        let (mut store, mut chain, path) = compactable();
+        chain.compact(&mut store, path[3]).unwrap();
+
+        let late = set(path[1], "late", "9");
+        assert!(matches!(
+            chain.insert(&mut store, late),
+            Err(Error::UnknownParent(parent)) if parent == path[1]
+        ));
+    }
+
+    #[test]
+    fn compact_can_cut_at_the_head() {
+        let (mut store, mut chain, _) = compactable();
+        let pruned = chain.compact(&mut store, chain.head()).unwrap();
+        assert_eq!(pruned, 4);
+
+        let reopened = Chain::open(&mut store, chain.head()).unwrap();
+        assert_eq!(reopened.head(), chain.head());
+        assert_eq!(
+            reopened.ledger().namespace(&store, &key("a")).unwrap(),
+            Some(ns("1"))
+        );
+    }
+
+    /// A prune interrupted part-way leaves everything still reachable
+    /// from the cut, so reopening there and compacting again finishes
+    /// the job.
+    #[test]
+    fn an_interrupted_prune_resumes() {
+        let (mut store, _chain, path) = compactable();
+        // What a crash right after the oldest removal leaves behind: the
+        // root gone, its descendant still in the log.
+        store.remove_envelope(path[0]).unwrap();
+
+        let mut reopened = Chain::open(&mut store, path[2]).unwrap();
+        let pruned = reopened.compact(&mut store, path[2]).unwrap();
+
+        assert_eq!(pruned, 1);
+        assert!(store.envelope(path[1]).unwrap().is_none());
+    }
+
+    #[test]
+    fn compact_twice_prunes_nothing_more() {
+        let (mut store, mut chain, path) = compactable();
+        assert_eq!(chain.compact(&mut store, path[3]).unwrap(), 3);
+        assert_eq!(chain.compact(&mut store, path[3]).unwrap(), 0);
+    }
+
+    /// The cut envelope and the checkpoint of its state reopen to exactly
+    /// that state and keep advancing — how a joiner stands on a chain
+    /// whose beginning no node holds any more.
+    #[test]
+    fn adopt_resumes_from_a_cut_and_checkpoint() {
+        let (store, chain, path) = compactable();
+        let cut = path[3];
+        let handed_over = store.envelope(cut).unwrap().unwrap();
+        let checkpoint = Ledger::open(&store, cut)
+            .unwrap()
+            .checkpoint(&store)
+            .unwrap();
+
+        let mut fresh = MemStorage::default();
+        let mut joined = Chain::adopt(&mut fresh, handed_over, &checkpoint).unwrap();
+        assert_eq!(joined.root(), cut);
+        assert_eq!(joined.head(), cut);
+        assert_eq!(joined.ledger().checkpoint(&fresh).unwrap(), checkpoint);
+
+        // The rest of the chain pulls in like any sync.
+        let tail = store.envelope(path[4]).unwrap().unwrap();
+        joined.insert(&mut fresh, tail).unwrap();
+        assert_eq!(joined.head(), chain.head());
+    }
+
+    /// An `Init` carries its own state; adopting one with a foreign
+    /// checkpoint would shadow it.
+    #[test]
+    fn adopt_refuses_an_init_envelope() {
+        let mut store = MemStorage::default();
+        assert!(matches!(
+            Chain::adopt(&mut store, init(), &FullCheckpoint::default()),
+            Err(Error::Apply(ApplyError::UnexpectedInit))
+        ));
+    }
+
+    /// The boundary covers adoption too: a handed-over checkpoint can't
+    /// smuggle in a reserved value an update would be refused for.
+    #[test]
+    fn adopt_rejects_an_invalid_reserved_value() {
+        let (store, _, path) = compactable();
+        let handed_over = store.envelope(path[1]).unwrap().unwrap();
+        let bad = FullCheckpoint {
+            namespaces: [(key(crate::MIN_KEEP_MINUTES_KEY), ns("garbage"))]
+                .into_iter()
+                .collect(),
+        };
+
+        let mut fresh = MemStorage::default();
+        assert!(matches!(
+            Chain::adopt(&mut fresh, handed_over, &bad),
+            Err(Error::Apply(ApplyError::InvalidValue { .. }))
+        ));
     }
 }

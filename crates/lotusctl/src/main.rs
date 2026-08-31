@@ -3,10 +3,10 @@ use std::{collections::BTreeMap, fmt, path::PathBuf, process::ExitCode, time::Du
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use lotusd_rpc::{
-    Call, ChainWalk, CreateInvite, EnvelopeFrame, GetChainRange, GetEnvelopes, GetStatus,
-    GetVersion, InviteCode, NamespaceChange, NodeStatus, Read, ValueAt, Watch, WatchEvent,
-    WatchSelector, WeakDelete, WeakDeleteMatching, WeakIncrement, WeakPush, WeakSet, WriteOutcome,
-    Written, call,
+    Call, ChainWalk, Compact, Compacted, CreateInvite, EnvelopeFrame, GetChainRange, GetEnvelopes,
+    GetStatus, GetVersion, InviteCode, NamespaceChange, NodeStatus, Read, ValueAt, Watch,
+    WatchEvent, WatchSelector, WeakDelete, WeakDeleteMatching, WeakIncrement, WeakPush, WeakSet,
+    WriteOutcome, Written, call,
 };
 use render::{ColorChoice, Entry, Render};
 use tokio::net::UnixStream;
@@ -122,6 +122,18 @@ enum Command {
         passes, so treat it as a credential and hand it over privately."
     )]
     Invite(InviteCommand),
+    /// Prunes envelopes past the daemon's retention policy, reporting how
+    /// the oldest envelope moved
+    #[command(
+        long_about = "Prunes envelopes past the daemon's retention policy, reporting how the \
+        oldest envelope moved.\n\n\
+        Eager where the daemon's own periodic pass waits for enough to be worth \
+        a sweep: however little is eligible goes now. What the policy keeps is \
+        untouched either way — the newest envelopes (the daemon's \
+        --keep-envelopes), everything held for less than the ledger's \
+        _lotus_min_keep_minutes floor, and the roots pinned by pending invites."
+    )]
+    Compact,
     /// Reports who the daemon is, how much of the chain it holds, and how
     /// it stands with its peers
     Status,
@@ -950,6 +962,17 @@ async fn async_main() -> Result<(), MainError> {
                 Format::Json => print_json(&line)?,
             }
         }
+        Command::Compact => {
+            let path = cli.global_args.local_sock_path()?;
+            let compacted = call(connect(&path).await?, Compact {})
+                .await
+                .map_err(MainError::Rpc)?;
+
+            match cli.global_args.format {
+                Format::Text => print!("{}", CompactedLine(&compacted)),
+                Format::Json => print_json(&compacted)?,
+            }
+        }
         Command::Status => {
             let path = cli.global_args.local_sock_path()?;
             let status = call(connect(&path).await?, GetStatus {})
@@ -1023,6 +1046,30 @@ async fn async_main() -> Result<(), MainError> {
 ///
 /// Ids are printed whole: an operator copies them into a ledger entry or
 /// another node's arguments, and a shortened id is one they cannot.
+/// The line `compact` prints.
+struct CompactedLine<'a>(&'a Compacted);
+
+impl fmt::Display for CompactedLine<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let compacted = self.0;
+        if compacted.pruned == 0 {
+            writeln!(
+                f,
+                "nothing to prune; oldest {}",
+                compacted.to.to_hex().as_ref()
+            )
+        } else {
+            writeln!(
+                f,
+                "pruned {} envelope{}; oldest now {}",
+                compacted.pruned,
+                if compacted.pruned == 1 { "" } else { "s" },
+                compacted.to.to_hex().as_ref(),
+            )
+        }
+    }
+}
+
 struct StatusText<'a>(&'a NodeStatus);
 
 impl fmt::Display for StatusText<'_> {

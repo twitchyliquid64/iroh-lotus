@@ -11,11 +11,7 @@ use wire::Envelope;
 ///
 /// Local bookkeeping for whoever is inspecting a log, and nothing else. It
 /// is not in the envelope, not in any digest, never gossiped, and nothing
-/// that decides anything may read it: two nodes holding the same envelope
-/// disagree about it by construction, so a rule that consulted it would
-/// resolve forks differently on different nodes and split the chain for
-/// good. Time the ledger can act on is [`SignedTimestamp`]'s job, because
-/// that is time somebody signed.
+/// relevant to consensus may use this value.
 ///
 /// Naive UTC to the millisecond: no zone travels with it, and it is only
 /// ever compared against another reading of the same node's clock. The
