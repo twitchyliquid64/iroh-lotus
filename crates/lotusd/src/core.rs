@@ -15,7 +15,7 @@ use state::{
     CLUSTER_NODES_KEY, Chain, ChangeDiffer, Insert, Ledger, MIN_ENVELOPE_SIGNATURES_KEY,
     TRUSTED_KEYS_KEY,
 };
-use storage::{LogEntry, SqliteStorage, Storage, StoredAt};
+use storage::{LogEntry, NodeKind, Resolution, SqliteStorage, Storage, StoredAt};
 use tokio::{fs, io::AsyncWriteExt};
 use wire::{
     Envelope, EnvelopeDigest, Key, KeyId, Msg, Signature,
@@ -288,6 +288,33 @@ impl Core {
         let head = self.chain.head();
         let path = path.map_or(&[][..], |path| path.as_ref().as_slice());
         Ok((head, self.storage.value_at(head, key, path)?))
+    }
+
+    /// Every namespace the ledger holds, each with the kind of value it
+    /// carries at its root, and the head they were read at.
+    ///
+    /// One borrow for all of it, as [`read`](Self::read) is. Cheap in the
+    /// namespaces' size: the keys are listed and each root's kind looked
+    /// up, so no value tree is materialized.
+    pub fn namespaces(
+        &self,
+    ) -> Result<(EnvelopeDigest, Vec<(NamespaceKey, NodeKind)>), storage::sqlite::Error> {
+        let head = self.chain.head();
+        let namespaces = self
+            .storage
+            .namespace_keys(head)
+            .map(|key| {
+                let key = key?;
+                let kind = match self.storage.resolve(head, &key, &[])? {
+                    Some(Resolution::Node(kind)) => kind,
+                    // The empty path walks nowhere, and the key came from
+                    // this same head.
+                    other => unreachable!("a listed namespace resolves at its root, got {other:?}"),
+                };
+                Ok((key, kind))
+            })
+            .collect::<Result<_, storage::sqlite::Error>>()?;
+        Ok((head, namespaces))
     }
 
     /// Signs the message `build` makes for the current head with this

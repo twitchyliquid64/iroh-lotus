@@ -12,7 +12,7 @@ use std::{
 use iroh::{Endpoint, EndpointAddr};
 use lotusd_rpc as rpc;
 use state::Insert;
-use storage::{LogEntry, StoredAt};
+use storage::{LogEntry, NodeKind, StoredAt};
 use tokio::{
     net::{UnixListener, UnixStream},
     sync::{mpsc, oneshot},
@@ -83,6 +83,7 @@ enum ServerMsg {
     Peers(Responder<Vec<PeerStatus>, ()>),
     Identity(Responder<Identity, ()>),
     Read(rpc::Read, Responder<rpc::ValueAt, ChainError>),
+    Namespaces(Responder<rpc::NamespaceList, ChainError>),
     WeakWrite(WeakWrite, Responder<rpc::Written, ChainError>),
     Compact(Responder<Compacted, CompactError>),
     CreateInvite(u32, Duration, Responder<Issued, InviteError>),
@@ -426,6 +427,20 @@ impl Server {
                     .map(|(head, value)| rpc::ValueAt { head, value })
                     .map_err(ChainError::Storage),
             ),
+            ServerMsg::Namespaces(r) => r.respond(
+                core.namespaces()
+                    .map(|(head, namespaces)| rpc::NamespaceList {
+                        head,
+                        namespaces: namespaces
+                            .into_iter()
+                            .map(|(key, kind)| rpc::NamespaceEntry {
+                                key,
+                                shape: shape(kind),
+                            })
+                            .collect(),
+                    })
+                    .map_err(ChainError::Storage),
+            ),
             // On the mainloop for the same reason `Insert` is: the write
             // is signed onto the head the core stands at right now.
             ServerMsg::WeakWrite(write, r) => r.respond(
@@ -563,6 +578,15 @@ fn outcome(insert: Insert) -> rpc::WriteOutcome {
     }
 }
 
+/// What a namespace's root holds, as the control protocol spells it.
+fn shape(kind: NodeKind) -> rpc::Shape {
+    match kind {
+        NodeKind::Leaf => rpc::Shape::Leaf,
+        NodeKind::Array => rpc::Shape::Array,
+        NodeKind::Map => rpc::Shape::Map,
+    }
+}
+
 /// The mainloop's side of the network: the actors it owns and the
 /// endpoint they share.
 #[derive(Debug)]
@@ -657,6 +681,14 @@ impl rpc::Handler for Rpc {
                     .await
                     .map_err(|err| rpc::Failure::internal(err.to_string()))?;
                 responses.send(rpc::Response::Value(value)).await
+            }
+            rpc::Request::ListNamespaces(_) => {
+                let list = self
+                    .0
+                    .namespaces()
+                    .await
+                    .map_err(|err| rpc::Failure::internal(err.to_string()))?;
+                responses.send(rpc::Response::Namespaces(list)).await
             }
             rpc::Request::WeakSet(set) => self.write(set, responses).await,
             rpc::Request::WeakPush(push) => self.write(push, responses).await,
@@ -1072,6 +1104,14 @@ impl ServerHandle {
     pub async fn read(&self, read: rpc::Read) -> Result<rpc::ValueAt, RequestError> {
         let (send, recv) = Responder::channel();
         let _ = self.0.send(ServerMsg::Read(read, send)).await;
+        Self::answer(recv.await)
+    }
+
+    /// Lists every namespace the ledger holds and the shape of each one's
+    /// value, at the head the core stands at.
+    pub async fn namespaces(&self) -> Result<rpc::NamespaceList, RequestError> {
+        let (send, recv) = Responder::channel();
+        let _ = self.0.send(ServerMsg::Namespaces(send)).await;
         Self::answer(recv.await)
     }
 

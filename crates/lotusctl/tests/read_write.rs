@@ -259,6 +259,97 @@ async fn reading_what_is_not_set_says_so() {
     assert_eq!(json["value"], serde_json::Value::Null);
 }
 
+/// The global options are global: they parse after the subcommand and its
+/// arguments, not only in front of it, and take effect from there.
+#[tokio::test]
+async fn the_global_options_may_trail_the_subcommand() {
+    let node = alone().await;
+    json(&node.dir, &["set", "cfg", r#"{"port": 80}"#]).await;
+
+    // --state-dir is what points these at the node at all, so reaching the
+    // daemon is itself the proof it was read from the tail.
+    let text = output(
+        &node.dir,
+        &["get", "cfg", "port", "--format", "json", "--color", "never"],
+    )
+    .await;
+    let read: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("not JSON ({e}): {text}"));
+    assert_eq!(read["value"], 80);
+
+    // Given in both places, the one after the subcommand wins: clap
+    // propagates a global from the deepest level it was named at.
+    let text = output(
+        &node.dir,
+        &["--format", "json", "get", "cfg", "--format", "text"],
+    )
+    .await;
+    assert!(
+        text.starts_with("head   "),
+        "expected text output, got {text}"
+    );
+}
+
+/// `list` names every namespace the ledger holds, at the head it was read
+/// at, with the shape of each one's value.
+#[tokio::test]
+async fn list_names_every_namespace_and_its_shape() {
+    let node = alone().await;
+    json(&node.dir, &["set", "cfg", r#"{"port": 80}"#]).await;
+    json(&node.dir, &["set", "hosts", r#"["a.example"]"#]).await;
+    let written = json(&node.dir, &["set", "region", "\"eu\""]).await;
+    let head = digest_in(&written, "head");
+
+    let listed = json(&node.dir, &["list"]).await;
+    assert_eq!(digest_in(&listed, "head"), head);
+    assert_eq!(
+        listed["namespaces"],
+        serde_json::json!([
+            // The reserved namespaces the genesis installs are listed in
+            // key order like any other.
+            {"key": "_lotus_min_envelope_signatures", "shape": "leaf"},
+            {"key": "_lotus_nodes", "shape": "map"},
+            {"key": "_lotus_trusted_keys", "shape": "map"},
+            {"key": "cfg", "shape": "map"},
+            {"key": "hosts", "shape": "array"},
+            {"key": "region", "shape": "leaf"},
+        ])
+    );
+
+    let text = output(&node.dir, &["list"]).await;
+    assert_eq!(
+        text,
+        format!(
+            "head  {head}\n\
+             _lotus_min_envelope_signatures  leaf\n\
+             _lotus_nodes                    map\n\
+             _lotus_trusted_keys             map\n\
+             cfg                             map\n\
+             hosts                           array\n\
+             region                          leaf\n"
+        )
+    );
+}
+
+/// A namespace deleted leaves the listing.
+#[tokio::test]
+async fn list_drops_a_deleted_namespace() {
+    let node = alone().await;
+    json(&node.dir, &["set", "cfg", "7"]).await;
+    let keys = |listed: &serde_json::Value| -> Vec<String> {
+        listed["namespaces"]
+            .as_array()
+            .expect("an array of namespaces")
+            .iter()
+            .map(|entry| entry["key"].as_str().expect("a key").to_owned())
+            .collect()
+    };
+    assert!(keys(&json(&node.dir, &["list"]).await).contains(&"cfg".to_owned()));
+
+    json(&node.dir, &["unset", "cfg"]).await;
+    assert!(!keys(&json(&node.dir, &["list"]).await).contains(&"cfg".to_owned()));
+}
+
 /// A namespace written whole reads back whole, and by path.
 #[tokio::test]
 async fn a_namespace_written_by_set_reads_back() {

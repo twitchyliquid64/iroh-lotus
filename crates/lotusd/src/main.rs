@@ -125,7 +125,7 @@ fn parse_invite(text: &str) -> Result<Invite, String> {
 #[derive(Debug, Args)]
 pub struct GlobalArgs {
     /// Override the directory where state is stored (default: $XDG_STATE_DIR/iroh-lotus)
-    #[arg(long, alias = "sd", env = "LOTUS_STATE_DIR")]
+    #[arg(long, alias = "sd", env = "LOTUS_STATE_DIR", global = true)]
     state_dir: Option<PathBuf>,
 
     /// Which relay infrastructure the iroh endpoint uses

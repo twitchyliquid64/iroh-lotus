@@ -688,6 +688,17 @@ impl Ledger {
         storage.namespaces(self.head)
     }
 
+    /// The key of every namespace the ledger holds, in key order.
+    ///
+    /// Where [`namespaces`](Self::namespaces) materializes each value,
+    /// this names them and reads none.
+    pub fn namespace_keys<S: Storage>(
+        &self,
+        storage: &S,
+    ) -> impl Iterator<Item = Result<NamespaceKey, S::Error>> {
+        storage.namespace_keys(self.head)
+    }
+
     /// The ledger's state as a checkpoint, ready to open a rewritten
     /// chain. The one read that is O(state): every namespace streams
     /// through memory to build it.

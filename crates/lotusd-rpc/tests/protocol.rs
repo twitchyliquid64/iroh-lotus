@@ -6,9 +6,10 @@ use std::collections::BTreeMap;
 use lotusd_rpc::{
     Call, ChainRange, ChainWalk, Changed, Compact, Compacted, EnvelopeFrame, EnvelopeSelector,
     Error, Failure, FailureKind, GetChainRange, GetEnvelopes, GetVersion, Handler, InviteCode,
-    MAX_FRAME_LEN, NamespaceChange, NodeStatus, Read, Reorged, Request, Response, Responses,
-    ValueAt, Verification, Watch, WatchEvent, WatchPath, WatchSelector, WeakDelete,
-    WeakDeleteMatching, WeakIncrement, WeakPush, WeakSet, WriteOutcome, Written, call, serve,
+    ListNamespaces, MAX_FRAME_LEN, NamespaceChange, NamespaceEntry, NamespaceList, NodeStatus,
+    Read, Reorged, Request, Response, Responses, Shape, ValueAt, Verification, Watch, WatchEvent,
+    WatchPath, WatchSelector, WeakDelete, WeakDeleteMatching, WeakIncrement, WeakPush, WeakSet,
+    WriteOutcome, Written, call, serve,
 };
 use std::time::Duration;
 
@@ -42,6 +43,27 @@ fn changed() -> Changed {
             ),
         ]),
         orphaned: [EnvelopeDigest::from_bytes([9u8; 32])].into(),
+    }
+}
+
+/// A listing to answer `ListNamespaces` with, one namespace per shape.
+fn namespace_list() -> NamespaceList {
+    NamespaceList {
+        head: range().head,
+        namespaces: vec![
+            NamespaceEntry {
+                key: key("a"),
+                shape: Shape::Map,
+            },
+            NamespaceEntry {
+                key: key("b"),
+                shape: Shape::Array,
+            },
+            NamespaceEntry {
+                key: key("c"),
+                shape: Shape::Leaf,
+            },
+        ],
     }
 }
 
@@ -218,6 +240,9 @@ impl Handler for Fake {
                     }))
                     .await
             }
+            Request::ListNamespaces(_) => {
+                responses.send(Response::Namespaces(namespace_list())).await
+            }
             Request::WeakSet(set) => {
                 self.set = Some(set);
                 responses.send(Response::Written(written())).await
@@ -279,6 +304,17 @@ async fn compact_answers_with_the_move() {
             pruned: 5,
         }
     );
+}
+
+/// A listing crosses whole: the head it was read at, and every namespace
+/// with the shape of its value.
+#[tokio::test]
+async fn list_namespaces_answers_with_the_listing() {
+    let list = call(connect(Fake::new()), ListNamespaces {})
+        .await
+        .expect("the listing");
+
+    assert_eq!(list, namespace_list());
 }
 
 #[tokio::test]

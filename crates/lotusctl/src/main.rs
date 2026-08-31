@@ -4,9 +4,9 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use lotusd_rpc::{
     Call, ChainWalk, Compact, Compacted, CreateInvite, EnvelopeFrame, GetChainRange, GetEnvelopes,
-    GetStatus, GetVersion, InviteCode, NamespaceChange, NodeStatus, Read, ValueAt, Watch,
-    WatchEvent, WatchSelector, WeakDelete, WeakDeleteMatching, WeakIncrement, WeakPush, WeakSet,
-    WriteOutcome, Written, call,
+    GetStatus, GetVersion, InviteCode, ListNamespaces, NamespaceChange, NamespaceList, NodeStatus,
+    Read, ValueAt, Watch, WatchEvent, WatchSelector, WeakDelete, WeakDeleteMatching, WeakIncrement,
+    WeakPush, WeakSet, WriteOutcome, Written, call,
 };
 use render::{ColorChoice, Entry, Render};
 use tokio::net::UnixStream;
@@ -42,6 +42,18 @@ enum Command {
     /// Prints a value from a namespace, and the head it was read at
     #[command(alias = "read")]
     Get(GetCommand),
+    /// Lists every namespace the ledger holds and the shape of its value
+    #[command(
+        alias = "ls",
+        long_about = "Lists every namespace the ledger holds and the shape of its value.\n\n\
+        Read at the head the daemon stands at, which is printed alongside. \
+        Each namespace is named with what its value is at the root — a `map` \
+        or an `array`, which a path can be walked into, or a `leaf`: a \
+        string, a whole number, a boolean or a trusted key, with nothing \
+        inside it a path addresses. What a namespace actually holds is \
+        `get`."
+    )]
+    List,
     /// Writes a value into a namespace
     #[command(
         alias = "weak-set",
@@ -652,15 +664,15 @@ struct CompletionsArgs {
 #[derive(Debug, Args)]
 struct GlobalArgs {
     /// Override the directory where state is stored (default: $XDG_STATE_DIR/iroh-lotus)
-    #[arg(long, alias = "sd", env = "LOTUS_STATE_DIR")]
+    #[arg(long, alias = "sd", env = "LOTUS_STATE_DIR", global = true)]
     state_dir: Option<PathBuf>,
 
     /// How to render output
-    #[arg(long, short, value_enum, default_value_t = Format::Text)]
+    #[arg(long, short, value_enum, default_value_t = Format::Text, global = true)]
     format: Format,
 
     /// When to colour the output. JSON is never coloured
-    #[arg(long, value_enum, default_value_t = ColorChoice::Auto)]
+    #[arg(long, value_enum, default_value_t = ColorChoice::Auto, global = true)]
     color: ColorChoice,
 }
 
@@ -882,6 +894,17 @@ async fn async_main() -> Result<(), MainError> {
                 Format::Json => print_json(&line)?,
             }
         }
+        Command::List => {
+            let path = cli.global_args.local_sock_path()?;
+            let list = call(connect(&path).await?, ListNamespaces {})
+                .await
+                .map_err(MainError::Rpc)?;
+
+            match cli.global_args.format {
+                Format::Text => print!("{}", ListText(&list)),
+                Format::Json => print_json(&list)?,
+            }
+        }
         Command::Set(args) => {
             let (path, value) = args.target.split()?;
             let value = parse_value(value, args.values.tagged)?;
@@ -1067,6 +1090,27 @@ impl fmt::Display for CompactedLine<'_> {
                 compacted.to.to_hex().as_ref(),
             )
         }
+    }
+}
+
+/// The lines `list` prints: the head, then a namespace per line with the
+/// shape of its value, the names padded so the shapes line up.
+struct ListText<'a>(&'a NamespaceList);
+
+impl fmt::Display for ListText<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "head  {}", self.0.head.to_hex().as_ref())?;
+        let width = self
+            .0
+            .namespaces
+            .iter()
+            .map(|entry| entry.key.as_ref().len())
+            .max()
+            .unwrap_or(0);
+        self.0
+            .namespaces
+            .iter()
+            .try_for_each(|entry| writeln!(f, "{:width$}  {}", entry.key.as_ref(), entry.shape))
     }
 }
 

@@ -185,6 +185,18 @@ pub trait Storage {
         head: EnvelopeDigest,
     ) -> impl Iterator<Item = Result<(NamespaceKey, Namespace), Self::Error>>;
 
+    /// Streams the key of every namespace in the version at `head`, in
+    /// key order.
+    ///
+    /// The default materializes each namespace to name it; a backend that
+    /// holds the keys apart from their values should override it.
+    fn namespace_keys(
+        &self,
+        head: EnvelopeDigest,
+    ) -> impl Iterator<Item = Result<NamespaceKey, Self::Error>> {
+        self.namespaces(head).map(|entry| entry.map(|(key, _)| key))
+    }
+
     /// Derives the version at `head` by applying `op` to the version at
     /// `parent`, atomically — a crash must never leave a half-written
     /// version. The parent version is left intact; other ledgers may be

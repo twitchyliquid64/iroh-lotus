@@ -721,6 +721,20 @@ impl Storage for SqliteStorage {
         )
     }
 
+    fn namespace_keys(
+        &self,
+        head: EnvelopeDigest,
+    ) -> impl Iterator<Item = Result<NamespaceKey, Error>> {
+        // One row lookup: the keys are named without materializing a
+        // single value tree behind them.
+        let (roots, err) = match self.namespace_roots(head) {
+            Ok(roots) => (roots, None),
+            Err(err) => (Vec::new(), Some(Err(err))),
+        };
+        err.into_iter()
+            .chain(roots.into_iter().map(|(key, _)| Ok(key)))
+    }
+
     fn commit(
         &mut self,
         parent: EnvelopeDigest,

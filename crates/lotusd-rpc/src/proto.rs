@@ -34,6 +34,8 @@ pub enum Request {
     Watch(Watch),
     /// See [`Read`].
     Read(Read),
+    /// See [`ListNamespaces`].
+    ListNamespaces(ListNamespaces),
     /// See [`WeakSet`].
     WeakSet(WeakSet),
     /// See [`WeakPush`].
@@ -102,6 +104,57 @@ pub struct ValueAt {
     /// or the path stops short of anything inside it.
     #[cbor(key = 2)]
     pub value: Option<Value>,
+}
+
+/// Asks the daemon for every namespace the ledger holds and the shape of
+/// the value each one carries.
+///
+/// Answered with one [`NamespaceList`]: the head and the listing are read
+/// under one borrow of the chain, so the listing is the one that head
+/// holds.
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+pub struct ListNamespaces {}
+
+/// Answers [`ListNamespaces`].
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+pub struct NamespaceList {
+    /// The canonical head the listing was read at.
+    #[cbor(key = 1)]
+    pub head: EnvelopeDigest,
+    /// Every namespace the ledger holds, in key order.
+    #[cbor(key = 2)]
+    pub namespaces: Vec<NamespaceEntry>,
+}
+
+/// One namespace of a [`NamespaceList`].
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+pub struct NamespaceEntry {
+    #[cbor(key = 1)]
+    pub key: NamespaceKey,
+    #[cbor(key = 2)]
+    pub shape: Shape,
+}
+
+/// What a namespace's value is at its root: what a path can be walked
+/// into, rather than which leaf type sits there.
+#[derive(Debug, Copy, Clone, Cbor, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Shape {
+    /// A single value — a string, an integer, a bool, or a trusted key.
+    /// No path reaches inside one.
+    Leaf,
+    Array,
+    Map,
+}
+
+impl fmt::Display for Shape {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Shape::Leaf => f.write_str("leaf"),
+            Shape::Array => f.write_str("array"),
+            Shape::Map => f.write_str("map"),
+        }
+    }
 }
 
 /// Asks the daemon to write `value` where `path` addresses in `key`,
@@ -709,6 +762,8 @@ pub enum Response {
     Watch(WatchEvent),
     /// Answers [`Read`].
     Value(ValueAt),
+    /// Answers [`ListNamespaces`].
+    Namespaces(NamespaceList),
     /// Answers every weak write, [`WeakSet`] and its siblings.
     Written(Written),
     /// Answers [`CreateInvite`].
@@ -730,6 +785,7 @@ impl Response {
             Response::Envelope(_) => "envelope",
             Response::Watch(_) => "watch event",
             Response::Value(_) => "value",
+            Response::Namespaces(_) => "namespace listing",
             Response::Written(_) => "write outcome",
             Response::Invite(_) => "invite",
             Response::Compacted(_) => "compaction",

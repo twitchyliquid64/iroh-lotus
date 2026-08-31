@@ -104,6 +104,10 @@ macro_rules! storage_conformance {
             $crate::conformance::resolve_reports_the_walk($make);
         }
         #[test]
+        fn conformance_namespace_keys_name_the_versions_namespaces() {
+            $crate::conformance::namespace_keys_name_the_versions_namespaces($make);
+        }
+        #[test]
         fn conformance_namespaces_reencode_to_identical_bytes() {
             $crate::conformance::namespaces_reencode_to_identical_bytes($make);
         }
@@ -947,6 +951,37 @@ pub fn resolve_reports_the_walk<S: Storage>(mut store: S) {
             .expect("resolve"),
         None
     );
+}
+
+/// The key listing names every namespace of the version, in key order,
+/// and no namespace of any other version.
+pub fn namespace_keys_name_the_versions_namespaces<S: Storage>(mut store: S) {
+    store
+        .install(digest(1), namespaces([("b", leaf("2")), ("a", nested())]))
+        .expect("install");
+    store
+        .install(digest(2), namespaces([("c", leaf("3"))]))
+        .expect("install");
+
+    assert_eq!(keys_at(&store, 1), vec![key("a"), key("b")]);
+    assert_eq!(keys_at(&store, 2), vec![key("c")]);
+
+    store
+        .commit(digest(2), digest(3), NamespaceOp::Delete(key("c")))
+        .expect("commit");
+    assert_eq!(keys_at(&store, 3), Vec::<NamespaceKey>::new());
+    assert_eq!(
+        keys_at(&store, 2),
+        vec![key("c")],
+        "the parent version must not move"
+    );
+}
+
+fn keys_at<S: Storage>(store: &S, head: u8) -> Vec<NamespaceKey> {
+    store
+        .namespace_keys(digest(head))
+        .collect::<Result<_, _>>()
+        .expect("namespace_keys")
 }
 
 /// A namespace read back re-encodes to the exact bytes it went in as.
