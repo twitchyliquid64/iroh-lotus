@@ -23,7 +23,7 @@ tar -xzf iroh-lotus-v*-linux-amd64.tar.gz
 sudo install iroh-lotus-v*-linux-amd64/lotus{d,ctl} /usr/local/bin
 ```
 
-**2. Start the first node.** `init` creates the cluster — keys, genesis, state directory — and
+**2. Start the first node.** `init` creates a fresh cluster on the current machine, and
 `run` serves it in the foreground:
 
 ```sh
@@ -31,9 +31,7 @@ lotusd init
 lotusd run
 ```
 
-State lives under `$XDG_STATE_HOME/iroh-lotus` (`~/.local/state/iroh-lotus`) unless `--state-dir`
-or `LOTUS_STATE_DIR` says otherwise. With the daemon up, `lotusctl` talks to it over the control
-socket in that directory:
+With the daemon up, `lotusctl` talks to it over the control socket (See docs for `--state-dir`):
 
 ```sh
 lotusctl status
@@ -47,8 +45,8 @@ lotusctl get cfg port
 lotusctl invite
 ```
 
-Carry that word to the new machine — it is a credential, so hand it over privately — and join with
-it instead of `init`. Bootstrap pulls the whole chain and waits to be admitted, then exits:
+Copy-paste that command to the new machine - it is a credential, so keep it secret - and run
+it to initialize the node from the other. You can then start the daemon as usual:
 
 ```sh
 lotusd bootstrap lotus1...
@@ -57,13 +55,60 @@ lotusd run
 
 Repeat for each additional node.
 
+## Reading and writing values
+
+You can think of data in lotus as JSON documents, stored in _namespaces_.
+
+```sh
+# Sets the `web` namespace to the provided object
+lotusctl set web '{"port": 443, "hosts": ["a.example"], "replicas": 3}'
+
+lotusctl get web       # Read whole namespace
+lotusctl get web port  # Reads a field from the object in the namespace
+```
+
+```
+head   dea1db8d…
+value  443
+```
+
+When writing data, its important to scope the write as tightly as possible: update fields instead of whole
+namespaces, use `append` or `increment` prolifically etc.
+
+```sh
+lotusctl set web port 8443               # replace one key
+lotusctl append web hosts '"b.example"'  # append to an array
+lotusctl increment web replicas 2        # add to an integer; a negative delta subtracts
+```
+
+Removing takes two forms: one value named outright, or whichever entries meet a condition.
+
+```sh
+lotusctl unset web port                           # remove the key `port` and its value
+lotusctl unset web                                # delete the whole `web` namespace
+lotusctl delete web hosts --where '="b.example"'  # delete every entry that matches
+```
+
+To follow changes as they land, until interrupted:
+
+```sh
+lotusctl watch web
+```
+
+```
+changed  e3e6d2c3… -> 5e0475c7…
+  web  port
+```
+
+Every command takes `--format json` for ease when scripting.
+
 ## Development
 
 Requires Rust 1.95 or newer.
 
 ```sh
+cargo fmt && cargo clippy --all-targets -- -D warnings
 cargo test
-cargo clippy --all-targets -- -D warnings
 ```
 
 Contributors — including agents — should read [AGENTS.md](AGENTS.md) for conventions and coding
