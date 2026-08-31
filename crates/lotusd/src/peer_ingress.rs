@@ -85,6 +85,8 @@ pub(crate) enum CloseReason {
     UnknownProtocol,
     /// The ledger no longer lists the node this connection was kept for.
     Removed,
+    /// The peer that opened the connection is not a node the ledger lists.
+    Unlisted,
 }
 
 impl CloseReason {
@@ -95,6 +97,7 @@ impl CloseReason {
             CloseReason::Local => 3,
             CloseReason::UnknownProtocol => 4,
             CloseReason::Removed => 5,
+            CloseReason::Unlisted => 6,
         })
     }
 
@@ -105,6 +108,7 @@ impl CloseReason {
             CloseReason::Local => b"internal error",
             CloseReason::UnknownProtocol => b"unknown protocol",
             CloseReason::Removed => b"removed from cluster",
+            CloseReason::Unlisted => b"not a listed node",
         }
     }
 
@@ -264,9 +268,42 @@ impl PeerIngress {
             return CloseReason::UnknownProtocol.close(conn);
         };
         match protocol {
-            Protocol::Sync => Self::serve_sync(server, conn).await,
+            Protocol::Sync => match Self::member(server, conn).await {
+                Ok(()) => Self::serve_sync(server, conn).await,
+                Err(reason) => reason.close(conn),
+            },
+            // A joining node is not listed yet — being listed is what the
+            // join is for — so bootstrap answers whoever holds a token.
             Protocol::Bootstrap => bootstrap::serve(server, conn).await,
         }
+    }
+
+    /// Checks that the ledger lists an endpoint this connection's peer
+    /// could have dialled from, or gives the reason to close on it.
+    ///
+    /// The peer is only ever what its endpoint id says: iroh authenticated
+    /// that at the handshake. Whether that endpoint is a node of this
+    /// cluster is ordinary ledger state, so the answer is only as current
+    /// as this node's head, and is read once — a node delisted mid-
+    /// connection keeps the connection it has until it drops, exactly as
+    /// the far side's own listing decides what it dials.
+    ///
+    /// A ledger that cannot be read refuses: a membership check that
+    /// passes when it cannot tell is not a membership check.
+    async fn member(server: &ServerHandle, conn: &Connection) -> Result<(), CloseReason> {
+        let remote = conn.remote_id();
+        let listed = server.peer_addresses().await.map_err(|e| {
+            tracing::error!(error = %e, "reading the cluster's node list");
+            CloseReason::Local
+        })?;
+        listed
+            .values()
+            .any(|addr| addr.id == remote)
+            .then_some(())
+            .ok_or_else(|| {
+                tracing::warn!("refusing a peer the ledger does not list");
+                CloseReason::Unlisted
+            })
     }
 
     /// Serves the peer's pulls and listens for its announces until the

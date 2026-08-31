@@ -41,8 +41,7 @@ fn copy_state_dir(from: &Path, to: &Path) {
 }
 
 /// An endpoint on `network` only, dialled by id alone.
-async fn endpoint(network: &TestNetwork) -> Endpoint {
-    let secret = SecretKey::generate();
+async fn endpoint(network: &TestNetwork, secret: SecretKey) -> Endpoint {
     let transport = network.create_transport(secret.public()).unwrap();
     Endpoint::builder(presets::Minimal)
         .preset(transport)
@@ -103,8 +102,9 @@ struct Node {
 }
 
 impl Node {
-    /// Starts a server over the cluster state in `dir` on a fresh endpoint.
-    async fn start(dir: TempDir, network: &TestNetwork) -> Self {
+    /// Starts a server over the cluster state in `dir`, on `secret`'s
+    /// endpoint on `network`.
+    async fn start(dir: TempDir, network: &TestNetwork, secret: Option<SecretKey>) -> Self {
         let core = Core::init_with_state_dir(dir.path().to_path_buf())
             .await
             .unwrap();
@@ -112,7 +112,8 @@ impl Node {
         let keys = core.keys().clone();
         // Short name on purpose: a unix socket path has to fit in SUN_LEN.
         let listener = UnixListener::bind(dir.path().join("s.sock")).unwrap();
-        let endpoint = endpoint(network).await;
+        let secret = secret.unwrap_or_else(|| core.iroh_secret().clone());
+        let endpoint = endpoint(network, secret).await;
         let (handle, join) = Server::new(core, listener)
             .unwrap()
             .with_endpoint(endpoint.clone())
@@ -212,6 +213,13 @@ impl Node {
 }
 
 /// `n` nodes of one cluster on one network. None lists any other yet.
+///
+/// The first runs on the endpoint the genesis names, so it is the one
+/// node every copy of that genesis already lists — and the only one that
+/// can open a connection before any listing is written, since a node
+/// serves only the peers its own ledger names. The rest take fresh keys:
+/// the copied state dirs share the genesis one, and two endpoints under
+/// one id cannot tell each other apart.
 async fn cluster(n: usize) -> Vec<Node> {
     let dirs: Vec<TempDir> = (0..n).map(|_| TempDir::new().unwrap()).collect();
     {
@@ -226,8 +234,9 @@ async fn cluster(n: usize) -> Vec<Node> {
 
     let network = TestNetwork::new();
     let mut nodes = Vec::with_capacity(n);
-    for dir in dirs {
-        nodes.push(Node::start(dir, &network).await);
+    for (i, dir) in dirs.into_iter().enumerate() {
+        let secret = (i > 0).then(SecretKey::generate);
+        nodes.push(Node::start(dir, &network, secret).await);
     }
     nodes
 }

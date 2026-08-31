@@ -28,7 +28,9 @@ actor messages through a `ServerHandle`; each local connection gets its own task
  - `sync_driver` drives the `sync` machines over any `AsyncRead + AsyncWrite` transport (a duplex pipe in tests, an iroh
    stream in the daemon), resolving their `Ask`/`Ingest` effects through the same actor messages.
  - `peer_ingress` accepts peer connections, one ALPN per protocol (`Protocol`), and serves each stream through a
-   `WeakServerHandle` it upgrades per connection.
+   `WeakServerHandle` it upgrades per connection. A sync connection is served only when `cluster-nodes` lists an
+   endpoint with the peer's id, read once at accept and refused when the ledger cannot be read; `bootstrap` is exempt,
+   since being listed is what a join is for.
  - `peer_egress` subscribes to the `cluster-nodes` namespace and keeps one dialled connection per listed node (a task
    each), reconciling the whole set on every change rather than diffing it. It also subscribes to the head and announces
    each move over those connections (a `sync::Announce` on a uni-stream), which the far side answers by pulling back over

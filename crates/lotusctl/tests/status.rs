@@ -62,8 +62,7 @@ fn copy_state_dir(from: &Path, to: &Path) {
 }
 
 /// An endpoint on `network` only, dialled by id alone.
-async fn endpoint(network: &TestNetwork) -> Endpoint {
-    let secret = SecretKey::generate();
+async fn endpoint(network: &TestNetwork, secret: SecretKey) -> Endpoint {
     let transport = network.create_transport(secret.public()).unwrap();
     Endpoint::builder(presets::Minimal)
         .preset(transport)
@@ -91,15 +90,23 @@ struct Node {
 impl Node {
     /// Starts a daemon over the cluster state in `dir`, on an endpoint on
     /// `network` if one is given.
-    async fn start(dir: TempDir, network: Option<&TestNetwork>) -> Self {
+    ///
+    /// `secret` of `None` puts the node on the endpoint its own genesis
+    /// names, which is what makes it a node its peers' ledgers already
+    /// list — a node serves only peers its ledger names, so a pair whose
+    /// endpoints are both strangers to it could never introduce itself.
+    /// The copied state dirs share that key, so a second node must pass
+    /// one of its own.
+    async fn start(dir: TempDir, network: Option<&TestNetwork>, secret: Option<SecretKey>) -> Self {
         let core = Core::init_with_state_dir(dir.path().to_path_buf())
             .await
             .unwrap();
         let (id, genesis) = (core.key_id(), core.root());
         let keys = core.keys().clone();
         let listener = UnixListener::bind(dir.path().join("local.sock")).unwrap();
+        let secret = secret.unwrap_or_else(|| core.iroh_secret().clone());
         let endpoint = match network {
-            Some(network) => Some(endpoint(network).await),
+            Some(network) => Some(endpoint(network, secret).await),
             None => None,
         };
         let server = Server::new(core, listener).unwrap();
@@ -169,7 +176,7 @@ async fn alone() -> Node {
     Core::create_in_state_dir(dir.path().to_path_buf(), IfInitialized::Fail)
         .await
         .unwrap();
-    Node::start(dir, None).await
+    Node::start(dir, None, None).await
 }
 
 /// Two nodes of one cluster on one network, the first keeping a
@@ -186,8 +193,8 @@ async fn pair() -> (Node, Node) {
     copy_state_dir(dir_a.path(), dir_b.path());
 
     let network = TestNetwork::new();
-    let a = Node::start(dir_a, Some(&network)).await;
-    let b = Node::start(dir_b, Some(&network)).await;
+    let a = Node::start(dir_a, Some(&network), None).await;
+    let b = Node::start(dir_b, Some(&network), Some(SecretKey::generate())).await;
     a.list([(
         KeyId::from_bytes([1; 32]),
         EndpointAddr::new(b.endpoint().id()),
