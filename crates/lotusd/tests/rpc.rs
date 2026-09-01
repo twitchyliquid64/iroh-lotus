@@ -9,8 +9,8 @@ use std::{
 use lotusd::{Core, IfInitialized, NodeKeys, Server, ServerHandle, VERSION};
 use lotusd_rpc::{
     Call, ChainWalk, EnvelopeFrame, Error, FailureKind, GetChainRange, GetEnvelopes, GetVersion,
-    Read, Verification, Watch, WatchSelector, WeakDelete, WeakDeleteMatching, WeakIncrement,
-    WeakPush, WeakSet, WriteOutcome, Written, call,
+    Len, MapMeta, Query, QueryKind, Read, ValueMeta, Verification, Watch, WatchSelector,
+    WeakDelete, WeakDeleteMatching, WeakIncrement, WeakPush, WeakSet, WriteOutcome, Written, call,
 };
 use std::collections::BTreeMap;
 use tempfile::TempDir;
@@ -490,6 +490,87 @@ async fn value_at(socket: &Path, key: NamespaceKey, path: Option<SubkeyPath>) ->
 /// Whether a write came back rejected, as opposed to done or broken.
 fn rejected(result: Result<Written, Error>) -> bool {
     matches!(result, Err(Error::Failed(failure)) if failure.kind == FailureKind::Rejected)
+}
+
+/// Asks what `key` holds at `path`, in as much detail as `kind`.
+async fn query(
+    socket: &Path,
+    key: NamespaceKey,
+    path: Option<SubkeyPath>,
+    kind: QueryKind,
+) -> lotusd_rpc::Queried {
+    let stream = UnixStream::connect(socket).await.unwrap();
+    call(stream, Query { key, path, kind }).await.unwrap()
+}
+
+/// A query reports the size and the keys of what a path addresses, and
+/// none of the values under it.
+#[tokio::test]
+async fn a_query_answers_with_the_size_and_keys_of_a_container() {
+    let dir = TempDir::new().unwrap();
+    let (_genesis, _keys, socket, _handle, _join) = serve(&dir).await;
+
+    let value = Value::Map(BTreeMap::from([
+        (
+            "servers".to_owned(),
+            Value::Array(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+        ),
+        ("name".to_owned(), Value::String("edge".to_owned())),
+    ]));
+    let written = weak_set(&socket, key("cfg"), None, value).await.unwrap();
+
+    let queried = query(&socket, key("cfg"), None, QueryKind::Keys).await;
+    assert_eq!(queried.head, written.head);
+    assert_eq!(
+        queried.meta,
+        Some(ValueMeta::Map(MapMeta {
+            len: 2,
+            keys: Some(vec!["name".to_owned(), "servers".to_owned()]),
+        }))
+    );
+
+    // The same map counted rather than named: the keys stay behind.
+    assert_eq!(
+        query(&socket, key("cfg"), None, QueryKind::Len).await.meta,
+        Some(ValueMeta::Map(MapMeta { len: 2, keys: None })),
+    );
+
+    assert_eq!(
+        query(&socket, key("cfg"), Some(path("servers")), QueryKind::Keys)
+            .await
+            .meta,
+        Some(ValueMeta::Array(Len { len: 3 })),
+    );
+
+    // A leaf holds no entries, which is not the same as holding none.
+    assert_eq!(
+        query(&socket, key("cfg"), Some(path("name")), QueryKind::Len)
+            .await
+            .meta,
+        Some(ValueMeta::Leaf),
+    );
+}
+
+/// A query about what the ledger does not hold answers with nothing, at
+/// the head the node stands at.
+#[tokio::test]
+async fn querying_what_is_not_there_answers_nothing() {
+    let dir = TempDir::new().unwrap();
+    let (head, _keys, socket, _handle, _join) = serve(&dir).await;
+
+    let queried = query(&socket, key("cfg"), None, QueryKind::Keys).await;
+    assert_eq!(queried.head, head);
+    assert_eq!(queried.meta, None);
+
+    weak_set(&socket, key("cfg"), None, Value::Int(7))
+        .await
+        .unwrap();
+    assert_eq!(
+        query(&socket, key("cfg"), Some(path("nope")), QueryKind::Len)
+            .await
+            .meta,
+        None,
+    );
 }
 
 /// A namespace the ledger does not hold reads as nothing, at the head the

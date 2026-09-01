@@ -15,7 +15,7 @@ use state::{
     CLUSTER_NODES_KEY, Chain, ChangeDiffer, Insert, Ledger, MIN_ENVELOPE_SIGNATURES_KEY,
     TRUSTED_KEYS_KEY,
 };
-use storage::{LogEntry, NodeKind, Resolution, SqliteStorage, Storage, StoredAt};
+use storage::{LogEntry, NodeKind, Resolution, SqliteStorage, Storage, StoredAt, ValueMeta};
 use tokio::{fs, io::AsyncWriteExt};
 use wire::{
     Envelope, EnvelopeDigest, Key, KeyId, Msg, Signature,
@@ -288,6 +288,23 @@ impl Core {
         let head = self.chain.head();
         let path = path.map_or(&[][..], |path| path.as_ref().as_slice());
         Ok((head, self.storage.value_at(head, key, path)?))
+    }
+
+    /// What the value `path` addresses in the namespace under `key`
+    /// holds — how many entries, and a map's keys — and the head it was
+    /// read at. `None` where [`read`](Self::read) reads nothing.
+    ///
+    /// One borrow for both, as [`read`](Self::read) is. Reads no value
+    /// below what `path` addresses: this is what a client asking for a
+    /// length or a key list gets instead of the namespace.
+    pub fn meta(
+        &self,
+        key: &NamespaceKey,
+        path: Option<&SubkeyPath>,
+    ) -> Result<(EnvelopeDigest, Option<ValueMeta>), storage::sqlite::Error> {
+        let head = self.chain.head();
+        let path = path.map_or(&[][..], |path| path.as_ref().as_slice());
+        Ok((head, self.storage.meta_at(head, key, path)?))
     }
 
     /// Every namespace the ledger holds, each with the kind of value it

@@ -4,9 +4,10 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use lotusd_rpc::{
     Call, ChainWalk, Compact, Compacted, CreateInvite, EnvelopeFrame, GetChainRange, GetEnvelopes,
-    GetStatus, GetVersion, InviteCode, ListNamespaces, NamespaceChange, NamespaceList, NodeStatus,
-    Read, ValueAt, Watch, WatchEvent, WatchSelector, WeakDelete, WeakDeleteMatching, WeakIncrement,
-    WeakPush, WeakSet, WriteOutcome, Written, call,
+    GetStatus, GetVersion, InviteCode, Len, ListNamespaces, MapMeta, NamespaceChange,
+    NamespaceList, NodeStatus, Queried, Query, QueryKind, Read, Shape, ValueAt, ValueMeta, Watch,
+    WatchEvent, WatchSelector, WeakDelete, WeakDeleteMatching, WeakIncrement, WeakPush, WeakSet,
+    WriteOutcome, Written, call,
 };
 use render::{ColorChoice, Entry, Render};
 use tokio::net::UnixStream;
@@ -54,6 +55,28 @@ enum Command {
         `get`."
     )]
     List,
+    /// Reports how many entries a map or array holds, without fetching it
+    #[command(
+        alias = "count",
+        long_about = "Reports how many entries a map or array holds, without fetching it.\n\n\
+        Read at the head the daemon stands at, which is printed alongside. \
+        Only the count crosses the socket, so counting a map of ten thousand \
+        entries costs what counting one of three does — where `get` would \
+        carry the whole value back.\n\n\
+        A leaf — a string, a whole number, a boolean or a trusted key — holds \
+        no entries, and is reported as a leaf rather than as zero. So is a \
+        path that addresses nothing, which is reported as not set."
+    )]
+    Len(LenCommand),
+    /// Lists the keys of a map, without fetching what they hold
+    #[command(
+        long_about = "Lists the keys of a map, without fetching what they hold.\n\n\
+        Read at the head the daemon stands at, which is printed alongside. \
+        Only the keys cross the socket, never the values under them. An array \
+        is listed as its indices, 0 up to one less than its length; a leaf has \
+        no keys to list, and neither does a path that addresses nothing."
+    )]
+    Keys(KeysCommand),
     /// Writes a value into a namespace
     #[command(
         alias = "weak-set",
@@ -296,6 +319,20 @@ struct GetCommand {
     values: ValueArgs,
 }
 
+/// The arguments for the len subcommand.
+#[derive(Debug, Args)]
+struct LenCommand {
+    #[command(flatten)]
+    target: Target,
+}
+
+/// The arguments for the keys subcommand.
+#[derive(Debug, Args)]
+struct KeysCommand {
+    #[command(flatten)]
+    target: Target,
+}
+
 /// The arguments for the set subcommand.
 #[derive(Debug, Args)]
 struct SetCommand {
@@ -506,6 +543,84 @@ impl fmt::Display for ValueLine {
         match &self.value {
             serde_json::Value::Null => writeln!(f, "value  — (not set)"),
             value => writeln!(f, "value  {value}"),
+        }
+    }
+}
+
+/// What `len` reports.
+#[derive(Debug, serde::Serialize)]
+struct LenLine {
+    head: EnvelopeDigest,
+    /// What the path addresses, or `null` when it addresses nothing.
+    shape: Option<Shape>,
+    /// How many entries it holds; `null` for a leaf, which holds none
+    /// rather than zero, and for a path addressing nothing.
+    len: Option<u64>,
+}
+
+impl From<Queried> for LenLine {
+    fn from(queried: Queried) -> Self {
+        Self {
+            head: queried.head,
+            shape: queried.meta.as_ref().map(ValueMeta::shape),
+            len: queried.meta.as_ref().and_then(ValueMeta::entries),
+        }
+    }
+}
+
+impl fmt::Display for LenLine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "head   {}", self.head.to_hex().as_ref())?;
+        match (self.shape, self.len) {
+            (None, _) => writeln!(f, "shape  — (not set)"),
+            (Some(shape), None) => {
+                writeln!(f, "shape  {shape}")?;
+                writeln!(f, "len    — (a leaf holds no entries)")
+            }
+            (Some(shape), Some(len)) => {
+                writeln!(f, "shape  {shape}")?;
+                writeln!(f, "len    {len}")
+            }
+        }
+    }
+}
+
+/// What `keys` reports.
+#[derive(Debug, serde::Serialize)]
+struct KeysLine {
+    head: EnvelopeDigest,
+    /// What the path addresses, or `null` when it addresses nothing.
+    shape: Option<Shape>,
+    /// The keys, in order — an array's indices spelled out — or `null`
+    /// where there are none to list, which an empty map is not.
+    keys: Option<Vec<String>>,
+}
+
+impl From<Queried> for KeysLine {
+    fn from(queried: Queried) -> Self {
+        Self {
+            head: queried.head,
+            shape: queried.meta.as_ref().map(ValueMeta::shape),
+            keys: match queried.meta {
+                None | Some(ValueMeta::Leaf) => None,
+                // The daemon answers an array with its length; its keys
+                // are the indices that length covers.
+                Some(ValueMeta::Array(Len { len })) => {
+                    Some((0..len).map(|i| i.to_string()).collect())
+                }
+                Some(ValueMeta::Map(MapMeta { keys, .. })) => Some(keys.unwrap_or_default()),
+            },
+        }
+    }
+}
+
+impl fmt::Display for KeysLine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "head  {}", self.head.to_hex().as_ref())?;
+        match (self.shape, &self.keys) {
+            (None, _) => writeln!(f, "— (not set)"),
+            (Some(_), None) => writeln!(f, "— (a leaf has no keys)"),
+            (Some(_), Some(keys)) => keys.iter().try_for_each(|key| writeln!(f, "{key}")),
         }
     }
 }
@@ -905,6 +1020,24 @@ async fn async_main() -> Result<(), MainError> {
                 Format::Json => print_json(&list)?,
             }
         }
+        Command::Len(args) => {
+            let queried = query(&cli.global_args, &args.target, QueryKind::Len).await?;
+            let line = LenLine::from(queried);
+
+            match cli.global_args.format {
+                Format::Text => print!("{line}"),
+                Format::Json => print_json(&line)?,
+            }
+        }
+        Command::Keys(args) => {
+            let queried = query(&cli.global_args, &args.target, QueryKind::Keys).await?;
+            let line = KeysLine::from(queried);
+
+            match cli.global_args.format {
+                Format::Text => print!("{line}"),
+                Format::Json => print_json(&line)?,
+            }
+        }
         Command::Set(args) => {
             let (path, value) = args.target.split()?;
             let value = parse_value(value, args.values.tagged)?;
@@ -1163,6 +1296,21 @@ impl fmt::Display for StatusText<'_> {
 
 fn plural(n: usize, one: &'static str, many: &'static str) -> &'static str {
     if n == 1 { one } else { many }
+}
+
+/// Asks the daemon what `target` holds, in as much detail as `kind`.
+async fn query(args: &GlobalArgs, target: &Target, kind: QueryKind) -> Result<Queried, MainError> {
+    let path = args.local_sock_path()?;
+    call(
+        connect(&path).await?,
+        Query {
+            key: target.key.clone(),
+            path: target.path.clone(),
+            kind,
+        },
+    )
+    .await
+    .map_err(MainError::Rpc)
 }
 
 /// Sends one weak write to the daemon and prints what it did.

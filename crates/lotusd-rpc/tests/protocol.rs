@@ -5,11 +5,11 @@ use std::collections::BTreeMap;
 
 use lotusd_rpc::{
     Call, ChainRange, ChainWalk, Changed, Compact, Compacted, EnvelopeFrame, EnvelopeSelector,
-    Error, Failure, FailureKind, GetChainRange, GetEnvelopes, GetVersion, Handler, InviteCode,
-    ListNamespaces, MAX_FRAME_LEN, NamespaceChange, NamespaceEntry, NamespaceList, NodeStatus,
-    Read, Reorged, Request, Response, Responses, Shape, ValueAt, Verification, Watch, WatchEvent,
-    WatchPath, WatchSelector, WeakDelete, WeakDeleteMatching, WeakIncrement, WeakPush, WeakSet,
-    WriteOutcome, Written, call, serve,
+    Error, Failure, FailureKind, GetChainRange, GetEnvelopes, GetVersion, Handler, InviteCode, Len,
+    ListNamespaces, MAX_FRAME_LEN, MapMeta, NamespaceChange, NamespaceEntry, NamespaceList,
+    NodeStatus, Queried, Query, QueryKind, Read, Reorged, Request, Response, Responses, Shape,
+    ValueAt, ValueMeta, Verification, Watch, WatchEvent, WatchPath, WatchSelector, WeakDelete,
+    WeakDeleteMatching, WeakIncrement, WeakPush, WeakSet, WriteOutcome, Written, call, serve,
 };
 use std::time::Duration;
 
@@ -127,6 +127,8 @@ struct Fake {
     selected: Option<EnvelopeSelector>,
     /// The read the last request asked for, likewise.
     read: Option<Read>,
+    /// The query the last request asked for, likewise.
+    query: Option<Query>,
     /// The write the last request asked for, likewise.
     set: Option<WeakSet>,
     push: Option<WeakPush>,
@@ -144,6 +146,7 @@ impl Fake {
             watched: None,
             selected: None,
             read: None,
+            query: None,
             set: None,
             push: None,
             delete: None,
@@ -237,6 +240,25 @@ impl Handler for Fake {
                     .send(Response::Value(ValueAt {
                         head: range().head,
                         value,
+                    }))
+                    .await
+            }
+            Request::Query(query) => {
+                // A path answers as a map, whose keys ride along only for
+                // the query that asked for them; the whole namespace
+                // answers with nothing there.
+                let meta = query.path.is_some().then(|| {
+                    ValueMeta::Map(MapMeta {
+                        len: 2,
+                        keys: matches!(query.kind, QueryKind::Keys)
+                            .then(|| vec!["a".to_owned(), "b".to_owned()]),
+                    })
+                });
+                self.query = Some(query);
+                responses
+                    .send(Response::Queried(Queried {
+                        head: range().head,
+                        meta,
                     }))
                     .await
             }
@@ -692,6 +714,82 @@ async fn a_read_answers_with_the_head_and_whatever_is_there() {
     .await
     .unwrap();
     assert_eq!(at.value, None);
+}
+
+/// A query answers with the size of what a path addresses, and carries
+/// the keys back only for the kind that asked for them.
+#[tokio::test]
+async fn a_query_answers_with_what_the_path_holds() {
+    let queried = call(
+        connect(Fake::new()),
+        Query {
+            key: key("a"),
+            path: Some(path("x")),
+            kind: QueryKind::Len,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(queried.head, range().head);
+    assert_eq!(
+        queried.meta,
+        Some(ValueMeta::Map(MapMeta { len: 2, keys: None }))
+    );
+
+    let queried = call(
+        connect(Fake::new()),
+        Query {
+            key: key("a"),
+            path: Some(path("x")),
+            kind: QueryKind::Keys,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        queried.meta,
+        Some(ValueMeta::Map(MapMeta {
+            len: 2,
+            keys: Some(vec!["a".to_owned(), "b".to_owned()]),
+        }))
+    );
+
+    let queried = call(
+        connect(Fake::new()),
+        Query {
+            key: key("a"),
+            path: None,
+            kind: QueryKind::Len,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(queried.meta, None);
+}
+
+/// Every shape a container answer takes survives the crossing.
+#[tokio::test]
+async fn a_query_answer_carries_every_shape() {
+    [
+        ValueMeta::Leaf,
+        ValueMeta::Array(Len { len: 3 }),
+        ValueMeta::Map(MapMeta {
+            len: 1,
+            keys: Some(vec!["a".to_owned()]),
+        }),
+    ]
+    .into_iter()
+    .for_each(|meta| {
+        let queried = Queried {
+            head: range().head,
+            meta: Some(meta),
+        };
+        let bytes = wire::encode(&queried).expect("the answer encodes");
+        assert_eq!(
+            wire::decode::<Queried>(&bytes).expect("it decodes"),
+            queried
+        );
+    });
 }
 
 /// A write crosses whole: namespace, optional path, and a value of every

@@ -36,6 +36,8 @@ pub enum Request {
     Read(Read),
     /// See [`ListNamespaces`].
     ListNamespaces(ListNamespaces),
+    /// See [`Query`].
+    Query(Query),
     /// See [`WeakSet`].
     WeakSet(WeakSet),
     /// See [`WeakPush`].
@@ -104,6 +106,102 @@ pub struct ValueAt {
     /// or the path stops short of anything inside it.
     #[cbor(key = 2)]
     pub value: Option<Value>,
+}
+
+/// Asks the daemon what a path holds, rather than what it is: how many
+/// entries a container has, and the keys of a map.
+///
+/// The answer is about the shape of the value, never the values under it,
+/// so counting a map of ten thousand entries costs one small answer
+/// instead of the whole namespace a [`Read`] would carry back.
+///
+/// Answered with one [`Queried`]: the head and the answer are read under
+/// one borrow of the chain, so the answer is the one that head holds.
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+pub struct Query {
+    #[cbor(key = 1)]
+    pub key: NamespaceKey,
+    /// The path within the namespace, or `None` for its whole value.
+    #[cbor(key = 2)]
+    pub path: Option<SubkeyPath>,
+    #[cbor(key = 3)]
+    pub kind: QueryKind,
+}
+
+/// How much of a container a [`Query`] asks about.
+#[derive(Debug, Copy, Clone, Cbor, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryKind {
+    /// How many entries it holds, and nothing about what they are.
+    Len,
+    /// The keys of a map, alongside the count. An array is answered with
+    /// its length either way: its keys are `0..len`.
+    Keys,
+}
+
+/// Answers [`Query`].
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+pub struct Queried {
+    /// The canonical head the answer was read at.
+    #[cbor(key = 1)]
+    pub head: EnvelopeDigest,
+    /// What the path addresses, or `None` when the namespace is not held
+    /// or the path stops short of anything inside it.
+    #[cbor(key = 2)]
+    pub meta: Option<ValueMeta>,
+}
+
+/// What a queried path holds — never the values themselves.
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ValueMeta {
+    /// A single value — a string, an integer, a bool, or a trusted key.
+    /// Nothing inside it to count or name; a [`Read`] fetches it.
+    Leaf,
+    /// An array, and how many entries it holds.
+    Array(Len),
+    /// A map: how many entries it holds, and their keys when the query
+    /// asked for them.
+    Map(MapMeta),
+}
+
+impl ValueMeta {
+    /// How many entries the container holds; `None` for a leaf, which
+    /// holds none rather than zero.
+    pub fn entries(&self) -> Option<u64> {
+        match self {
+            ValueMeta::Leaf => None,
+            ValueMeta::Array(Len { len }) => Some(*len),
+            ValueMeta::Map(MapMeta { len, .. }) => Some(*len),
+        }
+    }
+
+    /// The shape the path addresses.
+    pub fn shape(&self) -> Shape {
+        match self {
+            ValueMeta::Leaf => Shape::Leaf,
+            ValueMeta::Array(_) => Shape::Array,
+            ValueMeta::Map(_) => Shape::Map,
+        }
+    }
+}
+
+/// How many entries a container holds.
+#[derive(Debug, Copy, Clone, Cbor, PartialEq, Eq)]
+pub struct Len {
+    #[cbor(key = 1)]
+    pub len: u64,
+}
+
+/// A map, as much of it as was asked for.
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+pub struct MapMeta {
+    #[cbor(key = 1)]
+    pub len: u64,
+    /// The entry keys, in key order; `None` when the query asked for the
+    /// length alone, which is not the same as a map with no entries.
+    #[cbor(key = 2)]
+    pub keys: Option<Vec<String>>,
 }
 
 /// Asks the daemon for every namespace the ledger holds and the shape of
@@ -764,6 +862,8 @@ pub enum Response {
     Value(ValueAt),
     /// Answers [`ListNamespaces`].
     Namespaces(NamespaceList),
+    /// Answers [`Query`].
+    Queried(Queried),
     /// Answers every weak write, [`WeakSet`] and its siblings.
     Written(Written),
     /// Answers [`CreateInvite`].
@@ -786,6 +886,7 @@ impl Response {
             Response::Watch(_) => "watch event",
             Response::Value(_) => "value",
             Response::Namespaces(_) => "namespace listing",
+            Response::Queried(_) => "query answer",
             Response::Written(_) => "write outcome",
             Response::Invite(_) => "invite",
             Response::Compacted(_) => "compaction",

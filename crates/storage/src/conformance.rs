@@ -25,7 +25,7 @@ use wire::{
     subkey::{Subkey, SubkeyPath},
 };
 
-use crate::{NamespaceOp, NodeKind, Resolution, Storage, StoredAt};
+use crate::{NamespaceOp, NodeKind, Resolution, Storage, StoredAt, ValueMeta};
 
 /// Instantiates the conformance suite as `#[test]` functions.
 #[macro_export]
@@ -86,6 +86,10 @@ macro_rules! storage_conformance {
         #[test]
         fn conformance_value_at_reads_the_addressed_value() {
             $crate::conformance::value_at_reads_the_addressed_value($make);
+        }
+        #[test]
+        fn conformance_meta_at_counts_and_names_entries() {
+            $crate::conformance::meta_at_counts_and_names_entries($make);
         }
         #[test]
         fn conformance_set_at_does_not_bleed_into_other_versions() {
@@ -756,6 +760,32 @@ pub fn value_at_reads_the_addressed_value<S: Storage>(mut store: S) {
 /// Two siblings write through the same shared parent; each must see only
 /// its own write, and the parent neither. Catches copy-on-write slips
 /// where structural sharing lets a write leak across versions.
+pub fn meta_at_counts_and_names_entries<S: Storage>(mut store: S) {
+    store
+        .install(digest(1), namespaces([("n", nested())]))
+        .expect("install");
+
+    let meta = |p: &[Subkey]| store.meta_at(digest(1), &key("n"), p).expect("meta_at");
+
+    assert_eq!(
+        meta(&[]),
+        Some(ValueMeta::Map {
+            keys: vec!["a".to_string(), "list".to_string()],
+        })
+    );
+    assert_eq!(meta(&[sub("list")]), Some(ValueMeta::Array { len: 2 }));
+    assert_eq!(meta(&[sub("a"), sub("b")]), Some(ValueMeta::Leaf));
+    // Nothing there, and nowhere to walk: both are absent, not empty.
+    assert_eq!(meta(&[sub("missing")]), None);
+    assert_eq!(meta(&[sub("a"), sub("b"), sub("c")]), None);
+    assert_eq!(
+        store
+            .meta_at(digest(1), &key("missing"), &[])
+            .expect("meta_at"),
+        None
+    );
+}
+
 pub fn set_at_does_not_bleed_into_other_versions<S: Storage>(mut store: S) {
     store
         .install(digest(1), namespaces([("n", nested())]))

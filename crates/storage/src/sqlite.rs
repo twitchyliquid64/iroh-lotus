@@ -70,7 +70,7 @@ use wire::{
     subkey::Subkey,
 };
 
-use crate::{LogEntry, NamespaceOp, NodeKind, Resolution, Storage, StoredAt};
+use crate::{LogEntry, NamespaceOp, NodeKind, Resolution, Storage, StoredAt, ValueMeta};
 
 /// The errors the SQLite backend can produce.
 #[derive(Debug, thiserror::Error)]
@@ -205,6 +205,28 @@ impl SqliteStorage {
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
         Ok(Self { conn })
+    }
+
+    /// The node `path` addresses inside the namespace under `key` at
+    /// `head` — `None` when the version holds no such namespace or the
+    /// walk stops short. O(path) row lookups, reading no value.
+    fn walk(
+        &self,
+        head: EnvelopeDigest,
+        key: &NamespaceKey,
+        path: &[Subkey],
+    ) -> Result<Option<i64>, Error> {
+        let Some(root) = namespace_root(&self.conn, head, key)? else {
+            return Ok(None);
+        };
+        path.iter().try_fold(Some(root), |node, segment| {
+            let Some(node) = node else { return Ok(None) };
+            match (node_kind(&self.conn, node)?, segment) {
+                (NodeKind::Map, Subkey::Key(key)) => map_child(&self.conn, node, key),
+                (NodeKind::Array, Subkey::Index(idx)) => array_child(&self.conn, node, *idx),
+                _ => Ok(None),
+            }
+        })
     }
 
     /// Every `(key, root)` of the version at `head`, in key order — the
@@ -680,18 +702,40 @@ impl Storage for SqliteStorage {
         key: &NamespaceKey,
         path: &[Subkey],
     ) -> Result<Option<Value>, Error> {
-        let Some(root) = namespace_root(&self.conn, head, key)? else {
+        self.walk(head, key, path)?
+            .map(|id| value_of(&self.conn, id))
+            .transpose()
+    }
+
+    fn meta_at(
+        &self,
+        head: EnvelopeDigest,
+        key: &NamespaceKey,
+        path: &[Subkey],
+    ) -> Result<Option<ValueMeta>, Error> {
+        let Some(node) = self.walk(head, key, path)? else {
             return Ok(None);
         };
-        let target = path.iter().try_fold(Some(root), |node, segment| {
-            let Some(node) = node else { return Ok(None) };
-            match (node_kind(&self.conn, node)?, segment) {
-                (NodeKind::Map, Subkey::Key(key)) => map_child(&self.conn, node, key),
-                (NodeKind::Array, Subkey::Index(idx)) => array_child(&self.conn, node, *idx),
-                _ => Ok(None),
-            }
-        })?;
-        target.map(|id| value_of(&self.conn, id)).transpose()
+        match node_kind(&self.conn, node)? {
+            NodeKind::Leaf => Ok(Some(ValueMeta::Leaf)),
+            NodeKind::Array => Ok(Some(ValueMeta::Array {
+                len: self
+                    .conn
+                    .prepare_cached("SELECT COUNT(*) FROM array_edges WHERE parent = ?1")?
+                    .query_row([node], |row| row.get::<_, i64>(0))
+                    .map(|len| u64::try_from(len).expect("a COUNT is never negative"))?,
+            })),
+            // One index range scan over `map_edges`, which is ordered by
+            // key: the entries are named without a value tree behind any
+            // of them being read.
+            NodeKind::Map => Ok(Some(ValueMeta::Map {
+                keys: self
+                    .conn
+                    .prepare_cached("SELECT key FROM map_edges WHERE parent = ?1 ORDER BY key")?
+                    .query_map([node], |row| row.get(0))?
+                    .collect::<Result<_, _>>()?,
+            })),
+        }
     }
 
     fn namespace(

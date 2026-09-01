@@ -3,8 +3,8 @@
 use crate::{
     ChainRange, Compact, Compacted, CreateInvite, EnvelopeFrame, Error, GetChainRange,
     GetEnvelopes, GetStatus, GetVersion, InviteCode, ListNamespaces, NamespaceList, NodeStatus,
-    Read, Request, Response, ValueAt, Watch, WatchEvent, WeakDelete, WeakDeleteMatching,
-    WeakIncrement, WeakPush, WeakSet, Written,
+    Queried, Query, Read, Request, Response, ValueAt, Watch, WatchEvent, WeakDelete,
+    WeakDeleteMatching, WeakIncrement, WeakPush, WeakSet, Written,
 };
 
 /// One method of the local control protocol.
@@ -67,6 +67,7 @@ methods! {
     "watch": Watch => Watch(WatchEvent),
     "read": Read => Value(ValueAt),
     "list namespaces": ListNamespaces => Namespaces(NamespaceList),
+    "query": Query => Queried(Queried),
     "weak set": WeakSet => Written(Written),
     "weak push": WeakPush => Written(Written),
     "weak delete": WeakDelete => Written(Written),

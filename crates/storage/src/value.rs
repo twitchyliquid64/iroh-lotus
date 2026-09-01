@@ -14,7 +14,7 @@ use wire::{
     subkey::{Subkey, SubkeyPath},
 };
 
-use crate::{NodeKind, Resolution};
+use crate::{NodeKind, Resolution, ValueMeta};
 
 /// The kind of node `value` is.
 pub fn kind(value: &Value) -> NodeKind {
@@ -22,6 +22,19 @@ pub fn kind(value: &Value) -> NodeKind {
         Value::Map(_) => NodeKind::Map,
         Value::Array(_) => NodeKind::Array,
         Value::String(_) | Value::Int(_) | Value::Bool(_) | Value::Key(_) => NodeKind::Leaf,
+    }
+}
+
+/// What `value` holds: nothing, a count, or the keys of a map.
+pub fn meta(value: &Value) -> ValueMeta {
+    match value {
+        Value::Map(entries) => ValueMeta::Map {
+            keys: entries.keys().cloned().collect(),
+        },
+        Value::Array(items) => ValueMeta::Array {
+            len: u64::try_from(items.len()).expect("a Vec's length fits a u64"),
+        },
+        Value::String(_) | Value::Int(_) | Value::Bool(_) | Value::Key(_) => ValueMeta::Leaf,
     }
 }
 

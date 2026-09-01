@@ -12,7 +12,7 @@ use wire::{
     subkey::Subkey,
 };
 
-use crate::{LogEntry, NamespaceOp, Resolution, Storage, StoredAt, value};
+use crate::{LogEntry, NamespaceOp, Resolution, Storage, StoredAt, ValueMeta, value};
 
 // Arc-shared with the versions derived from it; a commit clones the map
 // of pointers and copy-on-writes only what it touches.
@@ -69,6 +69,18 @@ impl Storage for MemStorage {
             .version(head)
             .get(key)
             .and_then(|namespace| value::walk(&namespace.value, path).cloned()))
+    }
+
+    fn meta_at(
+        &self,
+        head: EnvelopeDigest,
+        key: &NamespaceKey,
+        path: &[Subkey],
+    ) -> Result<Option<ValueMeta>, Infallible> {
+        Ok(self
+            .version(head)
+            .get(key)
+            .and_then(|namespace| value::walk(&namespace.value, path).map(value::meta)))
     }
 
     fn namespace(

@@ -331,6 +331,70 @@ async fn list_names_every_namespace_and_its_shape() {
     );
 }
 
+/// `len` reports the size of what a path addresses, and `keys` names its
+/// entries, at the head each was read at.
+#[tokio::test]
+async fn len_and_keys_report_a_container_without_its_values() {
+    let node = alone().await;
+    let written = json(
+        &node.dir,
+        &["set", "cfg", r#"{"servers": ["a.example", "b.example"]}"#],
+    )
+    .await;
+    let head = digest_in(&written, "head");
+
+    let counted = json(&node.dir, &["len", "cfg", "servers"]).await;
+    assert_eq!(digest_in(&counted, "head"), head);
+    assert_eq!(counted["shape"], "array");
+    assert_eq!(counted["len"], 2);
+
+    let listed = json(&node.dir, &["keys", "cfg"]).await;
+    assert_eq!(digest_in(&listed, "head"), head);
+    assert_eq!(listed["keys"], serde_json::json!(["servers"]));
+
+    // An array is named by the indices its length covers.
+    let listed = json(&node.dir, &["keys", "cfg", "servers"]).await;
+    assert_eq!(listed["keys"], serde_json::json!(["0", "1"]));
+
+    assert_eq!(
+        output(&node.dir, &["len", "cfg", "servers"]).await,
+        format!("head   {head}\nshape  array\nlen    2\n")
+    );
+    assert_eq!(
+        output(&node.dir, &["keys", "cfg", "servers"]).await,
+        format!("head  {head}\n0\n1\n")
+    );
+}
+
+/// A leaf holds no entries and has no keys, and a path addressing nothing
+/// says so rather than reporting an empty container.
+#[tokio::test]
+async fn len_and_keys_tell_a_leaf_and_a_missing_path_apart() {
+    let node = alone().await;
+    let written = json(&node.dir, &["set", "cfg", r#"{"port": 80}"#]).await;
+    let head = digest_in(&written, "head");
+
+    let counted = json(&node.dir, &["len", "cfg", "port"]).await;
+    assert_eq!(counted["shape"], "leaf");
+    assert_eq!(counted["len"], serde_json::Value::Null);
+    assert_eq!(
+        output(&node.dir, &["keys", "cfg", "port"]).await,
+        format!("head  {head}\n— (a leaf has no keys)\n")
+    );
+
+    let counted = json(&node.dir, &["len", "cfg", "nope"]).await;
+    assert_eq!(counted["shape"], serde_json::Value::Null);
+    assert_eq!(counted["len"], serde_json::Value::Null);
+    assert_eq!(
+        output(&node.dir, &["len", "cfg", "nope"]).await,
+        format!("head   {head}\nshape  — (not set)\n")
+    );
+    assert_eq!(
+        json(&node.dir, &["keys", "missing"]).await["keys"],
+        serde_json::Value::Null
+    );
+}
+
 /// A namespace deleted leaves the listing.
 #[tokio::test]
 async fn list_drops_a_deleted_namespace() {

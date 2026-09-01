@@ -60,8 +60,11 @@ You can think of data in lotus as JSON documents, stored in _namespaces_.
 # Sets the `web` namespace to the provided object
 lotusctl set web '{"port": 443, "hosts": ["a.example"], "replicas": 3}'
 
-lotusctl get web       # Read whole namespace
-lotusctl get web port  # Reads a field from the object in the namespace
+lotusctl get web         # Reads whole `web` namespace
+lotusctl len web hosts   # Counts the entries in the container at the `hosts` JSONPath in the `web` namespace
+lotusctl keys web        # Lists the keys in the `web` namespace
+
+lotusctl get web port    # Reads the value in the `web` namespace at the `port` JSONPath
 ```
 
 ```

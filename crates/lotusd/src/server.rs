@@ -12,7 +12,7 @@ use std::{
 use iroh::{Endpoint, EndpointAddr};
 use lotusd_rpc as rpc;
 use state::Insert;
-use storage::{LogEntry, NodeKind, StoredAt};
+use storage::{LogEntry, NodeKind, StoredAt, ValueMeta};
 use tokio::{
     net::{UnixListener, UnixStream},
     sync::{mpsc, oneshot},
@@ -83,6 +83,7 @@ enum ServerMsg {
     Peers(Responder<Vec<PeerStatus>, ()>),
     Identity(Responder<Identity, ()>),
     Read(rpc::Read, Responder<rpc::ValueAt, ChainError>),
+    Query(rpc::Query, Responder<rpc::Queried, ChainError>),
     Namespaces(Responder<rpc::NamespaceList, ChainError>),
     WeakWrite(WeakWrite, Responder<rpc::Written, ChainError>),
     Compact(Responder<Compacted, CompactError>),
@@ -427,6 +428,14 @@ impl Server {
                     .map(|(head, value)| rpc::ValueAt { head, value })
                     .map_err(ChainError::Storage),
             ),
+            ServerMsg::Query(query, r) => r.respond(
+                core.meta(&query.key, query.path.as_ref())
+                    .map(|(head, meta)| rpc::Queried {
+                        head,
+                        meta: meta.map(|meta| value_meta(meta, query.kind)),
+                    })
+                    .map_err(ChainError::Storage),
+            ),
             ServerMsg::Namespaces(r) => r.respond(
                 core.namespaces()
                     .map(|(head, namespaces)| rpc::NamespaceList {
@@ -587,6 +596,20 @@ fn shape(kind: NodeKind) -> rpc::Shape {
     }
 }
 
+/// What a queried path holds, as the control protocol spells it. A
+/// map's keys are read either way — they are the same index scan that
+/// counts them — and are sent only when they were asked for.
+fn value_meta(meta: ValueMeta, kind: rpc::QueryKind) -> rpc::ValueMeta {
+    match meta {
+        ValueMeta::Leaf => rpc::ValueMeta::Leaf,
+        ValueMeta::Array { len } => rpc::ValueMeta::Array(rpc::Len { len }),
+        ValueMeta::Map { keys } => rpc::ValueMeta::Map(rpc::MapMeta {
+            len: u64::try_from(keys.len()).expect("a Vec's length fits a u64"),
+            keys: matches!(kind, rpc::QueryKind::Keys).then_some(keys),
+        }),
+    }
+}
+
 /// The mainloop's side of the network: the actors it owns and the
 /// endpoint they share.
 #[derive(Debug)]
@@ -681,6 +704,14 @@ impl rpc::Handler for Rpc {
                     .await
                     .map_err(|err| rpc::Failure::internal(err.to_string()))?;
                 responses.send(rpc::Response::Value(value)).await
+            }
+            rpc::Request::Query(query) => {
+                let queried = self
+                    .0
+                    .query(query)
+                    .await
+                    .map_err(|err| rpc::Failure::internal(err.to_string()))?;
+                responses.send(rpc::Response::Queried(queried)).await
             }
             rpc::Request::ListNamespaces(_) => {
                 let list = self
@@ -1104,6 +1135,15 @@ impl ServerHandle {
     pub async fn read(&self, read: rpc::Read) -> Result<rpc::ValueAt, RequestError> {
         let (send, recv) = Responder::channel();
         let _ = self.0.send(ServerMsg::Read(read, send)).await;
+        Self::answer(recv.await)
+    }
+
+    /// Answers what the value `query` addresses holds — its size, and a
+    /// map's keys — at the head the core stands at, without reading the
+    /// value itself.
+    pub async fn query(&self, query: rpc::Query) -> Result<rpc::Queried, RequestError> {
+        let (send, recv) = Responder::channel();
+        let _ = self.0.send(ServerMsg::Query(query, send)).await;
         Self::answer(recv.await)
     }
 

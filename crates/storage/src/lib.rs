@@ -57,6 +57,19 @@ pub enum NodeKind {
     Leaf,
 }
 
+/// What a node holds, counted and named rather than materialized: the
+/// answer for a reader that wants the size or the keys of a container
+/// without the values under it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValueMeta {
+    /// A leaf holds nothing a path reaches into.
+    Leaf,
+    /// How many entries an array holds; its keys are `0..len`.
+    Array { len: u64 },
+    /// A map's entry keys, in key order.
+    Map { keys: Vec<String> },
+}
+
 /// How far a walk down a namespace's value tree got.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resolution {
@@ -168,6 +181,28 @@ pub trait Storage {
         Ok(self
             .namespace(head, key)?
             .and_then(|namespace| value::walk(&namespace.value, path).cloned()))
+    }
+
+    /// What the value `path` addresses inside the namespace stored under
+    /// `key` in the version at `head` holds — `None` when that version
+    /// holds no such namespace or the path stops short. The empty path
+    /// asks about the namespace's whole value.
+    ///
+    /// [`value_at`](Storage::value_at) for a reader after the size or the
+    /// keys of a container rather than the container: nothing below the
+    /// addressed node is materialized.
+    ///
+    /// The default materializes the namespace and walks it in memory; a
+    /// backend that stores the tree decomposed should override it.
+    fn meta_at(
+        &self,
+        head: EnvelopeDigest,
+        key: &NamespaceKey,
+        path: &[Subkey],
+    ) -> Result<Option<ValueMeta>, Self::Error> {
+        Ok(self
+            .namespace(head, key)?
+            .and_then(|namespace| value::walk(&namespace.value, path).map(value::meta)))
     }
 
     /// Materializes the whole namespace stored under `key` in the version
