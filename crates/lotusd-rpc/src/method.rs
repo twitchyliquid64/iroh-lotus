@@ -26,13 +26,32 @@ pub trait Method: Into<Request> {
     fn read(response: Response) -> Result<Self::Response, Error>;
 }
 
+/// A method the daemon answers with exactly one response, so [`call`] can
+/// hand it back unwrapped. The others — a watch, a walk of the chain —
+/// stream, and are read through [`Call`].
+///
+/// [`call`]: crate::call
+/// [`Call`]: crate::Call
+pub trait AnsweredOnce: Method {}
+
 /// Declares the methods of the protocol, pairing each request payload with
 /// the [`Response`] variant that answers it.
 ///
 /// Kept in one place so a new method cannot be half-added: a request whose
-/// response variant is never named, or the reverse, does not compile.
+/// response variant is never named, or the reverse, does not compile. Each
+/// says whether it is answered `once` or `many` times, which is what lets
+/// [`call`](crate::call) refuse a streaming method.
+macro_rules! answered {
+    (once, $request:ident) => {
+        impl AnsweredOnce for $request {}
+    };
+    (many, $request:ident) => {};
+}
+
 macro_rules! methods {
-    ($($name:literal: $request:ident => $variant:ident($response:ty)),* $(,)?) => {$(
+    ($($name:literal: $request:ident => $answers:ident $variant:ident($response:ty)),* $(,)?) => {$(
+        answered!($answers, $request);
+
         impl From<$request> for Request {
             fn from(request: $request) -> Self {
                 Request::$request(request)
@@ -60,19 +79,19 @@ macro_rules! methods {
 }
 
 methods! {
-    "version": GetVersion => Version(String),
-    "chain range": GetChainRange => ChainRange(ChainRange),
-    "status": GetStatus => Status(NodeStatus),
-    "envelopes": GetEnvelopes => Envelope(EnvelopeFrame),
-    "watch": Watch => Watch(WatchEvent),
-    "read": Read => Value(ValueAt),
-    "list namespaces": ListNamespaces => Namespaces(NamespaceList),
-    "query": Query => Queried(Queried),
-    "weak set": WeakSet => Written(Written),
-    "weak push": WeakPush => Written(Written),
-    "weak delete": WeakDelete => Written(Written),
-    "weak increment": WeakIncrement => Written(Written),
-    "weak delete matching": WeakDeleteMatching => Written(Written),
-    "create invite": CreateInvite => Invite(InviteCode),
-    "compact": Compact => Compacted(Compacted),
+    "version": GetVersion => once Version(String),
+    "chain range": GetChainRange => once ChainRange(ChainRange),
+    "status": GetStatus => once Status(NodeStatus),
+    "envelopes": GetEnvelopes => many Envelope(EnvelopeFrame),
+    "watch": Watch => many Watch(WatchEvent),
+    "read": Read => once Value(ValueAt),
+    "list namespaces": ListNamespaces => once Namespaces(NamespaceList),
+    "query": Query => once Queried(Queried),
+    "weak set": WeakSet => once Written(Written),
+    "weak push": WeakPush => once Written(Written),
+    "weak delete": WeakDelete => once Written(Written),
+    "weak increment": WeakIncrement => once Written(Written),
+    "weak delete matching": WeakDeleteMatching => once Written(Written),
+    "create invite": CreateInvite => once Invite(InviteCode),
+    "compact": Compact => once Compacted(Compacted),
 }

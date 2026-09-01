@@ -2088,16 +2088,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "lotus-sdk"
+version = "0.0.1"
+dependencies = [
+ "dirs",
+ "lotusd",
+ "lotusd-rpc",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-stream",
+ "wire",
+]
+
+[[package]]
 name = "lotusctl"
 version = "0.0.1"
 dependencies = [
  "chrono",
  "clap",
  "clap_complete",
- "dirs",
  "iroh",
+ "lotus-sdk",
  "lotusd",
- "lotusd-rpc",
  "render",
  "serde",
  "serde_json",
@@ -2150,6 +2163,7 @@ dependencies = [
  "serde",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-stream",
  "wire",
 ]
 

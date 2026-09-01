@@ -2,21 +2,22 @@ use std::{collections::BTreeMap, fmt, path::PathBuf, process::ExitCode, time::Du
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
-use lotusd_rpc::{
-    Call, ChainWalk, Compact, Compacted, CreateInvite, EnvelopeFrame, GetChainRange, GetEnvelopes,
-    GetStatus, GetVersion, InviteCode, Len, ListNamespaces, MapMeta, NamespaceChange,
-    NamespaceList, NodeStatus, Queried, Query, QueryKind, Read, Shape, ValueAt, ValueMeta, Watch,
-    WatchEvent, WatchSelector, WeakDelete, WeakDeleteMatching, WeakIncrement, WeakPush, WeakSet,
-    WriteOutcome, Written, call,
+use lotus_sdk::{
+    Client,
+    rpc::{
+        AnsweredOnce, ChainWalk, Compacted, EnvelopeFrame, GetEnvelopes, InviteCode, Len, MapMeta,
+        Method, NamespaceChange, NamespaceList, NodeStatus, Queried, QueryKind, Shape, ValueAt,
+        ValueMeta, WatchEvent, WatchSelector, WeakDelete, WeakDeleteMatching, WeakIncrement,
+        WeakPush, WeakSet, WriteOutcome, Written,
+    },
+    wire::{
+        EnvelopeDigest,
+        msg::{Match, NamespaceKey, Predicate, Value},
+        subkey::SubkeyPath,
+    },
 };
 use render::{ColorChoice, Entry, Render};
-use tokio::net::UnixStream;
 use tokio::runtime::Builder;
-use wire::{
-    EnvelopeDigest,
-    msg::{Match, NamespaceKey, Predicate, Value},
-    subkey::SubkeyPath,
-};
 
 #[derive(Parser)]
 #[command(name = "lotusctl", version = version::VERSION, long_version = version::LONG_VERSION)]
@@ -692,7 +693,7 @@ impl WatchCommand {
     fn selector(&self) -> WatchSelector {
         match (&self.key, &self.path, self.envelope) {
             (Some(key), None, _) => WatchSelector::Namespace(key.clone()),
-            (Some(key), Some(path), _) => WatchSelector::Path(lotusd_rpc::WatchPath {
+            (Some(key), Some(path), _) => WatchSelector::Path(lotus_sdk::rpc::WatchPath {
                 key: key.clone(),
                 path: path.clone(),
             }),
@@ -802,19 +803,14 @@ enum Format {
 
 impl GlobalArgs {
     /// StateDir returns the directory where daemon state is stored: the `--state-dir`
-    /// override (or `LOTUS_STATE_DIR`) when given, otherwise `iroh-lotus` under the
-    /// platform state directory (`$XDG_STATE_HOME`, falling back to `~/.local/state`,
-    /// on Linux).
+    /// override (or `LOTUS_STATE_DIR`) when given, otherwise where `lotusd` keeps it
+    /// by default — see [`lotus_sdk::state_dir`].
     ///
     /// Fails only when no home directory can be determined.
     fn state_dir(&self) -> Result<PathBuf, MainError> {
         self.state_dir
             .clone()
-            .or_else(|| {
-                dirs::state_dir()
-                    .or_else(dirs::data_local_dir)
-                    .map(|dir| dir.join("iroh-lotus"))
-            })
+            .or_else(lotus_sdk::state_dir)
             .ok_or_else(|| {
                 MainError::Other(
                     "no state directory found; pass --state-dir to set one".to_string(),
@@ -822,9 +818,9 @@ impl GlobalArgs {
             })
     }
 
-    /// The path to the local control socket.
-    fn local_sock_path(&self) -> Result<PathBuf, MainError> {
-        self.state_dir().map(|sd| sd.join("local.sock"))
+    /// The daemon in the state directory.
+    fn client(&self) -> Result<Client, MainError> {
+        self.state_dir().map(Client::in_state_dir)
     }
 }
 
@@ -949,29 +945,29 @@ async fn async_main() -> Result<(), MainError> {
             clap_complete::generate(args.shell, &mut cmd, name, &mut std::io::stdout());
         }
         Command::Chain(args) => {
-            let path = cli.global_args.local_sock_path()?;
-            let frames = envelopes(&path, GetEnvelopes::walk(args.walk())).await?;
+            let client = cli.global_args.client()?;
+            let frames = envelopes(&client, GetEnvelopes::walk(args.walk())).await?;
 
             match cli.global_args.format {
                 Format::Json => print_json(&frames)?,
                 Format::Text => print!(
                     "{}",
-                    renderer(&cli.global_args, &path)
+                    renderer(&cli.global_args, &client)
                         .await?
-                        .with_header(path.display().to_string())
+                        .with_header(client.socket_path().display().to_string())
                         .chain(&entries(frames))
                 ),
             }
         }
         Command::Show(args) => {
-            let path = cli.global_args.local_sock_path()?;
-            let frames = envelopes(&path, GetEnvelopes::digests(args.digests.clone())).await?;
+            let client = cli.global_args.client()?;
+            let frames = envelopes(&client, GetEnvelopes::digests(args.digests.clone())).await?;
             let missing = missing(&args.digests, &frames);
 
             match cli.global_args.format {
                 Format::Json => print_json(&frames)?,
                 Format::Text => {
-                    let render = renderer(&cli.global_args, &path).await?;
+                    let render = renderer(&cli.global_args, &client).await?;
                     entries(frames)
                         .iter()
                         .for_each(|entry| print!("{}", render.envelope(entry)));
@@ -992,16 +988,11 @@ async fn async_main() -> Result<(), MainError> {
             }
         }
         Command::Get(args) => {
-            let path = cli.global_args.local_sock_path()?;
-            let at = call(
-                connect(&path).await?,
-                Read {
-                    key: args.target.key.clone(),
-                    path: args.target.path.clone(),
-                },
-            )
-            .await
-            .map_err(MainError::Rpc)?;
+            let at = cli
+                .global_args
+                .client()?
+                .read(args.target.key.clone(), args.target.path.clone())
+                .await?;
             let line = ValueLine::new(at, args.values.tagged)?;
 
             match cli.global_args.format {
@@ -1010,10 +1001,7 @@ async fn async_main() -> Result<(), MainError> {
             }
         }
         Command::List => {
-            let path = cli.global_args.local_sock_path()?;
-            let list = call(connect(&path).await?, ListNamespaces {})
-                .await
-                .map_err(MainError::Rpc)?;
+            let list = cli.global_args.client()?.list_namespaces().await?;
 
             match cli.global_args.format {
                 Format::Text => print!("{}", ListText(&list)),
@@ -1101,16 +1089,11 @@ async fn async_main() -> Result<(), MainError> {
             .await?
         }
         Command::Invite(args) => {
-            let path = cli.global_args.local_sock_path()?;
-            let code = call(
-                connect(&path).await?,
-                CreateInvite {
-                    weight: args.weight,
-                    ttl_millis: u64::try_from(args.ttl.as_millis()).unwrap_or(u64::MAX),
-                },
-            )
-            .await
-            .map_err(MainError::Rpc)?;
+            let code = cli
+                .global_args
+                .client()?
+                .invite(args.weight, args.ttl)
+                .await?;
             let line = InviteLine::from(code);
 
             match cli.global_args.format {
@@ -1119,10 +1102,7 @@ async fn async_main() -> Result<(), MainError> {
             }
         }
         Command::Compact => {
-            let path = cli.global_args.local_sock_path()?;
-            let compacted = call(connect(&path).await?, Compact {})
-                .await
-                .map_err(MainError::Rpc)?;
+            let compacted = cli.global_args.client()?.compact().await?;
 
             match cli.global_args.format {
                 Format::Text => print!("{}", CompactedLine(&compacted)),
@@ -1130,10 +1110,7 @@ async fn async_main() -> Result<(), MainError> {
             }
         }
         Command::Status => {
-            let path = cli.global_args.local_sock_path()?;
-            let status = call(connect(&path).await?, GetStatus {})
-                .await
-                .map_err(MainError::Rpc)?;
+            let status = cli.global_args.client()?.status().await?;
 
             match cli.global_args.format {
                 Format::Text => print!("{}", StatusText(&status)),
@@ -1141,20 +1118,12 @@ async fn async_main() -> Result<(), MainError> {
             }
         }
         Command::Watch(args) => {
-            let path = cli.global_args.local_sock_path()?;
-            let mut call = Call::send(
-                connect(&path).await?,
-                Watch {
-                    selector: args.selector(),
-                },
-            )
-            .await
-            .map_err(MainError::Rpc)?;
+            let mut watch = cli.global_args.client()?.watch(args.selector()).await?;
 
             let mut seen = 0;
             // Ends when the daemon stops answering, or when enough has been
             // seen; dropping the call is what unsubscribes.
-            while let Some(event) = call.next().await.map_err(MainError::Rpc)? {
+            while let Some(event) = watch.next().await? {
                 let line = WatchLine::from(event);
                 match cli.global_args.format {
                     Format::Text => print!("{line}"),
@@ -1175,10 +1144,7 @@ async fn async_main() -> Result<(), MainError> {
             }
         }
         Command::Version => {
-            let path = cli.global_args.local_sock_path()?;
-            let daemon = call(connect(&path).await?, GetVersion {})
-                .await
-                .map_err(MainError::Rpc)?;
+            let daemon = cli.global_args.client()?.version().await?;
 
             let versions = Versions {
                 client: version::VERSION.to_string(),
@@ -1300,28 +1266,18 @@ fn plural(n: usize, one: &'static str, many: &'static str) -> &'static str {
 
 /// Asks the daemon what `target` holds, in as much detail as `kind`.
 async fn query(args: &GlobalArgs, target: &Target, kind: QueryKind) -> Result<Queried, MainError> {
-    let path = args.local_sock_path()?;
-    call(
-        connect(&path).await?,
-        Query {
-            key: target.key.clone(),
-            path: target.path.clone(),
-            kind,
-        },
-    )
-    .await
-    .map_err(MainError::Rpc)
+    Ok(args
+        .client()?
+        .query(target.key.clone(), target.path.clone(), kind)
+        .await?)
 }
 
 /// Sends one weak write to the daemon and prints what it did.
 async fn write<M>(args: &GlobalArgs, request: M) -> Result<(), MainError>
 where
-    M: lotusd_rpc::Method<Response = Written>,
+    M: AnsweredOnce + Method<Response = Written>,
 {
-    let path = args.local_sock_path()?;
-    let written = call(connect(&path).await?, request)
-        .await
-        .map_err(MainError::Rpc)?;
+    let written = args.client()?.call(request).await?;
     let line = WrittenLine::from(written);
 
     match args.format {
@@ -1333,18 +1289,10 @@ where
 
 /// Fetches whatever `request` selects, reading the stream to its end.
 async fn envelopes(
-    path: &std::path::Path,
+    client: &Client,
     request: GetEnvelopes,
 ) -> Result<Vec<EnvelopeFrame>, MainError> {
-    let mut call = Call::send(connect(path).await?, request)
-        .await
-        .map_err(MainError::Rpc)?;
-
-    let mut frames = Vec::new();
-    while let Some(frame) = call.next().await.map_err(MainError::Rpc)? {
-        frames.push(frame);
-    }
-    Ok(frames)
+    Ok(client.envelopes(request).await?.collect().await?)
 }
 
 /// The envelopes the frames carry, ready to render: the verification
@@ -1370,27 +1318,18 @@ fn missing(asked: &[EnvelopeDigest], frames: &[EnvelopeFrame]) -> Vec<EnvelopeDi
         .collect()
 }
 
-/// A renderer that marks the ends of the chain the daemon at `path` holds.
+/// A renderer that marks the ends of the chain `client`'s daemon holds.
 ///
 /// A second connection — one carries one request — so the chain can move
 /// between reading it and reading the envelopes. The cost is a stale mark
 /// on a printout, never a wrong envelope.
-async fn renderer(args: &GlobalArgs, path: &std::path::Path) -> Result<Render, MainError> {
-    let range = call(connect(path).await?, GetChainRange {})
-        .await
-        .map_err(MainError::Rpc)?;
+async fn renderer(args: &GlobalArgs, client: &Client) -> Result<Render, MainError> {
+    let range = client.chain_range().await?;
 
     Ok(Render::new()
         .with_palette(args.color.palette(&std::io::stdout()))
         .with_root(range.root)
         .with_head(range.head))
-}
-
-/// Connects to the daemon's control socket.
-async fn connect(path: &std::path::Path) -> Result<UnixStream, MainError> {
-    UnixStream::connect(path)
-        .await
-        .map_err(|e| MainError::IO(e, "connecting to the control socket"))
 }
 
 /// Renders one JSON object.
@@ -1408,9 +1347,15 @@ fn print_json<T: serde::Serialize>(value: &T) -> Result<(), MainError> {
 pub enum MainError {
     IO(std::io::Error, &'static str),
     /// The daemon could not be reached, or would not answer.
-    Rpc(lotusd_rpc::Error),
+    Daemon(lotus_sdk::Error),
     Json(serde_json::Error),
     Other(String),
+}
+
+impl From<lotus_sdk::Error> for MainError {
+    fn from(err: lotus_sdk::Error) -> Self {
+        MainError::Daemon(err)
+    }
 }
 
 #[cfg(test)]

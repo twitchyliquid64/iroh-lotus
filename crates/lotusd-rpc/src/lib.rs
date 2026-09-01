@@ -8,7 +8,7 @@
 //! Frames are canonical CBOR, as on the ledger wire: everything moves
 //! through [`wire::encode`] and [`wire::decode`].
 //!
-//! A method is declared once, in [`method`], which pairs the request type
+//! A method is declared once, as a [`Method`], which pairs the request type
 //! with the response variant it is answered by. Clients reach it through
 //! [`call`] or [`Call`], the daemon through [`serve`] and [`Handler`].
 
@@ -30,7 +30,7 @@ pub use proto::{
 };
 
 mod method;
-pub use method::Method;
+pub use method::{AnsweredOnce, Method};
 
 mod client;
 pub use client::{Call, call};

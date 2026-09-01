@@ -9,7 +9,7 @@ publish.workspace = true
 [dependencies]
 iroh.workspace = true
 storage.workspace = true
-wire.workspace = true
+wire = { workspace = true, features = ["iroh"] }
 
 [dev-dependencies]
 ed25519-zebra.workspace = true

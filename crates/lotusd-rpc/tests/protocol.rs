@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use lotusd_rpc::{
     Call, ChainRange, ChainWalk, Changed, Compact, Compacted, EnvelopeFrame, EnvelopeSelector,
     Error, Failure, FailureKind, GetChainRange, GetEnvelopes, GetVersion, Handler, InviteCode, Len,
-    ListNamespaces, MAX_FRAME_LEN, MapMeta, NamespaceChange, NamespaceEntry, NamespaceList,
+    ListNamespaces, MAX_FRAME_LEN, MapMeta, Method, NamespaceChange, NamespaceEntry, NamespaceList,
     NodeStatus, Queried, Query, QueryKind, Read, Reorged, Request, Response, Responses, Shape,
     ValueAt, ValueMeta, Verification, Watch, WatchEvent, WatchPath, WatchSelector, WeakDelete,
     WeakDeleteMatching, WeakIncrement, WeakPush, WeakSet, WriteOutcome, Written, call, serve,
@@ -306,6 +306,18 @@ impl Handler for Fake {
     }
 }
 
+/// The first answer to a streaming method, for the tests about what one
+/// frame carries rather than how many there are.
+async fn first<M: Method>(stream: DuplexStream, method: M) -> M::Response {
+    Call::send(stream, method)
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .expect("at least one answer")
+}
+
 /// Serves `handler` on one end of an in-memory pipe, handing back the other.
 fn connect(mut handler: Fake) -> DuplexStream {
     let (client, mut server) = duplex(64 * 1024);
@@ -493,14 +505,13 @@ async fn a_watch_carries_its_selector_across() {
 /// orphan set.
 #[tokio::test]
 async fn a_watch_event_carries_the_whole_change_across() {
-    let event = call(
+    let event = first(
         connect(Fake::new()),
         Watch {
             selector: WatchSelector::Head,
         },
     )
-    .await
-    .unwrap();
+    .await;
 
     assert_eq!(event, WatchEvent::Changed(changed()));
 }
@@ -550,11 +561,31 @@ async fn get_envelopes_streams_one_frame_per_envelope() {
 /// The verification status is outside an envelope's canonical encoding, so
 /// it has to travel beside it — otherwise every fetched envelope reads as
 /// unchecked however the sending node scored it.
+/// A call reads the same through the `Stream` trait as by hand, and ends
+/// where the daemon stops.
 #[tokio::test]
-async fn an_envelope_frame_carries_the_verification_status_beside_the_envelope() {
-    let frame = call(connect(Fake::new()), GetEnvelopes::newest(1))
+async fn a_call_is_a_stream_of_its_answers() {
+    let mut by_hand = Call::send(connect(Fake::new()), GetEnvelopes::chain())
         .await
         .unwrap();
+    let mut expected = Vec::new();
+    while let Some(frame) = by_hand.next().await.unwrap() {
+        expected.push(frame);
+    }
+    assert!(!expected.is_empty());
+
+    let call = Call::send(connect(Fake::new()), GetEnvelopes::chain())
+        .await
+        .unwrap();
+    let frames: Vec<_> = tokio_stream::StreamExt::collect::<Result<_, _>>(call)
+        .await
+        .unwrap();
+    assert_eq!(frames, expected);
+}
+
+#[tokio::test]
+async fn an_envelope_frame_carries_the_verification_status_beside_the_envelope() {
+    let frame = first(connect(Fake::new()), GetEnvelopes::newest(1)).await;
 
     assert_eq!(frame.verification, Verification::AllMatched(3));
     // The envelope itself arrived unchecked, as the encoding demands.
@@ -646,9 +677,7 @@ fn a_window_crosses_as_milliseconds() {
 /// plain number of milliseconds since the epoch that reads back the same.
 #[tokio::test]
 async fn an_envelope_frame_carries_when_the_node_stored_it() {
-    let frame = call(connect(Fake::new()), GetEnvelopes::newest(1))
-        .await
-        .unwrap();
+    let frame = first(connect(Fake::new()), GetEnvelopes::newest(1)).await;
 
     assert_eq!(frame.stored_at_millis, STORED_AT_MILLIS);
     assert_eq!(

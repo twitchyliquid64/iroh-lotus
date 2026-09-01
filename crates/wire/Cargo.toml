@@ -10,9 +10,14 @@ publish.workspace = true
 blake3.workspace = true
 cbor2.workspace = true
 ed25519-zebra.workspace = true
-iroh.workspace = true
+iroh = { workspace = true, optional = true }
 nutype.workspace = true
 serde.workspace = true
+
+[features]
+# The `Value` <-> iroh address conversions. Off for clients of the control
+# socket, which get endpoint ids as strings and need no QUIC stack.
+iroh = ["dep:iroh"]
 
 [dev-dependencies]
 serde_json.workspace = true

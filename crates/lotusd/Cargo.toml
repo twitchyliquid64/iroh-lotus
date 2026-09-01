@@ -33,7 +33,7 @@ state.workspace = true
 storage.workspace = true
 sync.workspace = true
 version.workspace = true
-wire.workspace = true
+wire = { workspace = true, features = ["iroh"] }
 
 [dev-dependencies]
 chrono.workspace = true

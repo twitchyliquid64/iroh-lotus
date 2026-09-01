@@ -9,16 +9,14 @@ publish.workspace = true
 [dependencies]
 clap.workspace = true
 clap_complete.workspace = true
-dirs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 
 # Our crates
-lotusd-rpc.workspace = true
+lotus-sdk.workspace = true
 render = { workspace = true, features = ["clap"] }
 version.workspace = true
-wire.workspace = true
 
 # The end-to-end tests drive this CLI against a real daemon.
 [dev-dependencies]
@@ -28,3 +26,5 @@ iroh = { workspace = true, features = ["test-utils", "unstable-custom-transports
 lotusd.workspace = true
 state.workspace = true
 tempfile.workspace = true
+# Envelopes forged straight onto the chain, past the daemon.
+wire.workspace = true

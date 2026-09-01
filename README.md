@@ -102,6 +102,26 @@ changed  e3e6d2c3… -> 5e0475c7…
 
 Every command takes `--format json` for ease when scripting.
 
+## Programming against lotusd
+
+`lotus-sdk` gives you a nifty API to talk to lotusd to read/write/watch values.
+
+```rust
+use lotus_sdk::{Client, NamespaceKey, Value, WatchEvent, WatchSelector};
+
+let client = Client::discover()?;
+let web = NamespaceKey::try_new("web")?;
+
+client.set(web.clone(), "port".parse()?, 8080).await?;
+let at = client.read(web.clone(), None).await?;
+println!("{:?} at {}", at.value, at.head.to_hex().as_ref());
+
+let mut watch = client.watch(WatchSelector::Namespace(web)).await?;
+while let Some(WatchEvent::Changed(changed)) = watch.next().await? {
+    println!("moved to {}", changed.head.to_hex().as_ref());
+}
+```
+
 ## Development
 
 Requires Rust 1.95 or newer.

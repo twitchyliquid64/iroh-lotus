@@ -476,7 +476,7 @@ async fn weak_set(
 /// Sends any weak write over the socket.
 async fn write<M>(socket: &Path, request: M) -> Result<Written, Error>
 where
-    M: lotusd_rpc::Method<Response = Written>,
+    M: lotusd_rpc::AnsweredOnce + lotusd_rpc::Method<Response = Written>,
 {
     let stream = UnixStream::connect(socket).await.unwrap();
     call(stream, request).await

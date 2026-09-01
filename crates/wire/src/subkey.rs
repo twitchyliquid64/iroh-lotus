@@ -123,7 +123,7 @@ impl FromStr for SubkeyPath {
     ///
     /// Bare keys are read more leniently than the RFC's shorthand: only
     /// `.` and `[` end one, so `my-key` and `3fa9` need no quotes. What
-    /// [`Display`](SubkeyPath::fmt) writes always reads back as the same
+    /// [`Display`](fmt::Display) writes always reads back as the same
     /// path.
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         let mut segments = Vec::new();
