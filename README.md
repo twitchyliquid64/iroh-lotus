@@ -59,6 +59,23 @@ lotusd run
 
 Repeat for each additional node.
 
+## Containers
+
+Multi-arch images (`linux/amd64`, `linux/arm64`) are published to
+`ghcr.io/twitchyliquid64/iroh-lotus`, tagged with the release version and `latest`. The
+binaries are static, so the image is `distroless/static`: no shell, no package manager.
+All three are on `PATH`, and `LOTUS_STATE_DIR` points at `/var/lib/lotus`, so `lotusctl`
+finds the daemon's control socket without being told where it is.
+
+```sh
+docker run --rm -v lotus:/var/lib/lotus ghcr.io/twitchyliquid64/iroh-lotus:latest
+docker run --rm -v lotus:/var/lib/lotus ghcr.io/twitchyliquid64/iroh-lotus:latest lotusctl status
+```
+
+[docs/kubernetes.md](docs/kubernetes.md) covers running it on a cluster — joining once
+from an invite, what the node's identity means for volumes and replicas, and serving
+`lotusweb` alongside the daemon.
+
 ## Reading and writing values
 
 You can think of data in lotus as JSON documents, stored in _namespaces_.

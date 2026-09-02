@@ -1,0 +1,157 @@
+name: Container
+
+on:
+    push:
+        tags: ["v*"]
+    workflow_dispatch:
+        inputs:
+            tag:
+                description: "Existing v* tag to build and publish"
+                required: true
+
+env:
+    REGISTRY: ghcr.io
+    IMAGE_NAME: ${{ github.repository }}
+
+# One publish run per tag, and never cancel one mid-flight: a cancelled run can
+# leave the registry holding one architecture's image with no manifest list
+# pointing at it.
+concurrency:
+    group: container-${{ github.event.inputs.tag || github.ref }}
+    cancel-in-progress: false
+
+permissions:
+    contents: read
+
+jobs:
+    build:
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - arch: amd64
+                      platform: linux/amd64
+                      runner: ubuntu-24.04
+                    - arch: arm64
+                      platform: linux/arm64
+                      runner: ubuntu-24.04-arm
+        runs-on: ${{ matrix.runner }}
+        timeout-minutes: 60
+        permissions:
+            contents: read
+            packages: write
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+                  ref: ${{ github.event.inputs.tag || github.ref }}
+                  # The version crate derives its version from `git describe`
+                  # against v* tags, and the image build reads it out of the
+                  # build context, so the whole tag history has to be here.
+                  fetch-depth: 0
+
+            - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+            - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+              with:
+                  registry: ${{ env.REGISTRY }}
+                  username: ${{ github.actor }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+
+            # Built and loaded locally first so the binaries can be run before
+            # anything is published. Each arch builds on its own native runner —
+            # emulating a Rust build of iroh's tree under QEMU is hours, not
+            # minutes — so the image loaded here is the one that gets pushed.
+            - name: Build ${{ matrix.platform }}
+              uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+              with:
+                  context: .
+                  platforms: ${{ matrix.platform }}
+                  load: true
+                  tags: iroh-lotus:verify
+                  provenance: false
+
+            # The same check release.yml runs on the tarball binaries: a build
+            # context missing `.git` or its tags still produces working binaries,
+            # they just report the Cargo version. Catch that before publishing.
+            - name: Verify the image reports the tag
+              env:
+                  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+              run: |
+                  set -euo pipefail
+                  for bin in lotusd lotusctl lotusweb; do
+                      reported=$(docker run --rm iroh-lotus:verify "$bin" -V | awk '{print $2}')
+                      if [ "$reported" != "${TAG#v}" ]; then
+                          echo "::error::$bin reports $reported, expected ${TAG#v}"
+                          exit 1
+                      fi
+                  done
+
+            # Pushed by digest rather than by tag: two runners publishing the
+            # same tag would each overwrite the other, so the tags are attached
+            # once, by the merge job, to a manifest list naming both digests.
+            - name: Push ${{ matrix.platform }} by digest
+              id: push
+              uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+              with:
+                  context: .
+                  platforms: ${{ matrix.platform }}
+                  provenance: false
+                  outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+
+            # The digest names the file; the merge job reads the set back as
+            # filenames. GitHub expressions cannot strip the `sha256:` prefix,
+            # so it comes through the environment and the shell trims it.
+            - name: Write the digest to a file
+              env:
+                  DIGEST: ${{ steps.push.outputs.digest }}
+              run: |
+                  set -euo pipefail
+                  mkdir -p /tmp/digests
+                  touch "/tmp/digests/${DIGEST#sha256:}"
+
+            - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+              with:
+                  name: digest-${{ matrix.arch }}
+                  path: /tmp/digests/*
+                  if-no-files-found: error
+                  retention-days: 1
+
+    merge:
+        needs: [build]
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        permissions:
+            contents: read
+            packages: write
+        steps:
+            - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+              with:
+                  path: /tmp/digests
+                  pattern: digest-*
+                  merge-multiple: true
+
+            - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+            - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+              with:
+                  registry: ${{ env.REGISTRY }}
+                  username: ${{ github.actor }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+
+            # A tag carrying a pre-release identifier (v1.2.3-rc1) publishes the
+            # version tag alone: `latest` should not walk onto a pre-release.
+            - name: Create the manifest list
+              env:
+                  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+              run: |
+                  set -euo pipefail
+                  version="${TAG#v}"
+                  image="${REGISTRY}/${IMAGE_NAME}"
+                  args=(--tag "${image}:${version}")
+                  case "$TAG" in *-*) ;; *) args+=(--tag "${image}:latest");; esac
+                  for digest in /tmp/digests/*; do
+                      args+=("${image}@sha256:$(basename "$digest")")
+                  done
+                  docker buildx imagetools create "${args[@]}"
+                  docker buildx imagetools inspect "${image}:${version}"
