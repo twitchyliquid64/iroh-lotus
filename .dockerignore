@@ -1,0 +1,3 @@
+# `.git` is deliberately NOT ignored: crates/version/build.rs reads
+# `git describe` for the version the binaries report. See the Dockerfile.
+target/
