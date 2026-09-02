@@ -25,6 +25,9 @@ const PREVIEW_WIDTH: usize = 72;
 /// How much of a digest is shown; the rest is a hover away.
 const SHORT_DIGEST: usize = 12;
 
+/// What the ledger's own namespaces begin with: hidden until asked for.
+const INTERNAL_PREFIX: &str = "_lotus";
+
 /// The namespace list beside every page.
 #[derive(Debug)]
 pub enum Sidebar {
@@ -62,7 +65,17 @@ pub fn document(page: Page<'_>) -> Markup {
             // Inherited by every link and form: all of them swap the pane.
             body hx-target:inherited="#main" {
                 div.shell {
-                    (sidebar(page.sidebar, page.active, None))
+                    // The toggle sits outside the swapped nav, so it keeps
+                    // its state as the pages change; the stylesheet hides
+                    // the internal rows off it.
+                    aside.side {
+                        a.brand href="/" hx-get="/" hx-push-url="true" { "lotus" }
+                        label.toggle {
+                            input #show-internal type="checkbox";
+                            "Show internal namespaces"
+                        }
+                        (sidebar(page.sidebar, page.active, None))
+                    }
                     main #main { (page.pane) }
                 }
             }
@@ -83,7 +96,6 @@ pub fn fragment(page: Page<'_>) -> Markup {
 fn sidebar(sidebar: &Sidebar, active: Option<&NamespaceKey>, swap_oob: Option<&str>) -> Markup {
     html! {
         nav #sidebar hx-swap-oob=[swap_oob] aria-label="Namespaces" {
-            a.brand href="/" hx-get="/" hx-push-url="true" { "lotus" }
             @match sidebar {
                 Sidebar::Listed { head, namespaces } => {
                     p.head title=(head.to_hex().as_ref()) {
@@ -94,7 +106,8 @@ fn sidebar(sidebar: &Sidebar, active: Option<&NamespaceKey>, swap_oob: Option<&s
                     }
                     ul.namespaces {
                         @for entry in namespaces {
-                            li.active[active == Some(&entry.key)] {
+                            li.active[active == Some(&entry.key)]
+                                .internal[entry.key.as_ref().starts_with(INTERNAL_PREFIX)] {
                                 (link(&Location::namespace(entry.key.clone()), entry.key.as_ref()))
                                 span.shape { (entry.shape) }
                             }

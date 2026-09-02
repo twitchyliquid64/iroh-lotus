@@ -52,7 +52,7 @@ code, pre, textarea { font-family: var(--mono); font-size: 13px; }
 
 /* Sidebar */
 
-#sidebar {
+.side {
   background: var(--panel);
   border-right: 1px solid var(--line);
   padding: 1rem;
@@ -65,11 +65,33 @@ code, pre, textarea { font-family: var(--mono); font-size: 13px; }
   overflow-y: auto;
 }
 
-#sidebar .brand {
+.side .brand {
   font-weight: 700;
   font-size: 1.15rem;
   letter-spacing: .02em;
   color: var(--fg);
+}
+
+.side .toggle {
+  flex-direction: row;
+  align-items: center;
+  gap: .4rem;
+  color: var(--muted);
+  font-size: .85rem;
+  cursor: pointer;
+}
+
+.side .toggle input { width: auto; margin: 0; }
+
+/* Internal namespaces stay hidden until the toggle is on, except the one
+   being browsed. */
+.side:has(#show-internal:not(:checked)) #sidebar li.internal:not(.active) { display: none; }
+
+#sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: .75rem;
+  flex: 1;
 }
 
 #sidebar .head {
@@ -246,6 +268,6 @@ pre.value {
 
 @media (max-width: 720px) {
   .shell { grid-template-columns: 1fr; }
-  #sidebar { position: static; height: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+  .side { position: static; height: auto; border-right: 0; border-bottom: 1px solid var(--line); }
   #main { padding: 1rem; }
 }

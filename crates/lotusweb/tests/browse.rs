@@ -131,6 +131,19 @@ async fn the_home_page_lists_the_namespaces_in_the_sidebar() {
     assert!(body.starts_with("<!DOCTYPE html>"), "{body}");
     assert!(body.contains(r#"href="/ns/cfg""#), "{body}");
     assert!(body.contains("Pick a namespace"), "{body}");
+    // The ledger's own namespaces are marked internal, behind a toggle
+    // that is off to begin with and sits outside the swapped sidebar.
+    assert!(
+        body.contains(r#"internal"><a href="/ns/_lotus_nodes""#),
+        "{body}"
+    );
+    assert!(body.contains(r#"class=""><a href="/ns/cfg""#), "{body}");
+    assert!(
+        body.contains(r#"<input id="show-internal" type="checkbox">"#),
+        "{body}"
+    );
+    let nav = body.find(r#"<nav id="sidebar""#).expect("a sidebar");
+    assert!(body[..nav].contains("show-internal"), "{body}");
     // htmx 4 inherits nothing on its own: the target is marked inherited.
     assert!(
         body.contains(r##"<body hx-target:inherited="#main">"##),
@@ -208,6 +221,7 @@ async fn an_htmx_request_gets_the_pane_with_the_sidebar_out_of_band() {
         "{body}"
     );
     assert!(body.contains(r#"<li class="active">"#), "{body}");
+    assert!(!body.contains("show-internal"), "{body}");
 }
 
 /// htmx restores history by fetching the page whole and swapping its body.
