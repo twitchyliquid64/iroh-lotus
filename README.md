@@ -62,8 +62,11 @@ Repeat for each additional node.
 ## Containers
 
 Multi-arch images (`linux/amd64`, `linux/arm64`) are published to
-`ghcr.io/twitchyliquid64/iroh-lotus`, tagged with the release version and `latest`. The
-binaries are static, so the image is `distroless/static`: no shell, no package manager.
+`ghcr.io/twitchyliquid64/iroh-lotus`. A release is tagged with its version and `latest`;
+every push to `main` is published too, as `main` and as an immutable `sha-<commit>`, so
+what is on main can be run without waiting for a tag. `latest` only ever moves to a
+release. The binaries are static, so the image is `distroless/static`: no shell, no
+package manager.
 All three are on `PATH`, and `LOTUS_STATE_DIR` points at `/var/lib/lotus`, so `lotusctl`
 finds the daemon's control socket without being told where it is.
 
