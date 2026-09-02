@@ -4,6 +4,7 @@ members = [
     "crates/lotusctl",
     "crates/lotusd",
     "crates/lotusd-rpc",
+    "crates/lotusweb",
     "crates/render",
     "crates/state",
     "crates/storage",
@@ -26,6 +27,7 @@ lto = true
 codegen-units = 1
 
 [workspace.dependencies]
+axum = "0.8"
 blake3 = { version = "1.8", features = ["serde"] }
 cbor2 = { version = "1.1", features = ["std", "alloc", "derive", "futures", "tokio"] }
 chrono = {version = "0.4", features = ["serde", "std"]}
@@ -37,7 +39,11 @@ dirs = "6.0"
 # ZIP 215 verification: see "Signature verification" in AGENTS.md.
 ed25519-zebra = "4.2"
 iroh = "1.1"
+# Compile-time HTML templates for lotusweb; `axum` makes a rendered page a response.
+maud = { version = "0.27", features = ["axum"] }
 
+# URL spelling of ledger keys and paths in lotusweb.
+percent-encoding = "2.3"
 nutype = { version = "0.7", features = ["serde"] }
 rand = "0.10"
 # `bundled` pins the SQLite version instead of trusting whatever the host ships.
@@ -49,6 +55,8 @@ thiserror = "2.0"
 thunderdome = "0.6"
 tokio = { version = "1.53", features = ["full"] }
 tokio-stream = "0.1"
+# `ServiceExt::oneshot`, to drive a router in tests without a socket.
+tower = "0.5"
 tokio-util = { version = "0.7", features = ["codec"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -57,6 +65,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 lotus-sdk = { path = "crates/lotus-sdk" }
 lotusd = { path = "crates/lotusd" }
 lotusd-rpc = { path = "crates/lotusd-rpc" }
+lotusweb = { path = "crates/lotusweb" }
 render = { path = "crates/render" }
 state = { path = "crates/state" }
 storage = { path = "crates/storage" }

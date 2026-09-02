@@ -1,0 +1,29 @@
+[package]
+name = "lotusweb"
+version.workspace = true
+rust-version.workspace = true
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+axum.workspace = true
+clap.workspace = true
+maud.workspace = true
+percent-encoding.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Our crates
+lotus-sdk.workspace = true
+version.workspace = true
+
+# The tests drive the router against a real daemon in-process.
+[dev-dependencies]
+lotusd.workspace = true
+tempfile.workspace = true
+tower.workspace = true

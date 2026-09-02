@@ -11,13 +11,13 @@ Think of it as a slow, high-integrity etcd.
 
 ## Getting started
 
-**1. Install the binaries.** Grab `lotusd` and `lotusctl` from the
+**1. Install the binaries.** Grab `lotusd`, `lotusctl` and `lotusweb` from the
 [latest release](https://github.com/twitchyliquid64/iroh-lotus/releases/latest) and put them on your
 `PATH`:
 
 ```sh
 tar -xzf iroh-lotus-v*-linux-amd64.tar.gz
-sudo install iroh-lotus-v*-linux-amd64/lotus{d,ctl} /usr/local/bin
+sudo install iroh-lotus-v*-linux-amd64/lotus{d,ctl,web} /usr/local/bin
 ```
 
 **2. Start the first node.** `init` creates a fresh cluster on the current machine, and
@@ -34,6 +34,13 @@ With the daemon up, `lotusctl` talks to it over the control socket (See docs for
 lotusctl status
 lotusctl set cfg '{"port": 443}'
 lotusctl get cfg port
+```
+
+The same data can be browsed and edited from a browser: `lotusweb` serves a page over the
+control socket, on `127.0.0.1:8080` unless `--listen` says otherwise.
+
+```sh
+lotusweb
 ```
 
 **3. Add more nodes.** On a node already in the cluster, mint a one-time invite:
