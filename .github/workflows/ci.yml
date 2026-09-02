@@ -8,6 +8,12 @@ on:
 
 env:
     CARGO_TERM_COLOR: always
+    # Runners are ephemeral, so incremental state is never reused: it only
+    # costs disk. And full DWARF in every test binary — each links iroh's
+    # whole tree — is most of what a test build writes; line tables keep
+    # backtraces readable at a fraction of the size.
+    CARGO_INCREMENTAL: "0"
+    CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 # Cancel an in-progress run when a newer commit is pushed to the same ref.
 # main is excluded so a push to main never gets cancelled mid-flight.
@@ -72,5 +78,14 @@ jobs:
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
                   persist-credentials: false
+            # A debug build of all 35 test binaries has run the runner out of
+            # disk. Toolchains this job never touches are the cheapest space
+            # to take back.
+            - name: Free disk space
+              run: |
+                  set -euo pipefail
+                  df -h / | tail -1
+                  sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+                  df -h / | tail -1
             - name: Run tests
               run: cargo test --workspace --all-features --locked
