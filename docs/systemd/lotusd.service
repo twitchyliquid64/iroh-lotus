@@ -1,0 +1,61 @@
+# iroh-lotus daemon. Install to /etc/systemd/system/lotusd.service; see docs/systemd.md.
+[Unit]
+Description=iroh-lotus daemon
+Documentation=https://github.com/twitchyliquid64/iroh-lotus
+After=network-online.target
+Wants=network-online.target
+# `lotusd run` exits at once over a state directory that holds no cluster, so
+# until `lotusd init` or `lotusd bootstrap` has run (lotusd-bootstrap.service)
+# the unit is skipped, not restarted into a crash loop. `systemctl status`
+# shows the skip as a failed condition check.
+ConditionPathExists=/var/lib/lotus/oldest_envelope
+
+[Service]
+Type=exec
+User=lotus
+Group=lotus
+# /var/lib/lotus, created lotus:lotus 0750 when missing and writable even
+# under ProtectSystem=strict. lotusd puts the control socket there as 0660,
+# so members of the lotus group can run lotusctl against it.
+StateDirectory=lotus
+StateDirectoryMode=0750
+Environment=LOTUS_STATE_DIR=/var/lib/lotus
+Environment=RUST_LOG=info
+EnvironmentFile=-/etc/default/lotusd
+ExecStart=/usr/local/bin/lotusd run
+# lotusd shuts down cleanly on SIGINT only. systemd's default SIGTERM would
+# terminate it outright, mid-write included.
+KillSignal=SIGINT
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5s
+
+# Hardening. The daemon needs nothing but its state directory, outbound UDP
+# and HTTPS, and netlink for iroh to notice interfaces coming and going.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# The socket is chmod'ed to 0660 after bind and the state dir to 0750 on
+# create, so a tight umask costs nothing and keeps the key files 0600.
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

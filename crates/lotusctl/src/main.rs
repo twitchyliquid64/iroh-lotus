@@ -779,7 +779,8 @@ struct CompletionsArgs {
 /// Shared arguments for all subcommands.
 #[derive(Debug, Args)]
 struct GlobalArgs {
-    /// Override the directory where state is stored (default: $XDG_STATE_DIR/iroh-lotus)
+    /// The daemon's state directory, where its control socket is (default:
+    /// $XDG_STATE_DIR/iroh-lotus, or /var/lib/lotus when only that exists)
     #[arg(long, alias = "sd", env = "LOTUS_STATE_DIR", global = true)]
     state_dir: Option<PathBuf>,
 
@@ -802,15 +803,16 @@ enum Format {
 }
 
 impl GlobalArgs {
-    /// StateDir returns the directory where daemon state is stored: the `--state-dir`
-    /// override (or `LOTUS_STATE_DIR`) when given, otherwise where `lotusd` keeps it
-    /// by default — see [`lotus_sdk::state_dir`].
+    /// StateDir returns the directory of the daemon to talk to: the `--state-dir`
+    /// override (or `LOTUS_STATE_DIR`) when given, otherwise the user's own or the
+    /// machine's — see [`lotus_sdk::find_state_dir`].
     ///
-    /// Fails only when no home directory can be determined.
+    /// Fails only when no home directory can be determined and the machine runs
+    /// no daemon.
     fn state_dir(&self) -> Result<PathBuf, MainError> {
         self.state_dir
             .clone()
-            .or_else(lotus_sdk::state_dir)
+            .or_else(lotus_sdk::find_state_dir)
             .ok_or_else(|| {
                 MainError::Other(
                     "no state directory found; pass --state-dir to set one".to_string(),

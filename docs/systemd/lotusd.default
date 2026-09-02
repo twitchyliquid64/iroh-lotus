@@ -1,0 +1,17 @@
+# Environment for lotusd.service and lotusd-bootstrap.service.
+# Install to /etc/default/lotusd. Every setting is optional.
+
+# Relay infrastructure: n0 (public relays, reached over outbound HTTPS) or
+# none (direct connections only).
+#LOTUS_RELAY=n0
+
+# Address discovery: none (peers reached only as the ledger lists them) or
+# n0 (publish this node's reachability to n0's public DNS, and resolve peers
+# through it).
+#LOTUS_ADDR_DISCOVERY=none
+
+# Keep at least this many of the newest envelopes through compaction.
+#LOTUS_KEEP_ENVELOPES=32
+
+# Log filter, as tracing_subscriber's EnvFilter reads it.
+#RUST_LOG=info

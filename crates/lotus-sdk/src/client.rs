@@ -17,7 +17,7 @@ use wire::{
     subkey::SubkeyPath,
 };
 
-use crate::{Error, Streaming, socket_in, state_dir};
+use crate::{Error, Streaming, find_state_dir, socket_in};
 
 /// A lotusd daemon, by its control socket.
 ///
@@ -45,9 +45,13 @@ impl Client {
     }
 
     /// The daemon this machine runs by default: in `$LOTUS_STATE_DIR`, or
-    /// the platform state directory — see [`state_dir`].
+    /// the first of the user's own state directory and the machine's
+    /// ([`SYSTEM_STATE_DIR`](crate::SYSTEM_STATE_DIR)) that exists — see
+    /// [`find_state_dir`].
     pub fn discover() -> Result<Self, Error> {
-        state_dir().map(Self::in_state_dir).ok_or(Error::NoStateDir)
+        find_state_dir()
+            .map(Self::in_state_dir)
+            .ok_or(Error::NoStateDir)
     }
 
     /// The control socket this client connects to.

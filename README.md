@@ -59,6 +59,13 @@ lotusd run
 
 Repeat for each additional node.
 
+## Systemd service
+
+[docs/systemd.md](docs/systemd.md) covers running it as a system service on Debian — the
+`lotus` user, the one-shot join before the daemon will start, and which accounts reach
+the control socket. `lotusctl` and `lotusweb` find a daemon in `/var/lib/lotus` on their
+own when the account runs none of its own.
+
 ## Containers
 
 Multi-arch images (`linux/amd64`, `linux/arm64`) are published to

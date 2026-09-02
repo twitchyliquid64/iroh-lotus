@@ -1,0 +1,54 @@
+# Joins this machine to an existing iroh-lotus cluster from an invite, once.
+# Install to /etc/systemd/system/lotusd-bootstrap.service; see docs/systemd.md.
+[Unit]
+Description=Join this machine to an iroh-lotus cluster from an invite
+Documentation=https://github.com/twitchyliquid64/iroh-lotus
+After=network-online.target
+Wants=network-online.target
+# Joining happens once: `lotusd bootstrap` refuses a state directory that
+# already holds a cluster, and its --overwrite_existing would discard this
+# node's identity. With a cluster already here the unit is skipped instead.
+ConditionPathExists=!/var/lib/lotus/oldest_envelope
+# The invite is loaded as a credential from /etc/lotus/invite (root-only), so
+# it appears in neither `ps` nor `systemctl show`. It redeems once, so delete
+# the file after the join.
+AssertPathExists=/etc/lotus/invite
+
+[Service]
+Type=oneshot
+User=lotus
+Group=lotus
+StateDirectory=lotus
+StateDirectoryMode=0750
+Environment=LOTUS_STATE_DIR=/var/lib/lotus
+Environment=RUST_LOG=info
+EnvironmentFile=-/etc/default/lotusd
+LoadCredential=invite:/etc/lotus/invite
+# The invite is a positional argument, so a shell reads it out of the
+# credentials directory; `tr` drops the newline an editor leaves behind.
+# `$$` is systemd's escape for a literal `$`, leaving expansion to the shell.
+ExecStart=/bin/sh -c 'exec /usr/local/bin/lotusd bootstrap "$$(tr -d "[:space:]" < "$$CREDENTIALS_DIRECTORY/invite")"'
+TimeoutStartSec=5min
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077

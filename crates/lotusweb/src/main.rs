@@ -18,8 +18,8 @@ struct Cli {
     )]
     listen: SocketAddr,
 
-    /// Override the directory the daemon keeps its state and control
-    /// socket in (default: $XDG_STATE_DIR/iroh-lotus)
+    /// The daemon's state directory, where its control socket is (default:
+    /// $XDG_STATE_DIR/iroh-lotus, or /var/lib/lotus when only that exists)
     #[arg(long, alias = "sd", env = "LOTUS_STATE_DIR")]
     state_dir: Option<PathBuf>,
 }
@@ -69,7 +69,7 @@ async fn async_main() -> Result<(), MainError> {
     let cli = Cli::parse();
     let state_dir = cli
         .state_dir
-        .or_else(lotus_sdk::state_dir)
+        .or_else(lotus_sdk::find_state_dir)
         .ok_or(MainError::NoStateDir)?;
     let client = Client::in_state_dir(&state_dir);
 

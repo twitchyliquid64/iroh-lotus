@@ -50,7 +50,7 @@ const COMPACT_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// The fewest prunable envelopes the periodic pass acts on: the sweep is
 /// not worth paying for less. A [`ServerHandle::compact`] prunes eagerly
 /// instead.
-const COMPACT_MIN_PRUNE: u64 = 64;
+const COMPACT_MIN_PRUNE: u64 = 40;
 
 /// A freshly issued invite and the window the sponsor will honour it for.
 /// `ttl` is the granted window, capped at [`MAX_INVITE_TTL`], not a clock

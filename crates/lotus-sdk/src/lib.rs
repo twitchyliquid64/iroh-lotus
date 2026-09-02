@@ -1,7 +1,8 @@
 //! A running lotusd, as a Rust API.
 //!
 //! A [`Client`] names the daemon's control socket — [`Client::discover`]
-//! finds it where `lotusd` keeps it by default — and opens one connection
+//! finds it where `lotusd` keeps it by default, falling back to the
+//! machine's daemon when the user runs none — and opens one connection
 //! per request, which is how the protocol works: there is nothing to hold
 //! open, share, or reconnect. Every method of the protocol has a typed
 //! method on the client; [`Client::call`] and [`Client::stream`] take any
@@ -55,7 +56,9 @@
 //! other crate.
 
 mod discover;
-pub use discover::{SOCKET_NAME, STATE_DIR_ENV, socket_in, state_dir};
+pub use discover::{
+    SOCKET_NAME, STATE_DIR_ENV, SYSTEM_STATE_DIR, find_state_dir, socket_in, state_dir,
+};
 
 mod error;
 pub use error::Error;
