@@ -1,8 +1,11 @@
 # Running lotusd in Kubernetes
 
 Images are published to `ghcr.io/twitchyliquid64/iroh-lotus` for `linux/amd64` and
-`linux/arm64`, tagged with the release version (`0.0.4`) and `latest`. The binaries are
-static, so the image is `distroless/static` and carries no shell or package manager;
+`linux/arm64`. A release is tagged with its version (`0.0.4`) and `latest`; every push to
+`main` is published as `main` and as an immutable `sha-<commit>`. Prefer a version or a
+`sha-` tag over `main` or `latest` for anything you would rather not have change under a
+rescheduled pod. The binaries are static, so the image is `distroless/static` and carries
+no shell or package manager;
 `lotusd`, `lotusctl` and `lotusweb` are all on `PATH`, and `LOTUS_STATE_DIR` is preset to
 `/var/lib/lotus` so `kubectl exec … lotusctl status` finds the control socket without
 being told where it is.

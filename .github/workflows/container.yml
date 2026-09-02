@@ -3,19 +3,25 @@ name: Container
 on:
     push:
         tags: ["v*"]
+        branches: ["main"]
     workflow_dispatch:
         inputs:
             tag:
-                description: "Existing v* tag to build and publish"
-                required: true
+                description: "Existing v* tag to build and publish (blank builds the current ref untagged)"
+                required: false
 
 env:
     REGISTRY: ghcr.io
     IMAGE_NAME: ${{ github.repository }}
+    # The v* tag being published, or empty for an untagged build off a branch.
+    # Everything downstream keys off this rather than re-deriving it: what tags
+    # the manifest list gets, and whether the binaries are held to a version.
+    RELEASE_TAG: ${{ github.event.inputs.tag || (github.ref_type == 'tag' && github.ref_name || '') }}
 
-# One publish run per tag, and never cancel one mid-flight: a cancelled run can
+# One publish run per ref, and never cancel one mid-flight: a cancelled run can
 # leave the registry holding one architecture's image with no manifest list
-# pointing at it.
+# pointing at it. Pushes to main therefore queue rather than superseding each
+# other, so a run always publishes the commit it built.
 concurrency:
     group: container-${{ github.event.inputs.tag || github.ref }}
     cancel-in-progress: false
@@ -71,18 +77,21 @@ jobs:
                   tags: iroh-lotus:verify
                   provenance: false
 
-            # The same check release.yml runs on the tarball binaries: a build
-            # context missing `.git` or its tags still produces working binaries,
-            # they just report the Cargo version. Catch that before publishing.
-            - name: Verify the image reports the tag
-              env:
-                  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+            # Running each binary proves the image actually executes before any
+            # of it is published. On a tagged build it also runs the check
+            # release.yml runs on the tarball binaries: a build context missing
+            # `.git` or its tags still produces working binaries, they just
+            # report the Cargo version. An untagged build has nothing to hold
+            # them to — `git describe` derives a -dev version off the last tag,
+            # which is exactly what it should report — so it only records it.
+            - name: Verify the binaries in the image
               run: |
                   set -euo pipefail
                   for bin in lotusd lotusctl lotusweb; do
                       reported=$(docker run --rm iroh-lotus:verify "$bin" -V | awk '{print $2}')
-                      if [ "$reported" != "${TAG#v}" ]; then
-                          echo "::error::$bin reports $reported, expected ${TAG#v}"
+                      echo "$bin reports $reported"
+                      if [ -n "$RELEASE_TAG" ] && [ "$reported" != "${RELEASE_TAG#v}" ]; then
+                          echo "::error::$bin reports $reported, expected ${RELEASE_TAG#v}"
                           exit 1
                       fi
                   done
@@ -139,19 +148,29 @@ jobs:
                   username: ${{ github.actor }}
                   password: ${{ secrets.GITHUB_TOKEN }}
 
-            # A tag carrying a pre-release identifier (v1.2.3-rc1) publishes the
-            # version tag alone: `latest` should not walk onto a pre-release.
+            # A release publishes its version, and `latest` unless the tag
+            # carries a pre-release identifier (v1.2.3-rc1) — `latest` should
+            # not walk onto a pre-release. An untagged build publishes the
+            # branch name, which moves, alongside an immutable `sha-` tag to
+            # pin: neither touches `latest`, so `latest` stays a release.
             - name: Create the manifest list
               env:
-                  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+                  REF_NAME: ${{ github.ref_name }}
+                  COMMIT: ${{ github.sha }}
               run: |
                   set -euo pipefail
-                  version="${TAG#v}"
                   image="${REGISTRY}/${IMAGE_NAME}"
-                  args=(--tag "${image}:${version}")
-                  case "$TAG" in *-*) ;; *) args+=(--tag "${image}:latest");; esac
+                  if [ -n "$RELEASE_TAG" ]; then
+                      primary="${image}:${RELEASE_TAG#v}"
+                      args=(--tag "$primary")
+                      case "$RELEASE_TAG" in *-*) ;; *) args+=(--tag "${image}:latest");; esac
+                  else
+                      # A branch name is not a legal tag if it carries a slash.
+                      primary="${image}:sha-${COMMIT:0:7}"
+                      args=(--tag "$primary" --tag "${image}:${REF_NAME//\//-}")
+                  fi
                   for digest in /tmp/digests/*; do
                       args+=("${image}@sha256:$(basename "$digest")")
                   done
                   docker buildx imagetools create "${args[@]}"
-                  docker buildx imagetools inspect "${image}:${version}"
+                  docker buildx imagetools inspect "$primary"
