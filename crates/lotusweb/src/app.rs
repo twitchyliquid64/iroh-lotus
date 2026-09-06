@@ -2,8 +2,9 @@
 //!
 //! Every location has one URL, `/ns/<namespace>[/<path>]`, and the HTTP
 //! method says what happens there: `GET` shows it, `PUT` replaces what it
-//! holds, `POST` adds an entry inside it, `PATCH` adds to the integer it
-//! is, `DELETE` removes it.
+//! holds, `POST` adds an entry inside it, `PATCH` amends it in place — adds
+//! to the integer it is, or moves it to another key of the map it is in —
+//! and `DELETE` removes it.
 
 use axum::{
     Router,
@@ -12,7 +13,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use lotus_sdk::{Client, NamespaceKey, Subkey, Written};
+use lotus_sdk::{Client, NamespaceKey, Subkey, Value, Written};
 use serde::Deserialize;
 
 use crate::{
@@ -41,7 +42,7 @@ pub fn router(client: Client) -> Router {
     let location = get(browse)
         .put(replace)
         .post(insert)
-        .patch(increment)
+        .patch(amend)
         .delete(remove);
     Router::new()
         .route(HOME_URL, get(home))
@@ -73,10 +74,13 @@ struct EntryForm {
     value: String,
 }
 
-/// What the increment form submits: how much to add, negative to take.
+/// What the amend forms submit: how much to add to an integer, negative
+/// to take, or the key a map entry moves to. Told apart by the field.
 #[derive(Debug, Deserialize)]
-struct IncrementForm {
-    delta: String,
+#[serde(untagged)]
+enum AmendForm {
+    Increment { delta: String },
+    Rename { key: String },
 }
 
 /// What the create-namespace form submits.
@@ -158,29 +162,15 @@ async fn insert(
     }
 }
 
-async fn increment(
+async fn amend(
     State(app): State<App>,
     frame: Frame,
     location: Location,
-    Form(form): Form<IncrementForm>,
+    Form(form): Form<AmendForm>,
 ) -> Response {
-    let written = async {
-        let delta: i64 = form.delta.trim().parse().map_err(|_| {
-            Error::Invalid(format!("`{}` is not a whole number to add", form.delta))
-        })?;
-        let written = app
-            .client
-            .increment(location.key().clone(), location.path().cloned(), delta)
-            .await?;
-        Ok(format!("Added {delta} to {location}; {}", moved(&written)))
-    }
-    .await;
-    match written {
-        Ok(notice) => {
-            app.landed(frame, Some(&location), Some(&location), &notice)
-                .await
-        }
-        Err(error) => app.fail(&frame, Some(&location), &error).await,
+    match form {
+        AmendForm::Increment { delta } => app.increment(frame, location, &delta).await,
+        AmendForm::Rename { key } => app.rename(frame, location, key).await,
     }
 }
 
@@ -297,6 +287,85 @@ impl App {
                 pane,
             },
         )
+    }
+
+    async fn increment(&self, frame: Frame, location: Location, delta: &str) -> Response {
+        let written = async {
+            let delta: i64 = delta
+                .trim()
+                .parse()
+                .map_err(|_| Error::Invalid(format!("`{delta}` is not a whole number to add")))?;
+            let written = self
+                .client
+                .increment(location.key().clone(), location.path().cloned(), delta)
+                .await?;
+            Ok(format!("Added {delta} to {location}; {}", moved(&written)))
+        }
+        .await;
+        match written {
+            Ok(notice) => {
+                self.landed(frame, Some(&location), Some(&location), &notice)
+                    .await
+            }
+            Err(error) => self.fail(&frame, Some(&location), &error).await,
+        }
+    }
+
+    /// Moves the map entry at `location` to `key` beside it. The chain
+    /// has no move: the value is written at the new key, then cleared at
+    /// the old, so a failure between the two leaves a copy, never a loss.
+    async fn rename(&self, frame: Frame, location: Location, key: String) -> Response {
+        let renamed = async {
+            let from = location
+                .map_key()
+                .ok_or_else(|| Error::Invalid(format!("{location} is not a map entry")))?;
+            if key.is_empty() {
+                return Err(Error::Invalid("a key cannot be empty".into()));
+            }
+            if key == from {
+                return Err(Error::Invalid(format!(
+                    "{location} is already named `{key}`"
+                )));
+            }
+            let parent = location.parent().expect("a map entry has a parent");
+            let at = self
+                .client
+                .read(parent.key().clone(), parent.path().cloned())
+                .await?;
+            let mut fields = match at.value {
+                Some(Value::Map(fields)) => fields,
+                _ => return Err(Error::Invalid(format!("{parent} is not a map"))),
+            };
+            let to = parent.child(Subkey::Key(key.clone()));
+            if fields.contains_key(&key) {
+                return Err(Error::Invalid(format!("{to} already exists")));
+            }
+            let value = fields
+                .remove(from)
+                .ok_or_else(|| Error::Invalid(format!("nothing is held at {location}")))?;
+
+            self.client
+                .set(to.key().clone(), to.path().cloned(), value)
+                .await?;
+            let written = self
+                .client
+                .delete(location.key().clone(), location.path().cloned())
+                .await
+                .map_err(|e| Error::Halfway {
+                    done: format!("copied {location} to {to}"),
+                    source: Box::new(Error::from(e)),
+                })?;
+            let notice = format!("Renamed {location} to {to}; {}", moved(&written));
+            Ok((to, notice))
+        }
+        .await;
+        match renamed {
+            Ok((to, notice)) => {
+                self.landed(frame, Some(&location), Some(&to), &notice)
+                    .await
+            }
+            Err(error) => self.fail(&frame, Some(&location), &error).await,
+        }
     }
 
     /// Where a write on `from` leaves the browser: at `destination` —

@@ -292,10 +292,11 @@ async fn an_integer_is_incremented_by_a_delta() {
     let node = seeded().await;
 
     let (_, _, body) = send(&node, get("/ns/cfg/port")).await;
+    assert!(body.contains("Increment"), "{body}");
     assert!(body.contains(r#"hx-patch="/ns/cfg/port""#), "{body}");
     // Only an integer offers it.
     let (_, _, body) = send(&node, get("/ns/cfg/host")).await;
-    assert!(!body.contains("hx-patch"), "{body}");
+    assert!(!body.contains("Increment"), "{body}");
 
     let request = htmx(form("PATCH", "/ns/cfg/port", &[("delta", "7")]));
     let (status, _, body) = send(&node, request).await;
@@ -318,6 +319,71 @@ async fn an_integer_is_incremented_by_a_delta() {
     let request = htmx(form("PATCH", "/ns/cfg/host", &[("delta", "1")]));
     let (status, _, _) = send(&node, request).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn a_map_entry_is_renamed_and_the_page_moves_with_it() {
+    let node = seeded().await;
+
+    // Every map entry offers it, its key prefilled; an array item does not.
+    let (_, _, body) = send(&node, get("/ns/cfg/servers")).await;
+    assert!(body.contains("Rename key"), "{body}");
+    assert!(
+        body.contains(r#"<input name="key" value="servers" required>"#),
+        "{body}"
+    );
+    let (_, _, body) = send(&node, get("/ns/cfg/servers%5B0%5D")).await;
+    assert!(!body.contains("Rename key"), "{body}");
+    let (_, _, body) = send(&node, get("/ns/cfg")).await;
+    assert!(!body.contains("Rename key"), "{body}");
+
+    let request = htmx(form("PATCH", "/ns/cfg/servers", &[("key", "hosts")]));
+    let (status, headers, body) = send(&node, request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(pushed_to(&headers), Some("/ns/cfg/hosts"));
+    assert!(
+        body.contains("Renamed cfg › servers to cfg › hosts"),
+        "{body}"
+    );
+    assert!(body.contains(r#"hx-get="/ns/cfg/hosts%5B1%5D""#), "{body}");
+
+    let at = node.client.read(key("cfg"), None).await.unwrap();
+    assert_eq!(
+        at.value,
+        Some(Value::from_iter([
+            ("host", Value::from("a.example")),
+            (
+                "hosts",
+                Value::from_iter([Value::from("s1"), Value::from("s2")])
+            ),
+            ("port", Value::Int(443)),
+        ]))
+    );
+}
+
+#[tokio::test]
+async fn a_rename_that_would_lose_or_clobber_something_is_refused() {
+    let node = seeded().await;
+    let before = node.client.chain_range().await.unwrap().head;
+
+    for (uri, to, why) in [
+        ("/ns/cfg/host", "port", "cfg › port already exists"),
+        ("/ns/cfg/host", "host", "already named `host`"),
+        ("/ns/cfg/host", "", "cannot be empty"),
+        ("/ns/cfg/servers%5B0%5D", "s", "is not a map entry"),
+        (
+            "/ns/cfg/missing",
+            "present",
+            "nothing is held at cfg › missing",
+        ),
+    ] {
+        let request = htmx(form("PATCH", uri, &[("key", to)]));
+        let (status, _, body) = send(&node, request).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{uri}: {body}");
+        assert!(body.contains(why), "{uri}: {body}");
+    }
+
+    assert_eq!(node.client.chain_range().await.unwrap().head, before);
 }
 
 #[tokio::test]

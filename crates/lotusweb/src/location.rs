@@ -116,6 +116,16 @@ impl Location {
         std::iter::once(root).chain(inner)
     }
 
+    /// The key this is held under, when the last step here is into a map;
+    /// `None` for an array item or a namespace's root. Such an entry can
+    /// be renamed, its value moved to a sibling key.
+    pub fn map_key(&self) -> Option<&str> {
+        match self.segments().last()? {
+            Subkey::Key(key) => Some(key),
+            Subkey::Index(_) => None,
+        }
+    }
+
     /// The last step here, as a crumb reads: the final segment, or the
     /// namespace at its root.
     pub fn name(&self) -> String {
@@ -222,6 +232,14 @@ mod tests {
             ]
         );
         assert_eq!(root("cfg").crumbs().collect::<Vec<_>>(), [root("cfg")]);
+    }
+
+    #[test]
+    fn only_a_step_into_a_map_is_a_key() {
+        assert_eq!(at("cfg", "servers[0].host").map_key(), Some("host"));
+        assert_eq!(at("cfg", "['a.b']").map_key(), Some("a.b"));
+        assert_eq!(at("cfg", "servers[0]").map_key(), None);
+        assert_eq!(root("cfg").map_key(), None);
     }
 
     #[test]

@@ -246,6 +246,7 @@ button.danger {
 button.small { padding: .15rem .6rem; font-size: .8rem; }
 
 details.increment input { width: 8rem; }
+details.rename input { width: 16rem; }
 
 details { margin: 1rem 0; }
 summary { cursor: pointer; color: var(--accent); font-weight: 600; }

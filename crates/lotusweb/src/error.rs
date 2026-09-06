@@ -20,6 +20,14 @@ pub enum Error {
     /// The daemon could not be reached, or broke serving the request.
     #[error(transparent)]
     Daemon(lotus_sdk::Error),
+    /// A request of several writes stopped part way: what `done` says
+    /// stands on the chain, and the rest failed as `source` says.
+    #[error("{done}, but then")]
+    Halfway {
+        done: String,
+        #[source]
+        source: Box<Error>,
+    },
 }
 
 impl From<lotus_sdk::Error> for Error {
@@ -41,6 +49,7 @@ impl Error {
             Error::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Error::Daemon(err) if err.is_daemon_unreachable() => StatusCode::BAD_GATEWAY,
             Error::Daemon(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Error::Halfway { source, .. } => source.status(),
         }
     }
 

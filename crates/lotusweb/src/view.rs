@@ -192,6 +192,7 @@ pub fn value_pane(location: &Location, at: &ValueAt, notice: Option<&str>) -> Ma
                 (entries(location, fields.iter().map(|(key, value)| (Subkey::Key(key.clone()), value))))
                 (add_entry(location, Some("Add entry")))
                 (replace(location, value))
+                (rename(location))
                 (delete(location))
             }
             Some(value @ Value::Array(items)) => {
@@ -201,11 +202,13 @@ pub fn value_pane(location: &Location, at: &ValueAt, notice: Option<&str>) -> Ma
                 })))
                 (add_entry(location, None))
                 (replace(location, value))
+                (rename(location))
                 (delete(location))
             }
             Some(value @ Value::Key(_)) => {
                 pre.value { (json::pretty(value)) }
                 p.note { "A trusted key: plain JSON cannot spell one, so it is edited with lotusctl." }
+                (rename(location))
                 (delete(location))
             }
             Some(value) => {
@@ -214,6 +217,7 @@ pub fn value_pane(location: &Location, at: &ValueAt, notice: Option<&str>) -> Ma
                     button { "Save" }
                 }
                 @if matches!(value, Value::Int(_)) { (increment(location)) }
+                (rename(location))
                 (delete(location))
             }
         }
@@ -302,6 +306,23 @@ fn increment(location: &Location) -> Markup {
                     input type="number" name="delta" value="1" step="1" required;
                 }
                 button { "Increment" }
+            }
+        }
+    }
+}
+
+/// Moves a map entry to another key, its value untouched; nothing, where
+/// `location` is not one. The value is carried as the ledger holds it,
+/// so an entry holding a trusted key can be renamed though not edited.
+fn rename(location: &Location) -> Markup {
+    html! {
+        @if let Some(key) = location.map_key() {
+            details.rename {
+                summary { "Rename key" }
+                form hx-patch=(location.url()) {
+                    label { "New key" input name="key" value=(key) required; }
+                    button { "Rename" }
+                }
             }
         }
     }

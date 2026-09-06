@@ -4,7 +4,9 @@
 //! browser: a namespace opens at its root, every map key and array index is
 //! a link one level down, and breadcrumbs lead back up. Leaves are edited as
 //! JSON in place; containers take new entries, can be replaced whole, and
-//! can be deleted.
+//! can be deleted. Any entry of a map can be renamed — moved to a sibling
+//! key with its value untouched — which the page knows from the location
+//! alone: a path's last step is a key or an index.
 //!
 //! The pages are plain HTML over [htmx](https://htmx.org) 4: every link and
 //! form fetches the main pane alone and swaps it in, the sidebar riding
