@@ -1,0 +1,10 @@
+# Environment for lotusweb.service. Install to /etc/default/lotusweb. Every
+# setting is optional.
+
+# Where to serve. The default is loopback only; anything wider should sit
+# behind an authenticating proxy, since every page can write to the ledger
+# with this node's key.
+#LOTUS_WEB_LISTEN=127.0.0.1:8080
+
+# Log filter, as tracing_subscriber's EnvFilter reads it.
+#RUST_LOG=info

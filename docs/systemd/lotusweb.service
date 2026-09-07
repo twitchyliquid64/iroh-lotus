@@ -1,0 +1,58 @@
+# iroh-lotus web view. Install to /etc/systemd/system/lotusweb.service; see docs/systemd.md.
+[Unit]
+Description=iroh-lotus web view
+Documentation=https://github.com/twitchyliquid64/iroh-lotus
+# lotusweb opens one connection to the daemon per request, so it starts and
+# serves (an error page) without lotusd and needs no ordering beyond a
+# preference for the daemon to be up first.
+After=lotusd.service
+Wants=lotusd.service
+
+[Service]
+Type=exec
+# A throwaway user of its own, in the lotus group: that is what reaches the
+# control socket (/var/lib/lotus, lotus:lotus 0750, and the socket 0660), and
+# nothing else on the machine is granted. The key files are 0600, out of reach.
+DynamicUser=yes
+SupplementaryGroups=lotus
+Environment=LOTUS_STATE_DIR=/var/lib/lotus
+Environment=LOTUS_WEB_LISTEN=127.0.0.1:8080
+Environment=RUST_LOG=info
+EnvironmentFile=-/etc/default/lotusweb
+ExecStart=/usr/local/bin/lotusweb
+# Like lotusd, lotusweb shuts down cleanly on SIGINT only.
+KillSignal=SIGINT
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5s
+
+# Hardening. It needs the control socket and its listening TCP port, nothing
+# else; the read-only view of /var/lib/lotus is enough to connect to a socket.
+# A port below 1024 needs CapabilityBoundingSet= and AmbientCapabilities= both
+# set to CAP_NET_BIND_SERVICE, but the proxy in front should be what owns
+# that port (see docs/systemd.md).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

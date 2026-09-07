@@ -8,8 +8,10 @@ Unit files for a Debian (or any systemd) host live in [`systemd/`](systemd/):
 | `lotusd-bootstrap.service` | `/etc/systemd/system/` | One-shot join from an invite, for every node but the first. |
 | `lotusd.sysusers.conf` | `/usr/lib/sysusers.d/lotusd.conf` | The `lotus` system user and group. |
 | `lotusd.default` | `/etc/default/lotusd` | Optional environment: relay, discovery, compaction, log level. |
+| `lotusweb.service` | `/etc/systemd/system/` | The web view, `lotusweb`, on loopback, as a throwaway user in the `lotus` group. Optional. |
+| `lotusweb.default` | `/etc/default/lotusweb` | Optional environment for it: listen address, log level. |
 
-Everything runs as the `lotus` user, and the state directory `/var/lib/lotus` is
+The daemon runs as the `lotus` user, and the state directory `/var/lib/lotus` is
 `lotus:lotus` `0750`, so no operator account can write it directly. That is deliberate:
 the two things that must happen there before `lotusd run` will stay up, minting a cluster
 or joining one, are done *through* systemd, which has the access.
@@ -23,6 +25,14 @@ sudo install -m 0644 docs/systemd/lotusd.service docs/systemd/lotusd-bootstrap.s
 sudo install -m 0644 docs/systemd/lotusd.sysusers.conf /usr/lib/sysusers.d/lotusd.conf
 sudo install -m 0644 docs/systemd/lotusd.default /etc/default/lotusd
 sudo systemd-sysusers
+sudo systemctl daemon-reload
+```
+
+To serve the web view as well:
+
+```sh
+sudo install -m 0644 docs/systemd/lotusweb.service /etc/systemd/system/
+sudo install -m 0644 docs/systemd/lotusweb.default /etc/default/lotusweb
 sudo systemctl daemon-reload
 ```
 
@@ -106,8 +116,27 @@ can always connect; anyone outside the group is refused with a permission error 
 socket.
 
 Note that anyone in `lotus` can write to the ledger with this node's key. Keep the group
-to operators, and if `lotusweb` is run as a service, run it as `lotus` and put an
-authenticating proxy in front of it.
+to operators.
+
+## 5. Serve the web view with `lotusweb`
+
+```sh
+sudo systemctl enable --now lotusweb
+systemctl status lotusweb
+```
+
+It serves `http://127.0.0.1:8080` and reaches the daemon through the same socket
+`lotusctl` uses. The unit runs it as a throwaway user (`DynamicUser=`) that is in the
+`lotus` group and nothing more: enough to open the socket, not enough to read the key
+files. `lotusd` need not be up for it to start, since it connects per request; a page
+loaded while the daemon is down is an error page, and one loaded after it returns works.
+
+Every page can write to the ledger with this node's key, so the default listen address is
+loopback and `/etc/default/lotusweb` is where to widen it. Do that only behind a proxy
+that authenticates (nginx with `auth_basic`, or whatever fronts the rest of the host),
+pointed at `127.0.0.1:8080`; the unit drops the capability to bind a port below 1024, so
+the proxy is what should own port 80 or 443. It stops on SIGINT like the daemon, and
+`Restart=on-failure` covers crashes.
 
 ## Recovery
 
