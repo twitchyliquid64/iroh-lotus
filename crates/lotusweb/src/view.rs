@@ -9,7 +9,7 @@ use axum::http::StatusCode;
 use lotus_sdk::{EnvelopeDigest, NamespaceEntry, NamespaceKey, Subkey, Value, ValueAt};
 use maud::{DOCTYPE, Markup, html};
 
-use crate::{Location, json};
+use crate::{Location, chain, json};
 
 /// Where the embedded htmx build is served.
 pub const HTMX_URL: &str = "/static/htmx.min.js";
@@ -40,12 +40,22 @@ pub enum Sidebar {
     Unavailable(String),
 }
 
+/// What the pane shows, marked in the sidebar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Active<'a> {
+    /// Nothing the sidebar lists: home, or a failure before any page.
+    Nothing,
+    /// A location inside this namespace.
+    Namespace(&'a NamespaceKey),
+    /// The chain.
+    Chain,
+}
+
 /// One page: what fills each part of the document.
 #[derive(Debug)]
 pub struct Page<'a> {
     pub sidebar: &'a Sidebar,
-    /// The namespace the pane is inside, marked in the sidebar.
-    pub active: Option<&'a NamespaceKey>,
+    pub active: Active<'a>,
     pub title: String,
     pub pane: Markup,
 }
@@ -93,20 +103,22 @@ pub fn fragment(page: Page<'_>) -> Markup {
     }
 }
 
-fn sidebar(sidebar: &Sidebar, active: Option<&NamespaceKey>, swap_oob: Option<&str>) -> Markup {
+fn sidebar(sidebar: &Sidebar, active: Active<'_>, swap_oob: Option<&str>) -> Markup {
     html! {
         nav #sidebar hx-swap-oob=[swap_oob] aria-label="Namespaces" {
             @match sidebar {
                 Sidebar::Listed { head, namespaces } => {
                     p.head title=(head.to_hex().as_ref()) {
-                        "head " code { (short(head)) }
+                        "head " a href=(chain::CHAIN_URL) hx-get=(chain::CHAIN_URL) hx-push-url="true" {
+                            code { (short(head)) }
+                        }
                     }
                     @if namespaces.is_empty() {
                         p.empty { "No namespaces yet." }
                     }
                     ul.namespaces {
                         @for entry in namespaces {
-                            li.active[active == Some(&entry.key)]
+                            li.active[active == Active::Namespace(&entry.key)]
                                 .internal[entry.key.as_ref().starts_with(INTERNAL_PREFIX)] {
                                 (link(&Location::namespace(entry.key.clone()), entry.key.as_ref()))
                                 span.shape { (entry.shape) }
@@ -118,18 +130,26 @@ fn sidebar(sidebar: &Sidebar, active: Option<&NamespaceKey>, swap_oob: Option<&s
                     p.error { (why) }
                 }
             }
+            // Apart from the namespaces, at the bottom: what is not one.
+            ul.tools {
+                li.active[active == Active::Chain] {
+                    a href=(chain::CHAIN_URL) hx-get=(chain::CHAIN_URL) hx-push-url="true" { "Chain" }
+                    span.shape { "log" }
+                }
+            }
             footer { "lotusweb " (version::VERSION) }
         }
     }
 }
 
 /// A link that browses to `to`, whether or not script is on.
-fn link(to: &Location, label: &str) -> Markup {
+pub fn link(to: &Location, label: &str) -> Markup {
     let url = to.url();
     html! { a href=(url) hx-get=(url) hx-push-url="true" { (label) } }
 }
 
-fn short(digest: &EnvelopeDigest) -> String {
+/// The first characters of a digest, enough to tell it apart on a page.
+pub fn short(digest: &EnvelopeDigest) -> String {
     digest
         .to_hex()
         .as_ref()
@@ -392,7 +412,7 @@ pub fn bare(status: StatusCode, message: &str) -> Markup {
     let sidebar = Sidebar::Unavailable("Not read.".into());
     document(Page {
         sidebar: &sidebar,
-        active: None,
+        active: Active::Nothing,
         title: format!("{} · lotusweb", status.as_u16()),
         pane: error_pane(None, status, message),
     })

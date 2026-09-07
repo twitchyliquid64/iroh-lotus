@@ -4,23 +4,25 @@
 //! method says what happens there: `GET` shows it, `PUT` replaces what it
 //! holds, `POST` adds an entry inside it, `PATCH` amends it in place — adds
 //! to the integer it is, or moves it to another key of the map it is in —
-//! and `DELETE` removes it.
+//! and `DELETE` removes it. `/chain` shows the canonical chain, bounded by
+//! its query string.
 
 use axum::{
     Router,
-    extract::{Form, State},
+    extract::{Form, Query, State},
     http::{HeaderName, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use lotus_sdk::{Client, NamespaceKey, Subkey, Value, Written};
+use lotus_sdk::{Client, GetEnvelopes, NamespaceKey, Subkey, Value, Written};
 use serde::Deserialize;
 
 use crate::{
     Error, Location,
+    chain::{self, Walk},
     frame::Frame,
     json,
-    view::{self, Page, Sidebar},
+    view::{self, Active, Page, Sidebar},
 };
 
 const HTMX: &str = include_str!("../static/htmx.min.js");
@@ -46,6 +48,7 @@ pub fn router(client: Client) -> Router {
         .delete(remove);
     Router::new()
         .route(HOME_URL, get(home))
+        .route(chain::CHAIN_URL, get(show_chain))
         .route(view::CREATE_URL, post(create))
         .route("/ns/{key}", location.clone())
         .route("/ns/{key}/{*path}", location)
@@ -90,12 +93,31 @@ struct NamespaceForm {
     value: String,
 }
 
+/// How the chain page is bounded, as its form submits it: read as text so
+/// a slip is answered in the page, not by the extractor.
+#[derive(Debug, Default, Deserialize)]
+struct ChainQuery {
+    limit: Option<String>,
+    since: Option<String>,
+}
+
 async fn home(State(app): State<App>, frame: Frame) -> Response {
     app.home(&frame, None).await
 }
 
 async fn browse(State(app): State<App>, frame: Frame, location: Location) -> Response {
     app.show(&frame, &location, None).await
+}
+
+async fn show_chain(
+    State(app): State<App>,
+    frame: Frame,
+    Query(query): Query<ChainQuery>,
+) -> Response {
+    match Walk::parse(query.limit.as_deref(), query.since.as_deref()) {
+        Ok(walk) => app.chain(&frame, &walk).await,
+        Err(error) => app.fail_at(&frame, Active::Chain, &error).await,
+    }
 }
 
 async fn replace(
@@ -252,11 +274,46 @@ impl App {
             StatusCode::OK,
             Page {
                 sidebar: &sidebar,
-                active: None,
+                active: Active::Nothing,
                 title: "lotusweb".into(),
                 pane: view::home(notice),
             },
         )
+    }
+
+    /// The chain, as far as `walk` asks for it. The range and the
+    /// envelopes are two requests — one connection carries one — so the
+    /// chain can move between them: a stale mark, never a wrong envelope.
+    async fn chain(&self, frame: &Frame, walk: &Walk) -> Response {
+        let read = async {
+            let range = self.client.chain_range().await?;
+            let frames = self
+                .client
+                .envelopes(GetEnvelopes::walk(walk.request()))
+                .await?
+                .collect()
+                .await?;
+            Ok::<_, Error>((range, frames))
+        }
+        .await;
+        match read {
+            Ok((range, frames)) => {
+                let sidebar = self.sidebar().await;
+                frame.render(
+                    StatusCode::OK,
+                    Page {
+                        sidebar: &sidebar,
+                        active: Active::Chain,
+                        title: "chain · lotusweb".into(),
+                        pane: chain::pane(walk, &range, &frames),
+                    },
+                )
+            }
+            Err(error) => {
+                tracing::warn!(error = %error.describe(), "reading the chain");
+                self.fail_at(frame, Active::Chain, &error).await
+            }
+        }
     }
 
     /// What `location` holds, read now, with `notice` above it.
@@ -282,7 +339,7 @@ impl App {
             status,
             Page {
                 sidebar: &sidebar,
-                active: Some(location.key()),
+                active: Active::Namespace(location.key()),
                 title: format!("{location} · lotusweb"),
                 pane,
             },
@@ -409,9 +466,25 @@ impl App {
             status,
             Page {
                 sidebar: &sidebar,
-                active: location.map(Location::key),
+                active: location.map_or(Active::Nothing, |at| Active::Namespace(at.key())),
                 title: format!("{} · lotusweb", status.as_u16()),
                 pane: view::error_pane(location, status, &error.describe()),
+            },
+        )
+    }
+
+    /// `error`, in the pane, with `active` marked in the sidebar: for a
+    /// page that is no ledger location.
+    async fn fail_at(&self, frame: &Frame, active: Active<'_>, error: &Error) -> Response {
+        let sidebar = self.sidebar().await;
+        let status = error.status();
+        frame.render(
+            status,
+            Page {
+                sidebar: &sidebar,
+                active,
+                title: format!("{} · lotusweb", status.as_u16()),
+                pane: view::error_pane(None, status, &error.describe()),
             },
         )
     }

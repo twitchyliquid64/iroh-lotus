@@ -20,11 +20,18 @@
 //! command line, `/ns/<namespace>/<path>` with the path written
 //! `servers[0].host`, so a path copied from one reads in the other.
 //!
+//! Beside the values sits the chain they fold down from, at `/chain`: the
+//! canonical chain as `lotusctl chain` prints it, one stanza per envelope,
+//! newest first, bounded by the query string as that command is bounded
+//! by its flags.
+//!
 //! Every read and write goes through [`lotus_sdk`]; [`router`] is the whole
 //! server, over a [`Client`](lotus_sdk::Client).
 
 mod app;
 pub use app::router;
+
+mod chain;
 
 mod error;
 pub use error::Error;

@@ -572,3 +572,110 @@ async fn the_assets_are_served() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(headers[header::CONTENT_TYPE], "text/css");
 }
+
+#[tokio::test]
+async fn the_chain_page_lists_the_envelopes_newest_first_with_the_ends_marked() {
+    let node = seeded().await;
+    node.client
+        .set(key("cfg"), path("host"), Value::from("b.example"))
+        .await
+        .unwrap();
+    let range = node.client.chain_range().await.unwrap();
+
+    let (status, _, body) = send(&node, get("/chain")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.starts_with("<!DOCTYPE html>"), "{body}");
+    assert!(body.contains("<title>chain · lotusweb</title>"), "{body}");
+    // The head at the top, the genesis at the bottom, each marked.
+    let head = body.find(range.head.to_hex().as_ref()).expect("the head");
+    let root = body.find(range.root.to_hex().as_ref()).expect("the root");
+    assert!(head < root, "{body}");
+    assert!(body.contains(r#"<span class="mark">head</span>"#), "{body}");
+    assert!(body.contains(r#"<span class="mark">root</span>"#), "{body}");
+    assert!(body.contains("— (genesis)"), "{body}");
+    // What each message did, its target a link into the browser.
+    assert!(
+        body.contains(r#"set <a href="/ns/cfg/host" hx-get="/ns/cfg/host" hx-push-url="true">host</a> in namespace <a href="/ns/cfg""#),
+        "{body}"
+    );
+    assert!(body.contains("&quot;b.example&quot;"), "{body}");
+    assert!(body.contains("all matched, weight"), "{body}");
+    // The whole chain is on the page, so a prev links to its stanza.
+    assert!(
+        body.contains(&format!(r##"<a href="#e-{}""##, short(&range.root))),
+        "{body}"
+    );
+    // The chain is marked in the sidebar, at the bottom, apart from the
+    // namespaces.
+    assert!(
+        body.contains(r#"<ul class="tools"><li class="active"><a href="/chain""#),
+        "{body}"
+    );
+    assert!(
+        !body.contains(r#"<li class="active"><a href="/ns/"#),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn the_chain_page_is_bounded_by_its_query_string() {
+    let node = seeded().await;
+
+    let (status, _, body) = send(&node, get("/chain?limit=1&since=2h")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.matches(r#"<article class="envelope""#).count(), 1);
+    assert!(body.contains(r#"<span class="mark">head</span>"#), "{body}");
+    assert!(
+        !body.contains(r#"<span class="mark">root</span>"#),
+        "{body}"
+    );
+    assert!(
+        body.contains("Older envelopes are held but not shown"),
+        "{body}"
+    );
+    // The form shows the bounds in force.
+    assert!(
+        body.contains(r#"name="limit" min="1" step="1" placeholder="all" value="1""#),
+        "{body}"
+    );
+    assert!(
+        body.contains(r#"name="since" placeholder="e.g. 15m, 2h, 7d" value="2h""#),
+        "{body}"
+    );
+
+    // A window nothing was stored in shows nothing, not a failure.
+    let (status, _, body) = send(&node, get("/chain?since=0s")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Nothing in this window."), "{body}");
+
+    // A bound that is not one is answered in the page.
+    let (status, _, body) = send(&node, get("/chain?since=soon")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("`soon` is not a window"), "{body}");
+    let (status, _, body) = send(&node, get("/chain?limit=many")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body.contains("`many` is not a number of envelopes"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn the_chain_pane_is_swapped_in_like_any_other() {
+    let node = seeded().await;
+
+    let (status, _, body) = send(&node, htmx(get("/chain"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.contains("<html"), "{body}");
+    assert!(body.contains("<title>chain · lotusweb</title>"), "{body}");
+    assert!(
+        body.contains(r#"<nav id="sidebar" hx-swap-oob="outerHTML""#),
+        "{body}"
+    );
+    // The head in the sidebar leads to the chain too.
+    assert!(body.contains(r#"head <a href="/chain""#), "{body}");
+}
+
+fn short(digest: &lotus_sdk::EnvelopeDigest) -> String {
+    digest.to_hex().as_ref().chars().take(12).collect()
+}
