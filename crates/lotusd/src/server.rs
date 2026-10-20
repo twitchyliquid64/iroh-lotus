@@ -32,6 +32,7 @@ use crate::{
     addr_publish::{AddrPublish, AddrPublishHandle, PublishState},
     bootstrap::{InviteError, Invites, Welcomed},
     invite::{self, Invite, Token},
+    ip_family::IpFamily,
     peer_egress::{PeerEgress, PeerEgressHandle, PeerState, PeerStatus},
     peer_ingress::{PeerIngress, PeerIngressHandle},
 };
@@ -221,6 +222,9 @@ pub struct Identity {
     /// The endpoint's id and the addresses it is reachable at right now —
     /// what an operator compares against the ledger's entry for this node.
     pub endpoint: Option<EndpointAddr>,
+    /// The IP families the endpoint has sockets bound for; `None` without
+    /// an endpoint or without IP sockets.
+    pub ip_family: Option<IpFamily>,
 }
 
 /// The server actor, encapsulates all running/server state.
@@ -422,6 +426,7 @@ impl Server {
             ServerMsg::Identity(r) => r.respond(Ok(Identity {
                 node: core.key_id(),
                 endpoint: peers.endpoint.as_ref().map(Endpoint::addr),
+                ip_family: peers.endpoint.as_ref().and_then(IpFamily::of),
             })),
             ServerMsg::Read(read, r) => r.respond(
                 core.read(&read.key, read.path.as_ref())
@@ -785,6 +790,11 @@ impl Rpc {
             endpoint: identity.endpoint.map(|addr| rpc::EndpointInfo {
                 id: addr.id.to_z32(),
                 addrs: addr.addrs.iter().map(ToString::to_string).collect(),
+                ip_family: identity.ip_family.map(|family| match family {
+                    IpFamily::Dual => rpc::IpFamily::Dual,
+                    IpFamily::Ipv6 => rpc::IpFamily::Ipv6,
+                    IpFamily::Ipv4 => rpc::IpFamily::Ipv4,
+                }),
             }),
             chain,
             peers: peers

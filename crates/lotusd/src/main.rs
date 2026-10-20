@@ -1,13 +1,15 @@
-use std::{os::unix::fs::PermissionsExt, path::PathBuf, process::ExitCode};
+use std::{net::SocketAddr, os::unix::fs::PermissionsExt, path::PathBuf, process::ExitCode};
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use iroh::{
     Endpoint, RelayMode,
     address_lookup::{AddrFilter, DnsAddressLookup, PkarrPublisher, PkarrResolver},
-    endpoint::{default_relay_mode, presets},
+    endpoint::{InvalidSocketAddr, default_relay_mode, presets},
 };
-use lotusd::{Core, IfInitialized, Server, bootstrap, invite::Invite, peer_ingress::Protocol};
+use lotusd::{
+    Core, IfInitialized, Server, bootstrap, invite::Invite, ip_family, peer_ingress::Protocol,
+};
 use render::{ColorChoice, Entry, Render};
 use tokio::net::UnixListener;
 use tokio::runtime::Builder;
@@ -136,6 +138,15 @@ pub struct GlobalArgs {
     /// resolves peers through
     #[arg(long, value_enum, global = true, env = "LOTUS_ADDR_DISCOVERY", default_value_t = AddrDiscovery::None)]
     addr_discovery: AddrDiscovery,
+
+    /// Bind the iroh endpoint's UDP socket here instead of 0.0.0.0:0 and
+    /// [::]:0; repeat for one address per IP family.
+    ///
+    /// A family left out is not used at all: no socket, probes, relay
+    /// connections or port mapping, and no address of it advertised or
+    /// dialled. `--bind [::]:0` runs IPv6 only.
+    #[arg(long, global = true, env = "LOTUS_BIND", value_delimiter = ',')]
+    bind: Vec<SocketAddr>,
 }
 
 /// The relay infrastructure an endpoint binds with, as `--relay` names it.
@@ -174,13 +185,19 @@ pub enum AddrDiscovery {
 
 impl GlobalArgs {
     /// EndpointBuilder returns an iroh endpoint builder configured as
-    /// `--relay` and `--addr-discovery` select.
-    pub fn endpoint_builder(&self) -> iroh::endpoint::Builder {
-        let builder = Endpoint::builder(presets::Minimal).relay_mode(match self.relay {
-            Relay::None => RelayMode::Disabled,
-            Relay::N0 => default_relay_mode(),
-        });
-        match self.addr_discovery {
+    /// `--relay`, `--addr-discovery` and `--bind` select.
+    ///
+    /// Fails on two `--bind` addresses of one family.
+    pub fn endpoint_builder(&self) -> Result<iroh::endpoint::Builder, MainError> {
+        let builder = ip_family::bind(
+            Endpoint::builder(presets::Minimal).relay_mode(match self.relay {
+                Relay::None => RelayMode::Disabled,
+                Relay::N0 => default_relay_mode(),
+            }),
+            &self.bind,
+        )
+        .map_err(MainError::BindAddr)?;
+        Ok(match self.addr_discovery {
             AddrDiscovery::None => builder,
             AddrDiscovery::N0 => {
                 // n0's publisher keeps direct addresses out of public DNS
@@ -197,7 +214,7 @@ impl GlobalArgs {
                     .address_lookup(PkarrResolver::n0_dns())
                     .address_lookup(DnsAddressLookup::n0_dns())
             }
-        }
+        })
     }
 
     /// StateDir returns the directory where daemon state is stored: the `--state-dir`
@@ -301,7 +318,7 @@ async fn async_main() -> Result<(), MainError> {
             // rather than on the handshake.
             let endpoint = cli
                 .global_args
-                .endpoint_builder()
+                .endpoint_builder()?
                 .secret_key(keys.iroh_secret().clone())
                 .alpns(Protocol::alpns())
                 .bind()
@@ -368,7 +385,7 @@ async fn async_main() -> Result<(), MainError> {
 
         let endpoint = cli
             .global_args
-            .endpoint_builder()
+            .endpoint_builder()?
             .secret_key(core.iroh_secret().clone())
             .alpns(Protocol::alpns())
             .bind()
@@ -399,6 +416,8 @@ pub enum MainError {
     Init(lotusd::InitError),
     /// The iroh endpoint could not be bound.
     Bind(iroh::endpoint::BindError),
+    /// The `--bind` addresses could not all be bound together.
+    BindAddr(InvalidSocketAddr),
     /// The join did not complete.
     Join(bootstrap::JoinError),
     /// The envelope log could not be read.

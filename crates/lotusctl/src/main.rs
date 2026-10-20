@@ -1234,6 +1234,9 @@ impl fmt::Display for StatusText<'_> {
                         }
                     }
                 }
+                if let Some(family) = endpoint.ip_family {
+                    writeln!(f, "ip-family  {family}")?;
+                }
                 if let Some(published) = &status.published {
                     writeln!(f, "listing    {published}")?;
                 }

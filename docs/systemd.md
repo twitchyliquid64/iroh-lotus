@@ -7,7 +7,7 @@ Unit files for a Debian (or any systemd) host live in [`systemd/`](systemd/):
 | `lotusd.service` | `/etc/systemd/system/` | The daemon, `lotusd run`, as the `lotus` user over `/var/lib/lotus`. |
 | `lotusd-bootstrap.service` | `/etc/systemd/system/` | One-shot join from an invite, for every node but the first. |
 | `lotusd.sysusers.conf` | `/usr/lib/sysusers.d/lotusd.conf` | The `lotus` system user and group. |
-| `lotusd.default` | `/etc/default/lotusd` | Optional environment: relay, discovery, compaction, log level. |
+| `lotusd.default` | `/etc/default/lotusd` | Optional environment: relay, discovery, bind addresses, compaction, log level. |
 | `lotusweb.service` | `/etc/systemd/system/` | The web view, `lotusweb`, on loopback, as a throwaway user in the `lotus` group. Optional. |
 | `lotusweb.default` | `/etc/default/lotusweb` | Optional environment for it: listen address, log level. |
 

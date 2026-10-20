@@ -10,6 +10,11 @@
 # through it).
 #LOTUS_ADDR_DISCOVERY=none
 
+# UDP addresses the endpoint binds, comma-separated, one per IP family
+# (default 0.0.0.0:0 and [::]:0). A family left out is not used at all:
+# [::]:0 alone runs IPv6 only. A fixed port goes here too.
+#LOTUS_BIND=0.0.0.0:0,[::]:0
+
 # Keep at least this many of the newest envelopes through compaction.
 #LOTUS_KEEP_ENVELOPES=32
 

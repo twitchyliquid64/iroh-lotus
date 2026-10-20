@@ -45,6 +45,7 @@ use wire::{Envelope, EnvelopeDigest, Key, KeyId, PublicKey, msg::FullCheckpoint}
 use crate::{
     AdmitError, CannotSignAlone, ChainError, Core, InitError, NodeKeys, ServerHandle,
     invite::{self, Invite, Token},
+    ip_family,
     peer_ingress::CloseReason,
     sync_driver::{self, SyncError},
 };
@@ -582,7 +583,10 @@ pub async fn join(
     );
 
     let conn = endpoint
-        .connect(invite.endpoint.clone(), ALPN)
+        .connect(
+            ip_family::reachable(endpoint, invite.endpoint.clone()),
+            ALPN,
+        )
         .await
         .map_err(JoinError::Connect)?;
     let (mut send, mut recv) = step(conn.open_bi()).await.map_err(JoinError::Open)?;

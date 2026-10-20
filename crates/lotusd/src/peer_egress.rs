@@ -36,7 +36,7 @@ use tracing::Instrument;
 use wire::{EnvelopeDigest, KeyId, msg::NamespaceKey};
 
 use crate::{
-    ChangeFilter, Core, RequestError, Responder, ServerHandle, SubscriptionHandle,
+    ChangeFilter, Core, RequestError, Responder, ServerHandle, SubscriptionHandle, ip_family,
     peer_ingress::CloseReason, peer_link::Link, server::WeakServerHandle,
 };
 
@@ -232,6 +232,7 @@ impl PeerEgress {
         let desired: BTreeMap<KeyId, EndpointAddr> = desired
             .into_iter()
             .filter(|(node, addr)| *node != self.node && addr.id != self.endpoint.id())
+            .map(|(node, addr)| (node, ip_family::reachable(&self.endpoint, addr)))
             .collect();
 
         let gone: Vec<KeyId> = table

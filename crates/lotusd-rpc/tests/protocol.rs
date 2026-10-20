@@ -4,12 +4,13 @@
 use std::collections::BTreeMap;
 
 use lotusd_rpc::{
-    Call, ChainRange, ChainWalk, Changed, Compact, Compacted, EnvelopeFrame, EnvelopeSelector,
-    Error, Failure, FailureKind, GetChainRange, GetEnvelopes, GetVersion, Handler, InviteCode, Len,
-    ListNamespaces, MAX_FRAME_LEN, MapMeta, Method, NamespaceChange, NamespaceEntry, NamespaceList,
-    NodeStatus, Queried, Query, QueryKind, Read, Reorged, Request, Response, Responses, Shape,
-    ValueAt, ValueMeta, Verification, Watch, WatchEvent, WatchPath, WatchSelector, WeakDelete,
-    WeakDeleteMatching, WeakIncrement, WeakPush, WeakSet, WriteOutcome, Written, call, serve,
+    Call, ChainRange, ChainWalk, Changed, Compact, Compacted, EndpointInfo, EnvelopeFrame,
+    EnvelopeSelector, Error, Failure, FailureKind, GetChainRange, GetEnvelopes, GetVersion,
+    Handler, InviteCode, IpFamily, Len, ListNamespaces, MAX_FRAME_LEN, MapMeta, Method,
+    NamespaceChange, NamespaceEntry, NamespaceList, NodeStatus, Queried, Query, QueryKind, Read,
+    Reorged, Request, Response, Responses, Shape, ValueAt, ValueMeta, Verification, Watch,
+    WatchEvent, WatchPath, WatchSelector, WeakDelete, WeakDeleteMatching, WeakIncrement, WeakPush,
+    WeakSet, WriteOutcome, Written, call, serve,
 };
 use std::time::Duration;
 
@@ -942,4 +943,34 @@ async fn a_rejected_write_is_told_apart_from_a_broken_daemon() {
     };
     assert_eq!(failure.kind, FailureKind::Rejected);
     assert_eq!(failure.message, "no namespace a");
+}
+
+/// An endpoint as a daemon from before `ip_family` describes it decodes,
+/// with no family, and one that names a family keeps it.
+#[test]
+fn an_endpoint_without_a_family_decodes() {
+    #[derive(cbor2::Cbor)]
+    struct Before {
+        #[cbor(key = 1)]
+        id: String,
+        #[cbor(key = 2)]
+        addrs: Vec<String>,
+    }
+    let before = Before {
+        id: "abc".to_owned(),
+        addrs: vec!["ip:[::1]:1".to_owned()],
+    };
+    let info = wire::decode::<EndpointInfo>(&wire::encode(&before).unwrap()).unwrap();
+    assert_eq!(info.id, before.id);
+    assert_eq!(info.addrs, before.addrs);
+    assert_eq!(info.ip_family, None);
+
+    let info = EndpointInfo {
+        ip_family: Some(IpFamily::Ipv6),
+        ..info
+    };
+    assert_eq!(
+        wire::decode::<EndpointInfo>(&wire::encode(&info).unwrap()).unwrap(),
+        info
+    );
 }

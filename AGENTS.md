@@ -45,6 +45,9 @@ actor messages through a `ServerHandle`; each local connection gets its own task
    key set. It only maintains transports for the endpoint the ledger already names: a delisted node stays delisted, and
    one listed under another endpoint id is left alone (which endpoint a node *is* stays an operator's call — a daemon
    over a copied state dir must not capture the original's entry). `lotusctl status` reports where the listing stands.
+ - `ip_family` binds the endpoint where `--bind` says. Given one IP family only, it wraps the DNS resolver so the
+   other family's lookups come back empty (relays are dialled over TCP, outside those sockets) and, for IPv6, turns
+   port mapping off. Peer addresses of a family the endpoint has no socket for are dropped before dialling.
  - `invite` is the one-word text (`lotus1…`) an operator carries from a running node to a blank one: sponsor id, endpoint
    address, pinned root digest, one-time token.
  - `bootstrap` is the join protocol under its own ALPN: the joiner redeems the token, gets the root envelope — plus the

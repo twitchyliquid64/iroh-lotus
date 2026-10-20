@@ -210,3 +210,23 @@ moves, so the ledger keeps up on its own, and the relay carries the traffic mean
 Where peers share a LAN with the node and you would rather they connect directly,
 `hostNetwork: true` puts the daemon on the node's own addresses — at the cost of the pod
 seeing the host's whole network namespace.
+
+### IPv6 only
+
+On a dual-stack pod the daemon uses IPv4 too: it binds an IPv4 socket beside the IPv6
+one, probes and reaches the relays over IPv4, and lists its IPv4 pod and NAT addresses in
+the ledger. `--bind '[::]:0'` (or `LOTUS_BIND='[::]:0'`) keeps it off IPv4: no IPv4
+socket, no IPv4 probes, relays reached only at their AAAA addresses, no port mapping, and
+no IPv4 address published or dialled. Set it on the `bootstrap` init container as well as
+the daemon, since both run an endpoint. `lotusctl status` shows the family in force as
+`ip-family`.
+
+```yaml
+          env:
+            - name: LOTUS_BIND
+              value: "[::]:0"
+```
+
+Name lookups still go to the nameservers in the pod's `/etc/resolv.conf`; on a pod that
+must not use IPv4 at all, those need to be IPv6 addresses too. `--bind 0.0.0.0:0` is the
+mirror image, and a fixed port (`--bind '[::]:7842'`) works the same way.

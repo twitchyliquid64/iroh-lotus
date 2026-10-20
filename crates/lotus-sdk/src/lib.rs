@@ -72,9 +72,9 @@ pub use client::Client;
 pub use lotusd_rpc as rpc;
 pub use lotusd_rpc::{
     ChainRange, ChainWalk, Changed, Compacted, EnvelopeFrame, EnvelopeSelector, Failure,
-    FailureKind, GetEnvelopes, InviteCode, NamespaceChange, NamespaceEntry, NamespaceList,
-    NodeStatus, Queried, QueryKind, Shape, ValueAt, ValueMeta, WatchEvent, WatchSelector,
-    WriteOutcome, Written,
+    FailureKind, GetEnvelopes, InviteCode, IpFamily, NamespaceChange, NamespaceEntry,
+    NamespaceList, NodeStatus, Queried, QueryKind, Shape, ValueAt, ValueMeta, WatchEvent,
+    WatchSelector, WriteOutcome, Written,
 };
 pub use wire;
 pub use wire::{

@@ -517,6 +517,29 @@ pub struct EndpointInfo {
     pub id: String,
     #[cbor(key = 2)]
     pub addrs: Vec<String>,
+    /// The IP families the endpoint has sockets bound for; `None` when it
+    /// has none, or from a daemon too old to say.
+    #[cbor(key = 3)]
+    pub ip_family: Option<IpFamily>,
+}
+
+/// The IP families an endpoint has sockets bound for.
+#[derive(Debug, Copy, Clone, Cbor, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IpFamily {
+    Dual,
+    Ipv6,
+    Ipv4,
+}
+
+impl fmt::Display for IpFamily {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            IpFamily::Dual => "dual",
+            IpFamily::Ipv6 => "ipv6",
+            IpFamily::Ipv4 => "ipv4",
+        })
+    }
 }
 
 /// One peer the daemon keeps a connection to.

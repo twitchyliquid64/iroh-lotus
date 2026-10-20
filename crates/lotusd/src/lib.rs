@@ -26,6 +26,7 @@ pub use subscribe::{
 
 pub mod bootstrap;
 pub mod invite;
+pub mod ip_family;
 pub mod peer_egress;
 pub mod peer_ingress;
 pub mod peer_link;
