@@ -5,7 +5,8 @@ use clap_complete::Shell;
 use iroh::{
     Endpoint, RelayMode,
     address_lookup::{AddrFilter, DnsAddressLookup, PkarrPublisher, PkarrResolver},
-    endpoint::{InvalidSocketAddr, default_relay_mode, presets},
+    endpoint::{default_relay_mode, presets},
+    tls::CaTlsConfig,
 };
 use lotusd::{
     Core, IfInitialized, Server, bootstrap, invite::Invite, ip_family, peer_ingress::Protocol,
@@ -185,15 +186,18 @@ pub enum AddrDiscovery {
 
 impl GlobalArgs {
     /// EndpointBuilder returns an iroh endpoint builder configured as
-    /// `--relay`, `--addr-discovery` and `--bind` select.
+    /// `--relay`, `--addr-discovery` and `--bind` select, trusting the host's
+    /// CA store for relay, pkarr and DNS-over-HTTPS TLS.
     ///
-    /// Fails on two `--bind` addresses of one family.
+    /// Fails on two `--bind` addresses of one family, or a CA store that
+    /// cannot be read.
     pub fn endpoint_builder(&self) -> Result<iroh::endpoint::Builder, MainError> {
         let builder = ip_family::bind(
             Endpoint::builder(presets::Minimal).relay_mode(match self.relay {
                 Relay::None => RelayMode::Disabled,
                 Relay::N0 => default_relay_mode(),
             }),
+            CaTlsConfig::system(),
             &self.bind,
         )
         .map_err(MainError::BindAddr)?;
@@ -416,8 +420,9 @@ pub enum MainError {
     Init(lotusd::InitError),
     /// The iroh endpoint could not be bound.
     Bind(iroh::endpoint::BindError),
-    /// The `--bind` addresses could not all be bound together.
-    BindAddr(InvalidSocketAddr),
+    /// The `--bind` addresses could not all be bound together, or the CA
+    /// store could not be read.
+    BindAddr(ip_family::BindError),
     /// The join did not complete.
     Join(bootstrap::JoinError),
     /// The envelope log could not be read.

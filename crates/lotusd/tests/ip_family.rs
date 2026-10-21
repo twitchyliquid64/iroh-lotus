@@ -9,6 +9,7 @@ use std::{
 
 use iroh::{
     Endpoint, EndpointAddr, RelayMode, RelayUrl, SecretKey, TransportAddr, endpoint::presets,
+    tls::CaTlsConfig,
 };
 use lotusd::ip_family::{self, IpFamily};
 use tokio::time::{Instant, sleep};
@@ -22,6 +23,7 @@ const V6: SocketAddr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
 async fn endpoint(bind: &[SocketAddr]) -> Endpoint {
     ip_family::bind(
         Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Disabled),
+        CaTlsConfig::embedded(),
         bind,
     )
     .unwrap()
@@ -132,5 +134,5 @@ fn two_addresses_of_one_family_are_refused() {
     let builder = Endpoint::builder(presets::Minimal);
     let other = SocketAddr::from((Ipv6Addr::LOCALHOST, 0));
 
-    assert!(ip_family::bind(builder, &[V6, other]).is_err());
+    assert!(ip_family::bind(builder, CaTlsConfig::embedded(), &[V6, other]).is_err());
 }

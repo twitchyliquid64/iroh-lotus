@@ -47,7 +47,12 @@ actor messages through a `ServerHandle`; each local connection gets its own task
    over a copied state dir must not capture the original's entry). `lotusctl status` reports where the listing stands.
  - `ip_family` binds the endpoint where `--bind` says. Given one IP family only, it wraps the DNS resolver so the
    other family's lookups come back empty (relays are dialled over TCP, outside those sockets) and, for IPv6, turns
-   port mapping off. Peer addresses of a family the endpoint has no socket for are dropped before dialling.
+   port mapping off. Peer addresses of a family the endpoint has no socket for are dropped before dialling. It also
+   sets the CA roots for the TLS iroh speaks to relays, pkarr servers and DNS-over-HTTPS resolvers — the host's store
+   (`CaTlsConfig::system()`, iroh's `platform-verifier` feature), never a compiled-in snapshot, so a root the OS
+   distrusts is distrusted without a rebuild. The two sit together because a custom resolver replaces the one iroh
+   builds from those roots: the wrapped resolver must be handed the same config or its DNS-over-HTTPS silently falls
+   back to webpki-roots.
  - `invite` is the one-word text (`lotus1…`) an operator carries from a running node to a blank one: sponsor id, endpoint
    address, pinned root digest, one-time token.
  - `bootstrap` is the join protocol under its own ALPN: the joiner redeems the token, gets the root envelope — plus the

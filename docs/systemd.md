@@ -37,7 +37,9 @@ sudo systemctl daemon-reload
 ```
 
 The default relay is n0's public network, reached over HTTPS, so the host needs the
-`ca-certificates` package (present on any normal Debian install).
+`ca-certificates` package (present on any normal Debian install). lotusd trusts the host's
+CA store, not a compiled-in copy: a root the distribution distrusts is distrusted at once,
+and `SSL_CERT_FILE`/`SSL_CERT_DIR` in `/etc/default/lotusd` point it at another bundle.
 
 ## 2. Bring the state directory to life
 

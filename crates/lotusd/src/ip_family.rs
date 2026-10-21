@@ -9,6 +9,7 @@
 
 use std::{
     future::Future,
+    io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
 };
@@ -17,7 +18,19 @@ use iroh::{
     Endpoint, EndpointAddr, TransportAddr,
     dns::{BoxIter, DNS_TIMEOUT, DnsError, DnsResolver, Resolver, TxtRecordData},
     endpoint::{Builder, InvalidSocketAddr, PortmapperConfig},
+    tls::{CaTlsConfig, default_provider},
 };
+
+/// Why `bind` refused a builder.
+#[derive(Debug, thiserror::Error)]
+pub enum BindError {
+    /// Two `addrs` of one family.
+    #[error(transparent)]
+    Addr(InvalidSocketAddr),
+    /// The CA roots could not be loaded for the resolver.
+    #[error("loading the CA roots the resolver trusts")]
+    CaRoots(#[source] io::Error),
+}
 
 /// The IP families an endpoint has sockets bound for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,13 +40,19 @@ pub enum IpFamily {
     Ipv4,
 }
 
-/// Bind returns `builder` bound to exactly `addrs` in place of iroh's
-/// `0.0.0.0:0` and `[::]:0`, and kept off any family `addrs` leaves out.
-/// Empty `addrs` leaves it as it is.
+/// Bind returns `builder` trusting `ca_tls` for the TLS it speaks to relays,
+/// pkarr servers and DNS-over-HTTPS resolvers, bound to exactly `addrs` in
+/// place of iroh's `0.0.0.0:0` and `[::]:0`, and kept off any family `addrs`
+/// leaves out. Empty `addrs` leaves the sockets as they are.
 ///
 /// Fails on two addresses of one family: iroh routes each family through
 /// one socket.
-pub fn bind(builder: Builder, addrs: &[SocketAddr]) -> Result<Builder, InvalidSocketAddr> {
+pub fn bind(
+    builder: Builder,
+    ca_tls: CaTlsConfig,
+    addrs: &[SocketAddr],
+) -> Result<Builder, BindError> {
+    let builder = builder.ca_tls_config(ca_tls.clone());
     let Some(family) = IpFamily::of_addrs(addrs) else {
         return Ok(builder);
     };
@@ -41,19 +60,29 @@ pub fn bind(builder: Builder, addrs: &[SocketAddr]) -> Result<Builder, InvalidSo
         .iter()
         .try_fold(builder.clear_ip_transports(), |builder, addr| {
             builder.bind_addr(*addr)
-        })?;
+        })
+        .map_err(BindError::Addr)?;
     let narrowed = |builder: Builder| {
-        builder.dns_resolver(DnsResolver::custom(OneFamily {
-            inner: DnsResolver::new(),
-            family,
-        }))
+        // A custom resolver replaces the one iroh would have built from
+        // `ca_tls_config`, roots included: without these the narrowed
+        // resolver's DNS-over-HTTPS would trust webpki-roots instead.
+        let tls = ca_tls
+            .client_config(default_provider())
+            .map_err(BindError::CaRoots)?;
+        let inner = DnsResolver::builder()
+            .with_system_defaults()
+            .tls_client_config(tls)
+            .build();
+        Ok(builder.dns_resolver(DnsResolver::custom(OneFamily { inner, family })))
     };
-    Ok(match family {
-        IpFamily::Dual => builder,
+    match family {
+        IpFamily::Dual => Ok(builder),
         // UPnP, PCP and NAT-PMP map IPv4 ports only.
-        IpFamily::Ipv6 => narrowed(builder).portmapper_config(PortmapperConfig::Disabled),
+        IpFamily::Ipv6 => {
+            narrowed(builder).map(|b| b.portmapper_config(PortmapperConfig::Disabled))
+        }
         IpFamily::Ipv4 => narrowed(builder),
-    })
+    }
 }
 
 impl IpFamily {

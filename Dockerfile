@@ -29,9 +29,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     mkdir -p /out /state; \
     cp target/release/lotusd target/release/lotusctl target/release/lotusweb /out/
 
-# distroless/static carries the CA bundle the n0 relay's HTTPS needs and an
-# /etc/passwd with `nonroot` (65532), and nothing else — the binaries are static,
-# so there is no libc, shell or package manager to keep patched.
+# distroless/static carries the CA bundle lotusd trusts for the n0 relay's HTTPS
+# (read live from /etc/ssl/certs, or SSL_CERT_FILE/SSL_CERT_DIR when set, never
+# compiled in) and an /etc/passwd with `nonroot` (65532), and nothing else — the
+# binaries are static, so there is no libc, shell or package manager to keep
+# patched.
 FROM gcr.io/distroless/static-debian12:nonroot
 
 COPY --from=build /out/lotusd /out/lotusctl /out/lotusweb /usr/local/bin/
