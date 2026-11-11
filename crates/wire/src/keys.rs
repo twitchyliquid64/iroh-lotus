@@ -4,7 +4,7 @@
 //! verification" section of AGENTS.md covers why that rule set and not
 //! another.
 
-use core::fmt;
+use core::{fmt, str::FromStr};
 use std::collections::BTreeMap;
 
 use cbor2::Cbor;
@@ -12,7 +12,7 @@ use ed25519_zebra::{Signature as ZebraSignature, VerificationKey};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
-    codec::{byte_array, dual_repr, serialize_byte_array},
+    codec::{byte_array, decode_hex, dual_repr, serialize_byte_array},
     envelope::EnvelopeSignatureDigest,
 };
 
@@ -142,6 +142,54 @@ impl fmt::Display for PublicKey {
         }
     }
 }
+
+/// Reads back what `Display` writes: `ed25519:` then the key's 64 hex
+/// digits, of either case.
+impl FromStr for PublicKey {
+    type Err = PublicKeyParseError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let (scheme, key) = text.split_once(':').ok_or(PublicKeyParseError::NoScheme)?;
+        match scheme {
+            "ed25519" => decode_hex(key)
+                .map(|bytes| Self::Ed25519(Ed25519PublicKey::from_bytes(bytes)))
+                .ok_or(PublicKeyParseError::BadKey { scheme: "ed25519" }),
+            scheme => Err(PublicKeyParseError::UnknownScheme(scheme.to_owned())),
+        }
+    }
+}
+
+/// Why text did not read as a [`PublicKey`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PublicKeyParseError {
+    /// No `scheme:` before the key material.
+    NoScheme,
+    /// A scheme this build does not know.
+    UnknownScheme(String),
+    /// Key material that is not the scheme's width of hex.
+    BadKey { scheme: &'static str },
+}
+
+impl fmt::Display for PublicKeyParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoScheme => f.write_str("no scheme; write a key as ed25519:<64 hex digits>"),
+            Self::UnknownScheme(scheme) => {
+                write!(
+                    f,
+                    "`{scheme}` is not a key scheme; the one known is ed25519"
+                )
+            }
+            Self::BadKey { scheme } => match *scheme {
+                "ed25519" => f.write_str("an ed25519 key is 64 hex digits"),
+                scheme => write!(f, "not a {scheme} key"),
+            },
+        }
+    }
+}
+
+impl core::error::Error for PublicKeyParseError {}
 
 /// A short, stable reference to a [`Key`].
 ///
@@ -398,6 +446,42 @@ mod tests {
             &Signature::Ed25519(Ed25519Signature::from_bytes([0xcd; 64])),
             &format!("a1015840{}", "cd".repeat(64)),
         );
+    }
+
+    #[test]
+    fn a_public_key_reads_back_what_it_displays() {
+        let key = public_key(&signing_key());
+        assert_eq!(key.to_string().parse::<PublicKey>(), Ok(key));
+        assert_eq!(
+            format!("ed25519:{}", "AB".repeat(32)).parse::<PublicKey>(),
+            Ok(PublicKey::Ed25519(Ed25519PublicKey::from_bytes([0xab; 32])))
+        );
+    }
+
+    #[test]
+    fn text_that_is_not_a_public_key_is_refused() {
+        let bad_key = Err(PublicKeyParseError::BadKey { scheme: "ed25519" });
+        assert_eq!(
+            "ab".repeat(32).parse::<PublicKey>(),
+            Err(PublicKeyParseError::NoScheme)
+        );
+        assert_eq!(
+            format!("rsa:{}", "ab".repeat(32)).parse::<PublicKey>(),
+            Err(PublicKeyParseError::UnknownScheme("rsa".to_owned()))
+        );
+        for key in [
+            "ab".repeat(31),
+            "ab".repeat(33),
+            "a".repeat(63),
+            format!("{}zz", "ab".repeat(31)),
+            String::new(),
+        ] {
+            assert_eq!(
+                format!("ed25519:{key}").parse::<PublicKey>(),
+                bad_key,
+                "{key}"
+            );
+        }
     }
 
     #[test]

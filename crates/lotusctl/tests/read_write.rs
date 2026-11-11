@@ -165,6 +165,20 @@ impl Node {
         self.handle.insert([envelope]).await.unwrap();
     }
 
+    /// What `namespace` holds at `path`, read from the daemon itself rather
+    /// than through the CLI, so a test sees the value's type and not how
+    /// `get` spells it.
+    async fn stored(&self, namespace: &str, path: Option<&str>) -> Option<Value> {
+        self.handle
+            .read(rpc::Read {
+                key: NamespaceKey::try_new(namespace).unwrap(),
+                path: path.map(|path| path.parse().unwrap()),
+            })
+            .await
+            .unwrap()
+            .value
+    }
+
     /// Waits until this node is serving `n` inbound connections.
     async fn wait_for_connections(&self, n: usize) {
         timeout(GRACE, async {
@@ -533,19 +547,71 @@ async fn the_tagged_form_writes_a_key() {
 
     json(&node.dir, &["set", "cfg", "--tagged", &tagged.to_string()]).await;
 
-    let stored = node
-        .handle
-        .read(rpc::Read {
-            key: NamespaceKey::try_new("cfg").unwrap(),
-            path: None,
-        })
-        .await
-        .unwrap();
-    assert_eq!(stored.value, Some(Value::Key(key)));
+    assert_eq!(node.stored("cfg", None).await, Some(Value::Key(key)));
     assert_eq!(
         json(&node.dir, &["get", "cfg", "--tagged"]).await["value"],
         tagged
     );
+}
+
+/// An Ed25519 key of `byte` repeated, and how the CLI spells it.
+fn ed25519(byte: u8) -> (PublicKey, String) {
+    let key = PublicKey::Ed25519(Ed25519PublicKey::from_bytes([byte; 32]));
+    let text = key.to_string();
+    (key, text)
+}
+
+/// `set-key` writes a key spelled as it is printed, with no tagged JSON.
+#[tokio::test]
+async fn set_key_writes_a_key() {
+    let node = alone().await;
+    let (public_key, text) = ed25519(0xab);
+    json(&node.dir, &["set", "cfg", "{}"]).await;
+
+    let written = json(
+        &node.dir,
+        &[
+            "set-key",
+            "cfg",
+            "signer",
+            &text,
+            "--weight",
+            "7",
+            "--meta",
+            "operator=alice",
+            "--meta",
+            "note=a=b",
+        ],
+    )
+    .await;
+    assert_eq!(written["outcome"], "extended");
+
+    let key = Key::new(public_key, 7).with_metadata(BTreeMap::from([
+        ("operator".to_string(), "alice".to_string()),
+        ("note".to_string(), "a=b".to_string()),
+    ]));
+    assert_eq!(
+        node.stored("cfg", Some("signer")).await,
+        Some(Value::Key(key))
+    );
+}
+
+/// A key that does not parse is refused before anything is sent.
+#[tokio::test]
+async fn set_key_refuses_what_is_not_a_key() {
+    let node = alone().await;
+
+    for bad in [
+        "ab".repeat(32),
+        "ed25519:abab".to_string(),
+        format!("rsa:{}", "ab".repeat(32)),
+    ] {
+        let (ok, _out, err) = run(&node.dir, &["set-key", "cfg", &bad, "--weight", "1"]).await;
+        assert!(!ok, "`{bad}` should be refused");
+        assert!(err.contains("is not a public key"), "got {err}");
+    }
+    assert_eq!(node.stored("cfg", None).await, None);
+    assert_eq!(node.handle.head().await.unwrap(), node.genesis);
 }
 
 /// A value the ledger cannot hold is refused before anything is sent.

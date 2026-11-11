@@ -124,6 +124,13 @@ lotusctl unset web                                # delete the whole `web` names
 lotusctl delete web hosts --where '="b.example"'  # delete every entry that matches
 ```
 
+A public key is a value of its own, written as it is printed — `ed25519:` and 64 hex digits — with the weight its
+signatures carry:
+
+```sh
+lotusctl set-key web signer ed25519:3b6a27bc… --weight 1 --meta operator=alice
+```
+
 To follow changes as they land, until interrupted:
 
 ```sh

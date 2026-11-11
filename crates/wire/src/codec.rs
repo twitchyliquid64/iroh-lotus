@@ -205,32 +205,39 @@ impl<'de, const N: usize> de::Visitor<'de> for ByteArrayVisitor<N> {
     }
 
     fn visit_str<E: de::Error>(self, s: &str) -> Result<Self::Value, E> {
-        fn nibble(b: u8) -> Option<u8> {
-            match b {
-                b'0'..=b'9' => Some(b - b'0'),
-                b'a'..=b'f' => Some(b - b'a' + 10),
-                b'A'..=b'F' => Some(b - b'A' + 10),
-                _ => None,
-            }
-        }
-
         let hex = s
             .strip_prefix(self.prefix)
             .ok_or_else(|| E::invalid_value(de::Unexpected::Str(s), &self))?;
         if hex.len() != 2 * N {
             return Err(E::invalid_length(hex.len(), &self));
         }
-        let mut bytes = [0u8; N];
-        // The length check above leaves no remainder.
-        let (pairs, _) = hex.as_bytes().as_chunks::<2>();
-        bytes
-            .iter_mut()
-            .zip(pairs)
-            .try_for_each(|(byte, [hi, lo])| {
-                *byte = (nibble(*hi)? << 4) | nibble(*lo)?;
-                Some(())
-            })
-            .ok_or_else(|| E::invalid_value(de::Unexpected::Str(s), &self))?;
-        Ok(bytes)
+        decode_hex(hex).ok_or_else(|| E::invalid_value(de::Unexpected::Str(s), &self))
     }
+}
+
+/// Decodes exactly `N` bytes from hex of either case; `None` for any other
+/// length or a character that is not a hex digit.
+pub(crate) fn decode_hex<const N: usize>(hex: &str) -> Option<[u8; N]> {
+    fn nibble(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let (pairs, rest) = hex.as_bytes().as_chunks::<2>();
+    if pairs.len() != N || !rest.is_empty() {
+        return None;
+    }
+    let mut bytes = [0u8; N];
+    bytes
+        .iter_mut()
+        .zip(pairs)
+        .try_for_each(|(byte, [hi, lo])| {
+            *byte = (nibble(*hi)? << 4) | nibble(*lo)?;
+            Some(())
+        })?;
+    Some(bytes)
 }

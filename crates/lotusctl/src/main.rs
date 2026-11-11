@@ -12,6 +12,7 @@ use lotus_sdk::{
     },
     wire::{
         EnvelopeDigest,
+        keys::{Key, PublicKey},
         msg::{Match, NamespaceKey, Predicate, Value},
         subkey::SubkeyPath,
     },
@@ -93,9 +94,19 @@ enum Command {
         The value is always a JSON literal: a string, a whole number, true or \
         false, an array or an object. A string is quoted even when it is one \
         word, so `set cfg '\"hello\"'` writes the string hello and `set cfg 7` \
-        the number 7."
+        the number 7. A public key, which JSON has no shape for, is `set-key`."
     )]
     Set(SetCommand),
+    /// Writes a public key into a namespace
+    #[command(
+        override_usage = "lotusctl set-key <NAMESPACE> [PATH] <PUBLIC_KEY> --weight <WEIGHT> \
+        [--meta <KEY=VALUE>]...",
+        long_about = "Writes a public key into a namespace.\n\n\
+        As `set` does, but the value is a key, written as it is printed: \
+        `ed25519:` and its 64 hex digits. It is stored as a key, which `set` \
+        can write only in the --tagged form."
+    )]
+    SetKey(SetKeyCommand),
     /// Appends a value to an array in a namespace
     #[command(
         alias = "weak-push",
@@ -289,14 +300,43 @@ struct TargetValue {
 impl TargetValue {
     /// The path this writes at, and the value as it was written.
     fn split(&self) -> Result<(Option<SubkeyPath>, &str), MainError> {
-        match self.rest.as_slice() {
-            [value] => Ok((None, value.as_str())),
-            [path, value] => path
-                .parse()
-                .map(|path| (Some(path), value.as_str()))
-                .map_err(|e| MainError::Other(format!("`{path}` is not a path: {e}"))),
-            _ => unreachable!("clap holds the list to one or two"),
-        }
+        split_path_value(&self.rest)
+    }
+}
+
+/// A [`TargetValue`] whose value is a public key.
+#[derive(Debug, Args)]
+struct TargetKey {
+    /// The namespace to write to
+    #[arg(value_parser = parse_namespace_key, value_name = "NAMESPACE")]
+    key: NamespaceKey,
+
+    /// The path to write at, then the key written there as `ed25519:` and
+    /// its 64 hex digits; the key on its own is the namespace as a whole
+    #[arg(num_args = 1..=2, required = true, value_name = "[PATH] PUBLIC_KEY")]
+    rest: Vec<String>,
+}
+
+impl TargetKey {
+    /// The path this writes at, and the key written there.
+    fn split(&self) -> Result<(Option<SubkeyPath>, PublicKey), MainError> {
+        let (path, public_key) = split_path_value(&self.rest)?;
+        parse_public_key(public_key)
+            .map(|public_key| (path, public_key))
+            .map_err(MainError::Other)
+    }
+}
+
+/// Splits the one or two arguments after a namespace into the path, when
+/// there is one, and the value that always comes last.
+fn split_path_value(rest: &[String]) -> Result<(Option<SubkeyPath>, &str), MainError> {
+    match rest {
+        [value] => Ok((None, value.as_str())),
+        [path, value] => path
+            .parse()
+            .map(|path| (Some(path), value.as_str()))
+            .map_err(|e| MainError::Other(format!("`{path}` is not a path: {e}"))),
+        _ => unreachable!("clap holds the list to one or two"),
     }
 }
 
@@ -342,6 +382,42 @@ struct SetCommand {
 
     #[command(flatten)]
     values: ValueArgs,
+}
+
+/// The arguments for the set-key subcommand.
+#[derive(Debug, Args)]
+struct SetKeyCommand {
+    #[command(flatten)]
+    target: TargetKey,
+
+    /// What a signature by the key counts for toward an envelope's weight
+    #[arg(long)]
+    weight: u32,
+
+    /// Record KEY=VALUE against the key, as an operator's name or a
+    /// rotation date — repeatable
+    #[arg(long = "meta", value_name = "KEY=VALUE", value_parser = parse_meta)]
+    metadata: Vec<(String, String)>,
+}
+
+impl SetKeyCommand {
+    /// `public_key` at this weight, with this metadata.
+    fn key(&self, public_key: PublicKey) -> Key {
+        Key::new(public_key, self.weight).with_metadata(self.metadata.iter().cloned().collect())
+    }
+}
+
+/// Reads a public key, for clap.
+fn parse_public_key(text: &str) -> Result<PublicKey, String> {
+    text.parse()
+        .map_err(|e| format!("`{text}` is not a public key: {e}"))
+}
+
+/// Reads a `--meta` entry, split at its first `=`, for clap.
+fn parse_meta(text: &str) -> Result<(String, String), String> {
+    text.split_once('=')
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .ok_or_else(|| format!("`{text}` is not KEY=VALUE"))
 }
 
 /// The arguments for the append subcommand.
@@ -1037,6 +1113,18 @@ async fn async_main() -> Result<(), MainError> {
                     key: args.target.key.clone(),
                     path,
                     value,
+                },
+            )
+            .await?
+        }
+        Command::SetKey(args) => {
+            let (path, public_key) = args.target.split()?;
+            write(
+                &cli.global_args,
+                WeakSet {
+                    key: args.target.key.clone(),
+                    path,
+                    value: Value::Key(args.key(public_key)),
                 },
             )
             .await?
