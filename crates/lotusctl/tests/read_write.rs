@@ -8,12 +8,14 @@ use iroh::{
     Endpoint, EndpointAddr, RelayMode, SecretKey, endpoint::presets,
     test_utils::test_transport::TestNetwork,
 };
+use lotus_sdk::rpc;
 use lotusd::{Core, IfInitialized, NodeKeys, Server, ServerHandle, peer_ingress::Protocol};
 use state::CLUSTER_NODES_KEY;
 use tempfile::TempDir;
 use tokio::{net::UnixListener, process::Command, task::JoinHandle, time::timeout};
 use wire::{
     Envelope, EnvelopeDigest, KeyId, Msg,
+    keys::{Ed25519PublicKey, Key, PublicKey},
     msg::{Namespace, NamespaceKey, SetNamespace, Value},
 };
 
@@ -504,6 +506,46 @@ async fn the_tagged_form_round_trips() {
     );
     let read = json(&node.dir, &["get", "cfg"]).await;
     assert_eq!(read["value"], serde_json::json!([1]));
+}
+
+/// A trusted key, which plain JSON has no shape for, is written in the
+/// tagged form and lands in the ledger as a key — not a map that looks
+/// like one.
+#[tokio::test]
+async fn the_tagged_form_writes_a_key() {
+    let node = alone().await;
+    let key = Key::new(
+        PublicKey::Ed25519(Ed25519PublicKey::from_bytes([0xab; 32])),
+        7,
+    )
+    .with_metadata(BTreeMap::from([(
+        "operator".to_string(),
+        "alice".to_string(),
+    )]));
+    let tagged = serde_json::json!({
+        "type": "key",
+        "value": {
+            "public_key": {"type": "ed25519", "value": "ab".repeat(32)},
+            "weight": 7,
+            "metadata": {"operator": "alice"},
+        },
+    });
+
+    json(&node.dir, &["set", "cfg", "--tagged", &tagged.to_string()]).await;
+
+    let stored = node
+        .handle
+        .read(rpc::Read {
+            key: NamespaceKey::try_new("cfg").unwrap(),
+            path: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(stored.value, Some(Value::Key(key)));
+    assert_eq!(
+        json(&node.dir, &["get", "cfg", "--tagged"]).await["value"],
+        tagged
+    );
 }
 
 /// A value the ledger cannot hold is refused before anything is sent.
