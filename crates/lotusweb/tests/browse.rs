@@ -557,6 +557,16 @@ async fn a_daemon_that_is_not_there_is_a_bad_gateway() {
     let (status, _, body) = send(&node, get("/")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("could not connect to the daemon"), "{body}");
+
+    // The peers page keeps polling through the failure, to pick back up
+    // when the daemon does.
+    let (status, _, body) = send(&node, get("/peers")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(
+        body.contains(r#"<section class="peers" hx-get="/peers" hx-trigger="every 5s">"#),
+        "{body}"
+    );
+    assert!(body.contains("could not connect to the daemon"), "{body}");
 }
 
 #[tokio::test]
@@ -674,6 +684,35 @@ async fn the_chain_pane_is_swapped_in_like_any_other() {
     );
     // The head in the sidebar leads to the chain too.
     assert!(body.contains(r#"head <a href="/chain""#), "{body}");
+}
+
+#[tokio::test]
+async fn the_peers_page_shows_the_node_and_polls_for_itself() {
+    let node = seeded().await;
+    let status = node.client.status().await.unwrap();
+
+    let (code, _, body) = send(&node, get("/peers")).await;
+    assert_eq!(code, StatusCode::OK);
+    assert!(body.contains("<title>peers · lotusweb</title>"), "{body}");
+    assert!(
+        body.contains(r#"<section class="peers" hx-get="/peers" hx-trigger="every 5s">"#),
+        "{body}"
+    );
+    assert!(body.contains(status.node.to_hex().as_ref()), "{body}");
+    assert!(body.contains("0 of 0 connected"), "{body}");
+    // The test daemon runs without an endpoint, and the page says so.
+    assert!(body.contains("keeps no peers"), "{body}");
+    // Marked in the sidebar, beside the chain.
+    assert!(
+        body.contains(r#"<li class="active"><a href="/peers""#),
+        "{body}"
+    );
+
+    // A poll gets the pane, not the document.
+    let (code, _, body) = send(&node, htmx(get("/peers"))).await;
+    assert_eq!(code, StatusCode::OK);
+    assert!(!body.contains("<html"), "{body}");
+    assert!(body.contains("0 of 0 connected"), "{body}");
 }
 
 fn short(digest: &lotus_sdk::EnvelopeDigest) -> String {

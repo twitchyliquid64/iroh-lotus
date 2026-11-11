@@ -11,6 +11,9 @@
   --ok: #166534;
   --ok-soft: #dcfce7;
   --err-soft: #fee2e2;
+  --dot-up: #16a34a;
+  --dot-pending: #d97706;
+  --dot-down: #dc2626;
   --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
@@ -28,6 +31,9 @@
     --ok: #86efac;
     --ok-soft: #14301f;
     --err-soft: #3b1515;
+    --dot-up: #4ade80;
+    --dot-pending: #fbbf24;
+    --dot-down: #f87171;
   }
 }
 
@@ -341,6 +347,51 @@ form.bounds input { width: 10rem; }
 .envelope .absent, .envelope .unknown { color: var(--muted); }
 .envelope .good { color: var(--ok); }
 .envelope .bad { color: var(--danger); }
+
+/* Peers */
+
+.peers h2 {
+  font-size: .8rem;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: var(--muted);
+  margin: 1.5rem 0 .5rem;
+}
+
+dl.status {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: .25rem 1rem;
+  margin: 0;
+  font-size: .9rem;
+}
+
+dl.status dt { color: var(--muted); }
+dl.status dd { margin: 0; overflow-wrap: anywhere; }
+dl.status .addr { display: block; }
+dl.status .absent { color: var(--muted); }
+
+.peers .entries .state { white-space: nowrap; }
+
+.dot {
+  display: inline-block;
+  width: .6rem;
+  height: .6rem;
+  border-radius: 50%;
+  margin-right: .5rem;
+  vertical-align: baseline;
+}
+
+.dot.up { background: var(--dot-up); box-shadow: 0 0 0 3px color-mix(in srgb, var(--dot-up) 25%, transparent); }
+.dot.pending { background: var(--dot-pending); animation: pulse 1.2s ease-in-out infinite; }
+.dot.down { background: var(--dot-down); }
+.dot.idle { background: var(--muted); }
+
+@keyframes pulse { 50% { opacity: .35; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .dot.pending { animation: none; }
+}
 
 @media (max-width: 720px) {
   .shell { grid-template-columns: 1fr; }

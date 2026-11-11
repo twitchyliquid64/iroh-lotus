@@ -5,7 +5,8 @@
 //! holds, `POST` adds an entry inside it, `PATCH` amends it in place — adds
 //! to the integer it is, or moves it to another key of the map it is in —
 //! and `DELETE` removes it. `/chain` shows the canonical chain, bounded by
-//! its query string.
+//! its query string; `/peers` how the node stands with the rest of the
+//! cluster.
 
 use axum::{
     Router,
@@ -21,7 +22,7 @@ use crate::{
     Error, Location,
     chain::{self, Walk},
     frame::Frame,
-    json,
+    json, peers,
     view::{self, Active, Page, Sidebar},
 };
 
@@ -49,6 +50,7 @@ pub fn router(client: Client) -> Router {
     Router::new()
         .route(HOME_URL, get(home))
         .route(chain::CHAIN_URL, get(show_chain))
+        .route(peers::PEERS_URL, get(show_peers))
         .route(view::CREATE_URL, post(create))
         .route("/ns/{key}", location.clone())
         .route("/ns/{key}/{*path}", location)
@@ -118,6 +120,10 @@ async fn show_chain(
         Ok(walk) => app.chain(&frame, &walk).await,
         Err(error) => app.fail_at(&frame, Active::Chain, &error).await,
     }
+}
+
+async fn show_peers(State(app): State<App>, frame: Frame) -> Response {
+    app.peers(&frame).await
 }
 
 async fn replace(
@@ -314,6 +320,30 @@ impl App {
                 self.fail_at(frame, Active::Chain, &error).await
             }
         }
+    }
+
+    /// How the node stands with its peers. A failure is shown inside the
+    /// poll, so the page recovers on its own when the daemon does.
+    async fn peers(&self, frame: &Frame) -> Response {
+        let status = self.client.status().await.map_err(Error::from);
+        let sidebar = self.sidebar().await;
+        let (code, inner) = match &status {
+            Ok(status) => (StatusCode::OK, peers::pane(status)),
+            Err(error) => {
+                tracing::warn!(error = %error.describe(), "reading the status");
+                let code = error.status();
+                (code, view::error_pane(None, code, &error.describe()))
+            }
+        };
+        frame.render(
+            code,
+            Page {
+                sidebar: &sidebar,
+                active: Active::Peers,
+                title: "peers · lotusweb".into(),
+                pane: peers::polling(inner),
+            },
+        )
     }
 
     /// What `location` holds, read now, with `notice` above it.

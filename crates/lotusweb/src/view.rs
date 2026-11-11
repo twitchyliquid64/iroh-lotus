@@ -9,7 +9,7 @@ use axum::http::StatusCode;
 use lotus_sdk::{EnvelopeDigest, NamespaceEntry, NamespaceKey, Subkey, Value, ValueAt};
 use maud::{DOCTYPE, Markup, html};
 
-use crate::{Location, chain, json};
+use crate::{Location, chain, json, peers};
 
 /// Where the embedded htmx build is served.
 pub const HTMX_URL: &str = "/static/htmx.min.js";
@@ -49,6 +49,8 @@ pub enum Active<'a> {
     Namespace(&'a NamespaceKey),
     /// The chain.
     Chain,
+    /// The peers.
+    Peers,
 }
 
 /// One page: what fills each part of the document.
@@ -135,6 +137,10 @@ fn sidebar(sidebar: &Sidebar, active: Active<'_>, swap_oob: Option<&str>) -> Mar
                 li.active[active == Active::Chain] {
                     a href=(chain::CHAIN_URL) hx-get=(chain::CHAIN_URL) hx-push-url="true" { "Chain" }
                     span.shape { "log" }
+                }
+                li.active[active == Active::Peers] {
+                    a href=(peers::PEERS_URL) hx-get=(peers::PEERS_URL) hx-push-url="true" { "Peers" }
+                    span.shape { "status" }
                 }
             }
             footer { "lotusweb " (version::VERSION) }

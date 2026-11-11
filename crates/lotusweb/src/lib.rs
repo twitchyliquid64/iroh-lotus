@@ -23,7 +23,9 @@
 //! Beside the values sits the chain they fold down from, at `/chain`: the
 //! canonical chain as `lotusctl chain` prints it, one stanza per envelope,
 //! newest first, bounded by the query string as that command is bounded
-//! by its flags.
+//! by its flags. And at `/peers`, how the node stands with the rest of the
+//! cluster, as `lotusctl status` prints it: a dot per peer, green when
+//! connected, the page polling itself so the dots keep up.
 //!
 //! Every read and write goes through [`lotus_sdk`]; [`router`] is the whole
 //! server, over a [`Client`](lotus_sdk::Client).
@@ -41,5 +43,7 @@ mod json;
 
 mod location;
 pub use location::Location;
+
+mod peers;
 
 mod view;
