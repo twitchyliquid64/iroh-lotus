@@ -137,9 +137,9 @@ pub struct SetNamespaceKey {
 
 /// Amends a single value nested inside a namespace in place.
 ///
-/// Where [`SetNamespaceKey`] replaces what a path addresses, this derives
-/// the new value from the old one — the message carries only the change,
-/// however large the value it amends.
+/// Where [`SetNamespaceKey`] replaces what a path addresses, this describes
+/// a mutation of the existing value. This is more space-efficient than
+/// setting a whole large value when only a small tweak is needed.
 #[derive(Debug, Clone, Cbor, Hash, PartialEq, Eq)]
 pub struct AmendNamespaceKey {
     #[cbor(key = 1)]
