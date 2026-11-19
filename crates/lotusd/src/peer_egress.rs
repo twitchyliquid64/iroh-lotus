@@ -29,7 +29,7 @@ use state::CLUSTER_NODES_KEY;
 use tokio::{
     sync::{mpsc, watch},
     task::{Id, JoinHandle, JoinSet},
-    time::{sleep, timeout},
+    time::{Instant, sleep, timeout},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
@@ -43,8 +43,20 @@ use crate::{
 /// The first wait after a dial fails; each failure after doubles it.
 pub const BACKOFF_BASE: Duration = Duration::from_secs(1);
 
-/// The longest wait between dials of a peer that keeps failing.
+/// The longest wait between dials of a peer that has been unreachable for
+/// less than the first of [`BACKOFF_SLOW`]'s thresholds.
 pub const BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+/// The wait between dials of a peer unreachable for long, by how long:
+/// past each threshold, its wait. Ascending in both.
+pub const BACKOFF_SLOW: [(Duration, Duration); 3] = [
+    (Duration::from_secs(30 * 60), Duration::from_secs(5 * 60)),
+    (Duration::from_secs(60 * 60), Duration::from_secs(10 * 60)),
+    (
+        Duration::from_secs(2 * 60 * 60),
+        Duration::from_secs(15 * 60),
+    ),
+];
 
 /// How long peer tasks get to close their connections on shutdown before
 /// they are aborted.
@@ -390,6 +402,8 @@ async fn maintain(
     cancel: CancellationToken,
 ) -> KeyId {
     let mut attempt: u32 = 0;
+    // Last seen reachable: when the task started, or a connection ended.
+    let mut last_up = Instant::now();
     loop {
         let target = addr.borrow_and_update().clone();
         state.send_replace(PeerState::Dialing { attempt });
@@ -410,6 +424,7 @@ async fn maintain(
                 if hold(conn, server, &mut head, &cancel).await.is_break() {
                     return node;
                 }
+                last_up = Instant::now();
             }
             Err(e) => {
                 tracing::debug!(error = %e, attempt, "dialling peer");
@@ -421,7 +436,7 @@ async fn maintain(
         attempt = attempt.saturating_add(1);
         state.send_replace(PeerState::Backoff { attempt });
         tokio::select! {
-            () = sleep(backoff(attempt)) => {}
+            () = sleep(backoff(attempt, last_up.elapsed())) => {}
             // A new address is worth trying at once.
             changed = addr.changed() => if changed.is_err() {
                 return node;
@@ -490,11 +505,46 @@ async fn hold(
     }
 }
 
-/// How long to wait before dial number `attempt + 1`.
-fn backoff(attempt: u32) -> Duration {
-    // Doubling past the cap only overflows, so stop doubling there.
-    let doublings = attempt.saturating_sub(1).min(16);
-    BACKOFF_BASE.saturating_mul(1 << doublings).min(BACKOFF_MAX)
+/// How long to wait before dial number `attempt + 1` of a peer last
+/// reachable `down_for` ago.
+///
+/// Doubles from [`BACKOFF_BASE`] up to [`BACKOFF_MAX`]; once the peer has
+/// been down past a [`BACKOFF_SLOW`] threshold, that tier's wait instead.
+fn backoff(attempt: u32, down_for: Duration) -> Duration {
+    BACKOFF_SLOW
+        .iter()
+        .rev()
+        .find(|(threshold, _)| down_for >= *threshold)
+        .map_or_else(
+            || {
+                // Doubling past the cap only overflows, so stop doubling there.
+                let doublings = attempt.saturating_sub(1).min(16);
+                BACKOFF_BASE.saturating_mul(1 << doublings).min(BACKOFF_MAX)
+            },
+            |(_, wait)| *wait,
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MIN: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn backoff_doubles_to_the_cap_while_recently_down() {
+        let waits: Vec<_> = (1..=8).map(|n| backoff(n, MIN)).collect();
+        assert_eq!(waits, [1, 2, 4, 8, 16, 32, 60, 60].map(Duration::from_secs),);
+    }
+
+    #[test]
+    fn backoff_slows_in_tiers_the_longer_a_peer_is_down() {
+        let waits: Vec<_> = [29, 30, 59, 60, 119, 120, 60 * 24 * 90]
+            .into_iter()
+            .map(|mins| backoff(u32::MAX, MIN * mins).as_secs() / 60)
+            .collect();
+        assert_eq!(waits, [1, 5, 5, 10, 10, 15, 15]);
+    }
 }
 
 /// The server's handle on its egress actor.
