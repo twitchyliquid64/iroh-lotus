@@ -3,8 +3,9 @@
 //! Every location has one URL, `/ns/<namespace>[/<path>]`, and the HTTP
 //! method says what happens there: `GET` shows it, `PUT` replaces what it
 //! holds, `POST` adds an entry inside it, `PATCH` amends it in place — adds
-//! to the integer it is, or moves it to another key of the map it is in —
-//! and `DELETE` removes it. `/chain` shows the canonical chain, bounded by
+//! to the integer it is, moves it to another key of the map it is in, or
+//! sets the password of the `auth.users.<user>` entry it is — and `DELETE`
+//! removes it. `/chain` shows the canonical chain, bounded by
 //! its query string; `/peers` how the node stands with the rest of the
 //! cluster.
 
@@ -22,7 +23,7 @@ use crate::{
     Error, Location,
     chain::{self, Walk},
     frame::Frame,
-    json, peers,
+    json, password, peers,
     view::{self, Active, Page, Sidebar},
 };
 
@@ -80,12 +81,25 @@ struct EntryForm {
 }
 
 /// What the amend forms submit: how much to add to an integer, negative
-/// to take, or the key a map entry moves to. Told apart by the field.
-#[derive(Debug, Deserialize)]
+/// to take, the key a map entry moves to, or a user's new password. Told
+/// apart by the field.
+#[derive(Deserialize)]
 #[serde(untagged)]
 enum AmendForm {
     Increment { delta: String },
     Rename { key: String },
+    Password { password: String },
+}
+
+impl std::fmt::Debug for AmendForm {
+    /// Never the password itself.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Increment { delta } => f.debug_struct("Increment").field("delta", delta).finish(),
+            Self::Rename { key } => f.debug_struct("Rename").field("key", key).finish(),
+            Self::Password { .. } => f.debug_struct("Password").finish_non_exhaustive(),
+        }
+    }
 }
 
 /// What the create-namespace form submits.
@@ -199,6 +213,7 @@ async fn amend(
     match form {
         AmendForm::Increment { delta } => app.increment(frame, location, &delta).await,
         AmendForm::Rename { key } => app.rename(frame, location, key).await,
+        AmendForm::Password { password } => app.set_password(frame, location, password).await,
     }
 }
 
@@ -449,6 +464,33 @@ impl App {
         match renamed {
             Ok((to, notice)) => {
                 self.landed(frame, Some(&location), Some(&to), &notice)
+                    .await
+            }
+            Err(error) => self.fail(&frame, Some(&location), &error).await,
+        }
+    }
+
+    /// Writes the argon2id hash of `password` into the user's entry at
+    /// `location`, under `password`.
+    async fn set_password(&self, frame: Frame, location: Location, password: String) -> Response {
+        let written = async {
+            let user = location.auth_user().ok_or_else(|| {
+                Error::Invalid(format!(
+                    "{location} is no user's entry in an `auth.users` map"
+                ))
+            })?;
+            let hashed = password::hash(password).await?;
+            let at = location.child(Subkey::Key(password::PASSWORD_KEY.into()));
+            let written = self
+                .client
+                .set(at.key().clone(), at.path().cloned(), Value::String(hashed))
+                .await?;
+            Ok(format!("Set the password of {user}; {}", moved(&written)))
+        }
+        .await;
+        match written {
+            Ok(notice) => {
+                self.landed(frame, Some(&location), Some(&location), &notice)
                     .await
             }
             Err(error) => self.fail(&frame, Some(&location), &error).await,

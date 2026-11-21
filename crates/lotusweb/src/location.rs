@@ -14,6 +14,10 @@ use crate::Error;
 /// Where the URL begins for every ledger location.
 const PREFIX: &str = "/ns/";
 
+/// Where a namespace keeps its users, one entry each: `auth.users`.
+const AUTH_KEY: &str = "auth";
+const USERS_KEY: &str = "users";
+
 /// What is escaped in a URL segment: what can't sit in a path unencoded,
 /// plus the brackets and quotes a path spells indices and odd keys with,
 /// so a path reads the same in a link and on the command line.
@@ -123,6 +127,19 @@ impl Location {
         match self.segments().last()? {
             Subkey::Key(key) => Some(key),
             Subkey::Index(_) => None,
+        }
+    }
+
+    /// The user this is the entry of, when it sits directly in the
+    /// namespace's `auth.users` map: `auth.users.<user>`.
+    pub fn auth_user(&self) -> Option<&str> {
+        match self.segments() {
+            [Subkey::Key(auth), Subkey::Key(users), Subkey::Key(user)]
+                if auth == AUTH_KEY && users == USERS_KEY =>
+            {
+                Some(user)
+            }
+            _ => None,
         }
     }
 
@@ -240,6 +257,17 @@ mod tests {
         assert_eq!(at("cfg", "['a.b']").map_key(), Some("a.b"));
         assert_eq!(at("cfg", "servers[0]").map_key(), None);
         assert_eq!(root("cfg").map_key(), None);
+    }
+
+    #[test]
+    fn only_an_entry_of_the_auth_users_map_is_a_user() {
+        assert_eq!(at("blue", "auth.users.alice").auth_user(), Some("alice"));
+        assert_eq!(at("blue", "auth.users").auth_user(), None);
+        assert_eq!(at("blue", "auth.alice").auth_user(), None);
+        assert_eq!(at("blue", "auth.users.alice.password").auth_user(), None);
+        assert_eq!(at("blue", "x.auth.users.alice").auth_user(), None);
+        assert_eq!(at("blue", "auth.users[0]").auth_user(), None);
+        assert_eq!(root("blue").auth_user(), None);
     }
 
     #[test]

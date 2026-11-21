@@ -216,6 +216,7 @@ pub fn value_pane(location: &Location, at: &ValueAt, notice: Option<&str>) -> Ma
             None => (missing(location)),
             Some(value @ Value::Map(fields)) => {
                 (entries(location, fields.iter().map(|(key, value)| (Subkey::Key(key.clone()), value))))
+                (set_password(location))
                 (add_entry(location, Some("Add entry")))
                 (replace(location, value))
                 (rename(location))
@@ -348,6 +349,27 @@ fn rename(location: &Location) -> Markup {
                 form hx-patch=(location.url()) {
                     label { "New key" input name="key" value=(key) required; }
                     button { "Rename" }
+                }
+            }
+        }
+    }
+}
+
+/// Sets the password of the user whose `auth.users` entry `location` is;
+/// nothing, where it is not one. The server hashes it before writing.
+fn set_password(location: &Location) -> Markup {
+    html! {
+        @if let Some(user) = location.auth_user() {
+            details.password {
+                summary { "Set password" }
+                form hx-patch=(location.url()) {
+                    // The username lets a password manager file it.
+                    input type="hidden" name="username" value=(user) autocomplete="username";
+                    label {
+                        "New password"
+                        input type="password" name="password" autocomplete="new-password" required;
+                    }
+                    button { "Set password" }
                 }
             }
         }

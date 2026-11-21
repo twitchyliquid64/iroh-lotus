@@ -387,6 +387,110 @@ async fn a_rename_that_would_lose_or_clobber_something_is_refused() {
 }
 
 #[tokio::test]
+async fn a_user_in_an_auth_map_gets_a_password_set_as_its_hash() {
+    let node = node().await;
+    node.client
+        .set(
+            key("blue"),
+            None,
+            Value::from_iter([(
+                "auth",
+                Value::from_iter([(
+                    "users",
+                    Value::from_iter([(
+                        "alice",
+                        Value::from_iter([("role", Value::from("admin"))]),
+                    )]),
+                )]),
+            )]),
+        )
+        .await
+        .unwrap();
+
+    // Only a user's entry offers it.
+    let (_, _, body) = send(&node, get("/ns/blue/auth.users.alice")).await;
+    assert!(body.contains("Set password"), "{body}");
+    for uri in [
+        "/ns/blue",
+        "/ns/blue/auth",
+        "/ns/blue/auth.users",
+        "/ns/blue/auth.users.alice.role",
+    ] {
+        let (_, _, body) = send(&node, get(uri)).await;
+        assert!(!body.contains("Set password"), "{uri}: {body}");
+    }
+
+    let request = htmx(form(
+        "PATCH",
+        "/ns/blue/auth.users.alice",
+        &[("username", "alice"), ("password", "hunter2")],
+    ));
+    let (status, headers, body) = send(&node, request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(pushed_to(&headers), None);
+    assert!(body.contains("Set the password of alice"), "{body}");
+    assert!(!body.contains("hunter2"), "{body}");
+
+    let at = node
+        .client
+        .read(key("blue"), Some(path("auth.users.alice.password")))
+        .await
+        .unwrap();
+    let Some(Value::String(hashed)) = at.value else {
+        panic!("no hash written: {:?}", at.value);
+    };
+    assert!(hashed.starts_with("$argon2id$"), "{hashed}");
+    let role = node
+        .client
+        .read(key("blue"), Some(path("auth.users.alice.role")))
+        .await
+        .unwrap();
+    assert_eq!(role.value, Some(Value::from("admin")));
+}
+
+#[tokio::test]
+async fn a_password_is_refused_outside_a_user_entry_and_when_empty() {
+    let node = seeded().await;
+    let before = node.client.chain_range().await.unwrap().head;
+
+    for (uri, password, why) in [
+        ("/ns/cfg/servers", "pw", "no user's entry"),
+        ("/ns/cfg", "pw", "no user's entry"),
+    ] {
+        let request = htmx(form("PATCH", uri, &[("password", password)]));
+        let (status, _, body) = send(&node, request).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{uri}: {body}");
+        assert!(body.contains(why), "{uri}: {body}");
+    }
+
+    node.client
+        .set(
+            key("blue"),
+            None,
+            Value::from_iter([(
+                "auth",
+                Value::from_iter([(
+                    "users",
+                    Value::from_iter([("bob", Value::from_iter([("x", Value::Int(1))]))]),
+                )]),
+            )]),
+        )
+        .await
+        .unwrap();
+    let before_empty = node.client.chain_range().await.unwrap().head;
+    let request = htmx(form(
+        "PATCH",
+        "/ns/blue/auth.users.bob",
+        &[("password", "")],
+    ));
+    let (status, _, body) = send(&node, request).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(body.contains("cannot be empty"), "{body}");
+    assert_eq!(node.client.chain_range().await.unwrap().head, before_empty);
+    assert_ne!(before, before_empty);
+}
+
+#[tokio::test]
 async fn a_namespace_is_created_from_the_home_page() {
     let node = node().await;
 

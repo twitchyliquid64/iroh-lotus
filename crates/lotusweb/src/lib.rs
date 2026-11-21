@@ -6,7 +6,10 @@
 //! JSON in place; containers take new entries, can be replaced whole, and
 //! can be deleted. Any entry of a map can be renamed — moved to a sibling
 //! key with its value untouched — which the page knows from the location
-//! alone: a path's last step is a key or an index.
+//! alone: a path's last step is a key or an index. A user's entry in a
+//! namespace's `auth.users` map (`auth.users.<user>`) also takes a
+//! password, written beside the rest of it as its argon2id hash,
+//! `auth.users.<user>.password`.
 //!
 //! The pages are plain HTML over [htmx](https://htmx.org) 4: every link and
 //! form fetches the main pane alone and swaps it in, the sidebar riding
@@ -44,6 +47,7 @@ mod json;
 mod location;
 pub use location::Location;
 
+mod password;
 mod peers;
 
 mod view;

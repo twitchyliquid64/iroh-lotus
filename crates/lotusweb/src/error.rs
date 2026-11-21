@@ -20,6 +20,9 @@ pub enum Error {
     /// The daemon could not be reached, or broke serving the request.
     #[error(transparent)]
     Daemon(lotus_sdk::Error),
+    /// A password could not be hashed.
+    #[error("hashing the password")]
+    Hash(#[source] argon2::password_hash::Error),
     /// A request of several writes stopped part way: what `done` says
     /// stands on the chain, and the rest failed as `source` says.
     #[error("{done}, but then")]
@@ -48,7 +51,7 @@ impl Error {
             Error::BadRequest(_) => StatusCode::BAD_REQUEST,
             Error::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Error::Daemon(err) if err.is_daemon_unreachable() => StatusCode::BAD_GATEWAY,
-            Error::Daemon(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Error::Daemon(_) | Error::Hash(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Error::Halfway { source, .. } => source.status(),
         }
     }

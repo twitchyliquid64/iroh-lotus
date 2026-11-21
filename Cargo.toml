@@ -27,6 +27,8 @@ lto = true
 codegen-units = 1
 
 [workspace.dependencies]
+# Password hashes lotusweb writes under a namespace's `auth` map.
+argon2 = "0.6"
 axum = "0.8"
 blake3 = { version = "1.8", features = ["serde"] }
 cbor2 = { version = "1.2", features = ["std", "alloc", "derive", "futures", "tokio"] }
