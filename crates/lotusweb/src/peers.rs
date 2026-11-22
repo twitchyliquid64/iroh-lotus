@@ -8,7 +8,9 @@
 
 use lotus_sdk::{
     KeyId, NamespaceKey, NodeStatus, Subkey,
-    rpc::{Attempt, EndpointInfo, OtherEndpoint, PeerInfo, PeerState, Published, Reason},
+    rpc::{
+        Attempt, Connected, EndpointInfo, OtherEndpoint, PeerInfo, PeerState, Published, Reason,
+    },
 };
 use maud::{Markup, html};
 
@@ -186,7 +188,7 @@ fn peers(status: &NodeStatus) -> Markup {
             p.empty { "No other node is listed in the cluster." }
         } @else {
             table.entries.peers {
-                thead { tr { th { "State" } th { "Node" } th { "Endpoint" } } }
+                thead { tr { th { "State" } th { "Node" } th { "Version" } th { "Endpoint" } } }
                 tbody {
                     @for peer in &status.peers { (row(peer)) }
                 }
@@ -203,6 +205,12 @@ fn row(peer: &PeerInfo) -> Markup {
             td.name {
                 @if let Some(name) = &peer.name { span.node-name { (name) } " " }
                 (node(&peer.node))
+            }
+            td.version {
+                @match &peer.state {
+                    PeerState::Connected(Connected { version: Some(version) }) => code { (version) },
+                    _ => span.absent { "—" },
+                }
             }
             td.endpoint { code title=(peer.endpoint) { (short) } }
         }
@@ -242,10 +250,7 @@ fn node(id: &KeyId) -> Markup {
 
 #[cfg(test)]
 mod tests {
-    use lotus_sdk::{
-        ChainRange, EnvelopeDigest, IpFamily,
-        rpc::{Connected, Unchecked},
-    };
+    use lotus_sdk::{ChainRange, EnvelopeDigest, IpFamily, rpc::Unchecked};
 
     use super::*;
 
@@ -282,13 +287,13 @@ mod tests {
     fn names_are_shown_where_the_cluster_sets_them() {
         let named = PeerInfo {
             name: Some("bravo".into()),
-            ..peer(4, PeerState::Connected(Connected {}))
+            ..peer(4, PeerState::Connected(Connected::default()))
         };
         let page = pane(&NodeStatus {
             name: Some("alpha".into()),
             ..status(
                 true,
-                vec![named, peer(5, PeerState::Connected(Connected {}))],
+                vec![named, peer(5, PeerState::Connected(Connected::default()))],
                 None,
             )
         })
@@ -303,6 +308,33 @@ mod tests {
     }
 
     #[test]
+    fn a_connected_peer_shows_the_version_it_runs() {
+        let page = pane(&status(
+            true,
+            vec![
+                peer(
+                    4,
+                    PeerState::Connected(Connected {
+                        version: Some("1.2.3".into()),
+                    }),
+                ),
+                peer(5, PeerState::Backoff(Attempt { attempt: 1 })),
+            ],
+            None,
+        ))
+        .into_string();
+
+        assert!(
+            page.contains(r#"<td class="version"><code>1.2.3</code></td>"#),
+            "{page}"
+        );
+        assert!(
+            page.contains(r#"<td class="version"><span class="absent">—</span></td>"#),
+            "{page}"
+        );
+    }
+
+    #[test]
     fn an_unnamed_node_shows_no_name_row() {
         let page = pane(&status(true, vec![], None)).into_string();
         assert!(!page.contains("<dt>name</dt>"), "{page}");
@@ -313,11 +345,11 @@ mod tests {
         let page = pane(&status(
             true,
             vec![
-                peer(4, PeerState::Connected(Connected {})),
+                peer(4, PeerState::Connected(Connected::default())),
                 peer(5, PeerState::Dialing(Attempt { attempt: 0 })),
                 peer(6, PeerState::Backoff(Attempt { attempt: 3 })),
             ],
-            Some(Published::Published(Connected {})),
+            Some(Published::Published(Unchecked {})),
         ))
         .into_string();
 
@@ -336,7 +368,7 @@ mod tests {
     fn a_peer_links_to_its_listing_in_the_cluster() {
         let page = pane(&status(
             true,
-            vec![peer(4, PeerState::Connected(Connected {}))],
+            vec![peer(4, PeerState::Connected(Connected::default()))],
             None,
         ))
         .into_string();
@@ -351,7 +383,7 @@ mod tests {
     #[test]
     fn the_listing_is_coloured_by_where_it_stands() {
         for (published, dot) in [
-            (Published::Published(Connected {}), "dot up"),
+            (Published::Published(Unchecked {}), "dot up"),
             (Published::Pending(Unchecked {}), "dot pending"),
             (Published::NotListed(Unchecked {}), "dot idle"),
             (

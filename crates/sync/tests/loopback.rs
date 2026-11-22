@@ -205,8 +205,8 @@ fn run_sync_tampered(
     server_node: &mut Node,
     mut tamper: impl FnMut(Message) -> Message,
 ) -> Result<Outcomes, Fault> {
-    let (mut puller, opening) = Puller::new(puller_node.head());
-    let mut server = Server::new(server_node.head());
+    let (mut puller, opening) = Puller::new(puller_node.head(), None);
+    let mut server = Server::new(server_node.head(), None);
     let mut pull_effects: VecDeque<Effect<PullOutcome>> = VecDeque::from([opening]);
     let mut serve_effects: VecDeque<Effect<ServeOutcome>> = VecDeque::new();
     let mut outcomes = Outcomes {

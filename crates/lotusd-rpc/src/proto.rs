@@ -461,7 +461,7 @@ pub enum Published {
     /// Nothing has been compared yet.
     Unchecked(Unchecked),
     /// The ledger lists the address the endpoint reports.
-    Published(Connected),
+    Published(Unchecked),
     /// The address moved; the listing is about to be, or being, updated.
     Pending(Unchecked),
     /// The ledger does not list this node.
@@ -580,7 +580,10 @@ impl fmt::Display for PeerState {
         match self {
             PeerState::Dialing(Attempt { attempt: 0 }) => f.write_str("dialing"),
             PeerState::Dialing(Attempt { attempt }) => write!(f, "dialing (retry {attempt})"),
-            PeerState::Connected(_) => f.write_str("connected"),
+            PeerState::Connected(Connected { version: None }) => f.write_str("connected"),
+            PeerState::Connected(Connected {
+                version: Some(version),
+            }) => write!(f, "connected, running {version}"),
             PeerState::Backoff(Attempt { attempt }) => {
                 write!(f, "backing off after {attempt} failed dials")
             }
@@ -595,9 +598,14 @@ pub struct Attempt {
     pub attempt: u32,
 }
 
-/// A connected peer. Carries nothing yet; a struct so it can.
+/// A connected peer.
 #[derive(Debug, Clone, Cbor, Default, PartialEq, Eq)]
-pub struct Connected {}
+pub struct Connected {
+    /// The software version the peer says it runs; `None` until it has
+    /// said, when it does not, or from a daemon too old to ask.
+    #[cbor(key = 1)]
+    pub version: Option<String>,
+}
 
 /// Asks the daemon for envelopes it holds.
 ///

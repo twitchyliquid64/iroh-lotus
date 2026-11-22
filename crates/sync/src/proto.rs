@@ -13,7 +13,7 @@ use cbor2::Cbor;
 use wire::{Envelope, EnvelopeDigest};
 
 /// Each side's first frame: protocol version and the current HEAD.
-#[derive(Debug, Copy, Clone, Cbor, PartialEq, Eq)]
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
 pub struct Hello {
     /// Must equal [`PROTOCOL_VERSION`](crate::PROTOCOL_VERSION) exactly.
     #[cbor(key = 1)]
@@ -21,6 +21,11 @@ pub struct Hello {
     /// The canonical head this node stands at.
     #[cbor(key = 2)]
     pub head: EnvelopeDigest,
+    /// The software version the node runs, for people: shown, never
+    /// compared. `None` from a node too old to say — which also ignores
+    /// it, so adding it needed no protocol bump.
+    #[cbor(key = 3)]
+    pub software: Option<String>,
 }
 
 /// The puller's canonical path sampled newest-first — see
@@ -206,18 +211,70 @@ mod tests {
         EnvelopeDigest::from_bytes([byte; 32])
     }
 
-    /// `a2` (map, 2 pairs): version, then the head as a bare byte string,
-    /// exactly as `wire` encodes digests.
+    /// `a3` (map, 3 pairs): version, the head as a bare byte string,
+    /// exactly as `wire` encodes digests, then the software version.
     #[test]
     fn hello_pins_its_encoding() {
         let hello = Hello {
             version: 1,
             head: d(0xcd),
+            software: Some("1.2.3".into()),
         };
-        assert_wire(&hello, &format!("a20101025820{}", "cd".repeat(32)));
+        assert_wire(
+            &hello,
+            &format!("a30101025820{}0365312e322e33", "cd".repeat(32)),
+        );
         assert_wire(
             &Message::Hello(hello),
-            &format!("a101a20101025820{}", "cd".repeat(32)),
+            &format!("a101a30101025820{}0365312e322e33", "cd".repeat(32)),
+        );
+        let unsaid = Hello {
+            version: 1,
+            head: d(0xcd),
+            software: None,
+        };
+        assert_wire(&unsaid, &format!("a30101025820{}03f6", "cd".repeat(32)));
+    }
+
+    /// A `Hello` from a node too old to send its software version decodes,
+    /// saying none.
+    #[test]
+    fn a_hello_without_software_decodes() {
+        let hello: Hello =
+            wire::decode(&unhex(&format!("a20101025820{}", "cd".repeat(32)))).unwrap();
+        assert_eq!(
+            hello,
+            Hello {
+                version: 1,
+                head: d(0xcd),
+                software: None,
+            }
+        );
+    }
+
+    /// A node too old to know the software version decodes a `Hello` that
+    /// carries one, so adding it needed no protocol bump.
+    #[test]
+    fn a_hello_with_software_decodes_as_one_from_before() {
+        #[derive(Debug, Cbor, PartialEq)]
+        struct Before {
+            #[cbor(key = 1)]
+            version: u32,
+            #[cbor(key = 2)]
+            head: EnvelopeDigest,
+        }
+        let hello = Hello {
+            version: 1,
+            head: d(0xcd),
+            software: Some("1.2.3".into()),
+        };
+        let before: Before = wire::decode(&wire::encode(&hello).unwrap()).unwrap();
+        assert_eq!(
+            before,
+            Before {
+                version: 1,
+                head: d(0xcd)
+            }
         );
     }
 

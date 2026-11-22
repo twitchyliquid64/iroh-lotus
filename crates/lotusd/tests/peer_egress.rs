@@ -242,9 +242,11 @@ async fn cluster(n: usize) -> Vec<Node> {
 }
 
 fn connected_to(peers: &[PeerStatus], node: KeyId, endpoint: &Endpoint) -> bool {
-    peers
-        .iter()
-        .any(|p| p.node == node && p.addr.id == endpoint.id() && p.state == PeerState::Connected)
+    peers.iter().any(|p| {
+        p.node == node
+            && p.addr.id == endpoint.id()
+            && matches!(p.state, PeerState::Connected { .. })
+    })
 }
 
 #[tokio::test]
@@ -447,7 +449,10 @@ async fn a_change_anywhere_in_the_mesh_reaches_everyone() {
     c.wait_for_head(listed).await;
     for node in [a, b, c] {
         node.wait_for_peers("two peers connected", |peers| {
-            peers.len() == 2 && peers.iter().all(|p| p.state == PeerState::Connected)
+            peers.len() == 2
+                && peers
+                    .iter()
+                    .all(|p| matches!(p.state, PeerState::Connected { .. }))
         })
         .await;
     }

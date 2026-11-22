@@ -26,7 +26,7 @@ use tokio_util::{
 };
 use wire::{Envelope, EnvelopeDigest};
 
-use crate::{ChainError, Core, RequestError, ServerHandle};
+use crate::{ChainError, Core, RequestError, ServerHandle, VERSION};
 
 /// How long a quiet peer gets between frames before the session fails.
 pub const FRAME_TIMEOUT: Duration = Duration::from_secs(30);
@@ -121,26 +121,60 @@ impl SyncCore for &mut Core {
     }
 }
 
+/// How a session ended, and the software version the peer said it runs —
+/// kept whatever the outcome, since a served session the puller found
+/// current ends in [`SyncError::PeerClosed`] after the `Hello`s crossed.
+#[derive(Debug)]
+pub struct Finished<O> {
+    pub outcome: Result<O, SyncError>,
+    /// `None` when the peer did not say, or the session ended before its
+    /// `Hello`.
+    pub peer_software: Option<String>,
+}
+
 /// Pulls this node up to date from the peer on `transport`.
-pub async fn pull<T, C>(transport: T, mut core: C) -> Result<PullOutcome, SyncError>
+pub async fn pull<T, C>(transport: T, mut core: C) -> Finished<PullOutcome>
 where
     T: AsyncRead + AsyncWrite + Unpin,
     C: SyncCore,
 {
-    let head = core.head().await?;
-    let (mut puller, opening) = Puller::new(head);
-    drive(transport, core, |input| puller.handle(input), Some(opening)).await
+    let head = match core.head().await {
+        Ok(head) => head,
+        Err(e) => return Finished::before_hello(e),
+    };
+    let (mut puller, opening) = Puller::new(head, Some(VERSION.to_owned()));
+    let outcome = drive(transport, core, |input| puller.handle(input), Some(opening)).await;
+    Finished {
+        outcome,
+        peer_software: puller.peer_software().map(str::to_owned),
+    }
 }
 
 /// Serves the pull of the peer on `transport`.
-pub async fn serve<T, C>(transport: T, mut core: C) -> Result<ServeOutcome, SyncError>
+pub async fn serve<T, C>(transport: T, mut core: C) -> Finished<ServeOutcome>
 where
     T: AsyncRead + AsyncWrite + Unpin,
     C: SyncCore,
 {
-    let head = core.head().await?;
-    let mut server = sync::Server::new(head);
-    drive(transport, core, |input| server.handle(input), None).await
+    let head = match core.head().await {
+        Ok(head) => head,
+        Err(e) => return Finished::before_hello(e),
+    };
+    let mut server = sync::Server::new(head, Some(VERSION.to_owned()));
+    let outcome = drive(transport, core, |input| server.handle(input), None).await;
+    Finished {
+        outcome,
+        peer_software: server.peer_software().map(str::to_owned),
+    }
+}
+
+impl<O> Finished<O> {
+    fn before_hello(error: SyncError) -> Self {
+        Self {
+            outcome: Err(error),
+            peer_software: None,
+        }
+    }
 }
 
 /// The effect loop both sessions share: resolve every pending effect in

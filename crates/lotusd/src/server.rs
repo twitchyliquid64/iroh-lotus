@@ -816,7 +816,9 @@ impl Rpc {
                         PeerState::Dialing { attempt } => {
                             rpc::PeerState::Dialing(rpc::Attempt { attempt })
                         }
-                        PeerState::Connected => rpc::PeerState::Connected(rpc::Connected {}),
+                        PeerState::Connected { software } => {
+                            rpc::PeerState::Connected(rpc::Connected { version: software })
+                        }
                         PeerState::Backoff { attempt } => {
                             rpc::PeerState::Backoff(rpc::Attempt { attempt })
                         }
@@ -827,7 +829,7 @@ impl Rpc {
             inbound: u32::try_from(inbound).unwrap_or(u32::MAX),
             published: published.map(|state| match state {
                 PublishState::Unchecked => rpc::Published::Unchecked(rpc::Unchecked {}),
-                PublishState::Published => rpc::Published::Published(rpc::Connected {}),
+                PublishState::Published => rpc::Published::Published(rpc::Unchecked {}),
                 PublishState::Pending => rpc::Published::Pending(rpc::Unchecked {}),
                 PublishState::NotListed => rpc::Published::NotListed(rpc::Unchecked {}),
                 PublishState::OtherEndpoint(id) => {

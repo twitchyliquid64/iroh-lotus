@@ -132,6 +132,7 @@ mod tests {
         let hello = Input::Message(Message::Hello(Hello {
             version: 1,
             head: d(0xab),
+            software: None,
         }));
         assert_eq!(input(&hello).to_string(), "Hello(v1, head abababab)");
 

@@ -169,6 +169,7 @@ impl Node {
         let (send, recv) = conn.open_bi().await.ok()?;
         sync_driver::pull(tokio::io::join(recv, send), &self.handle)
             .await
+            .outcome
             .ok()
     }
 
@@ -183,7 +184,9 @@ impl Node {
     /// Pulls from `other` over one stream of `conn`.
     async fn pull_over(&self, conn: &Connection) -> Result<PullOutcome, SyncError> {
         let (send, recv) = conn.open_bi().await.unwrap();
-        sync_driver::pull(tokio::io::join(recv, send), &self.handle).await
+        sync_driver::pull(tokio::io::join(recv, send), &self.handle)
+            .await
+            .outcome
     }
 
     /// Waits for `other` to be serving `n` connections: accepting runs

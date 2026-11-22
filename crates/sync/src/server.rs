@@ -23,6 +23,9 @@ pub struct Server {
     /// The head at session start, for this side's `Hello` alone — a
     /// snapshot; segments always read the current canonical path.
     head: EnvelopeDigest,
+    /// What this side's `Hello` says it runs.
+    software: Option<String>,
+    peer_software: Option<String>,
     state: State,
 }
 
@@ -50,13 +53,21 @@ impl State {
 }
 
 impl Server {
-    /// A session about to serve a peer's pull, standing at `head`; says
-    /// nothing until the peer's `Hello` arrives.
-    pub fn new(head: EnvelopeDigest) -> Self {
+    /// A session about to serve a peer's pull, standing at `head` and
+    /// running `software`; says nothing until the peer's `Hello` arrives.
+    pub fn new(head: EnvelopeDigest, software: Option<String>) -> Self {
         Self {
             head,
+            software,
+            peer_software: None,
             state: State::AwaitHello,
         }
+    }
+
+    /// The software version the peer's `Hello` said it runs; `None` before
+    /// it arrives, or when the peer did not say.
+    pub fn peer_software(&self) -> Option<&str> {
+        self.peer_software.as_deref()
     }
 
     /// Feeds the machine one input; the returned effects must be resolved
@@ -87,10 +98,12 @@ impl Server {
                         theirs: peer.version,
                     });
                 }
+                self.peer_software = peer.software;
                 self.state = State::AwaitFindSplit;
                 vec![Effect::Send(Message::Hello(Hello {
                     version: PROTOCOL_VERSION,
                     head: self.head,
+                    software: self.software.take(),
                 }))]
             }
 
@@ -209,6 +222,7 @@ mod tests {
         Message::Hello(Hello {
             version: PROTOCOL_VERSION,
             head: d(0x01),
+            software: None,
         })
     }
 
@@ -229,7 +243,7 @@ mod tests {
 
     /// Drives a fresh server to the point of streaming from `at`.
     fn streaming(at: EnvelopeDigest) -> Server {
-        let mut server = Server::new(d(0x02));
+        let mut server = Server::new(d(0x02), None);
         server.handle(Input::Message(peer_hello()));
         server.handle(Input::Message(Message::FindSplit(FindSplit {
             locator: vec![at],
@@ -253,8 +267,23 @@ mod tests {
     }
 
     #[test]
+    fn each_side_learns_the_software_the_other_runs() {
+        let mut server = Server::new(d(0x02), Some("2.0.0".into()));
+        let effect = one(server.handle(Input::Message(Message::Hello(Hello {
+            version: PROTOCOL_VERSION,
+            head: d(0x01),
+            software: Some("1.0.0".into()),
+        }))));
+        assert!(matches!(
+            effect,
+            Effect::Send(Message::Hello(hello)) if hello.software.as_deref() == Some("2.0.0")
+        ));
+        assert_eq!(server.peer_software(), Some("1.0.0"));
+    }
+
+    #[test]
     fn hello_is_answered_with_hello() {
-        let mut server = Server::new(d(0x02));
+        let mut server = Server::new(d(0x02), None);
         let effect = one(server.handle(Input::Message(peer_hello())));
         assert!(matches!(
             effect,
@@ -265,10 +294,11 @@ mod tests {
 
     #[test]
     fn a_version_mismatch_is_a_breach() {
-        let mut server = Server::new(d(0x02));
+        let mut server = Server::new(d(0x02), None);
         let effect = one(server.handle(Input::Message(Message::Hello(Hello {
             version: 0,
             head: d(0x01),
+            software: None,
         }))));
         assert!(matches!(
             effect,
@@ -278,7 +308,7 @@ mod tests {
 
     #[test]
     fn find_split_consults_the_core() {
-        let mut server = Server::new(d(0x02));
+        let mut server = Server::new(d(0x02), None);
         server.handle(Input::Message(peer_hello()));
 
         let locator = vec![d(0x01), d(0x03)];
@@ -293,7 +323,7 @@ mod tests {
 
     #[test]
     fn an_empty_locator_is_a_breach() {
-        let mut server = Server::new(d(0x02));
+        let mut server = Server::new(d(0x02), None);
         server.handle(Input::Message(peer_hello()));
         let effect = one(server.handle(Input::Message(Message::FindSplit(FindSplit {
             locator: Vec::new(),
@@ -303,7 +333,7 @@ mod tests {
 
     #[test]
     fn an_oversized_locator_is_a_breach() {
-        let mut server = Server::new(d(0x02));
+        let mut server = Server::new(d(0x02), None);
         server.handle(Input::Message(peer_hello()));
         let locator = vec![d(0x01); locator::MAX_LOCATOR_LEN + 1];
         let effect = one(server.handle(Input::Message(Message::FindSplit(FindSplit { locator }))));
@@ -315,7 +345,7 @@ mod tests {
 
     #[test]
     fn no_split_point_says_so_and_ends() {
-        let mut server = Server::new(d(0x02));
+        let mut server = Server::new(d(0x02), None);
         server.handle(Input::Message(peer_hello()));
         server.handle(Input::Message(Message::FindSplit(FindSplit {
             locator: vec![d(0x01)],
@@ -375,7 +405,7 @@ mod tests {
 
     #[test]
     fn a_find_split_before_hello_is_a_breach() {
-        let mut server = Server::new(d(0x02));
+        let mut server = Server::new(d(0x02), None);
         let effect = one(server.handle(Input::Message(Message::FindSplit(FindSplit {
             locator: vec![d(0x01)],
         }))));
@@ -391,7 +421,7 @@ mod tests {
     /// A puller never sends `Envelopes`; one that does is off-script.
     #[test]
     fn an_envelopes_frame_from_the_puller_is_a_breach() {
-        let mut server = Server::new(d(0x02));
+        let mut server = Server::new(d(0x02), None);
         server.handle(Input::Message(peer_hello()));
         let (batch, _) = chained(d(0x10), 1);
         let effect = one(server.handle(Input::Message(Message::Envelopes(Envelopes { batch }))));
@@ -407,7 +437,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "a server never ingests")]
     fn an_ingested_input_panics() {
-        let mut server = Server::new(d(0x02));
+        let mut server = Server::new(d(0x02), None);
         server.handle(Input::Ingested);
     }
 

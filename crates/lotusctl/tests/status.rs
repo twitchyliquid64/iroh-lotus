@@ -8,7 +8,10 @@ use iroh::{
     Endpoint, EndpointAddr, RelayMode, SecretKey, endpoint::presets,
     test_utils::test_transport::TestNetwork,
 };
-use lotusd::{Core, IfInitialized, NodeKeys, Server, ServerHandle, peer_ingress::Protocol};
+use lotusd::{
+    Core, IfInitialized, NodeKeys, Server, ServerHandle, peer_egress::PeerState,
+    peer_ingress::Protocol,
+};
 use state::{CLUSTER_NODES_KEY, NODE_NAME_FIELD};
 use tempfile::TempDir;
 use tokio::{net::UnixListener, process::Command, task::JoinHandle, time::timeout};
@@ -172,6 +175,25 @@ impl Node {
         self.handle.insert([envelope]).await.unwrap();
     }
 
+    /// Waits until every peer this node keeps has said what it runs: the
+    /// pull on connect that learns it lands after the connection does.
+    async fn wait_for_peer_software(&self) {
+        timeout(GRACE, async {
+            while !self
+                .handle
+                .peers()
+                .await
+                .unwrap()
+                .iter()
+                .all(|peer| matches!(peer.state, PeerState::Connected { software: Some(_) }))
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("every peer to say what it runs");
+    }
+
     /// Waits until this node is serving `n` inbound connections.
     async fn wait_for_connections(&self, n: usize) {
         timeout(GRACE, async {
@@ -215,6 +237,7 @@ async fn pair() -> (Node, Node) {
     )])
     .await;
     b.wait_for_connections(1).await;
+    a.wait_for_peer_software().await;
     (a, b)
 }
 
@@ -276,9 +299,10 @@ async fn status_shows_each_side_of_a_kept_connection() {
     assert!(a_text.contains("peers      1 kept\n"), "got {a_text}");
     assert!(
         a_text.contains(&format!(
-            "           {}  {}  connected\n",
+            "           {}  {}  connected, running {}\n",
             KeyId::from_bytes([1; 32]).to_hex().as_ref(),
             b.endpoint().id().to_z32(),
+            lotusd::VERSION,
         )),
         "got {a_text}"
     );
@@ -338,6 +362,6 @@ async fn status_renders_json_when_asked() {
     assert_eq!(json["peers"][0]["endpoint"], b.endpoint().id().to_z32());
     assert_eq!(
         json["peers"][0]["state"],
-        serde_json::json!({ "connected": {} })
+        serde_json::json!({ "connected": { "version": lotusd::VERSION } })
     );
 }

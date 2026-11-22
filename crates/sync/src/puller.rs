@@ -20,6 +20,7 @@ use crate::{
 #[derive(Debug)]
 pub struct Puller {
     state: State,
+    peer_software: Option<String>,
 }
 
 #[derive(Debug)]
@@ -58,19 +59,27 @@ impl State {
 }
 
 impl Puller {
-    /// Creates a new Puller for a node at head, also returning the first
-    /// message to be sent.
-    pub fn new(head: EnvelopeDigest) -> (Self, Effect<PullOutcome>) {
+    /// Creates a new Puller for a node at head running `software`, also
+    /// returning the first message to be sent.
+    pub fn new(head: EnvelopeDigest, software: Option<String>) -> (Self, Effect<PullOutcome>) {
         let hello = Effect::Send(Message::Hello(Hello {
             version: PROTOCOL_VERSION,
             head,
+            software,
         }));
         (
             Self {
                 state: State::AwaitHello,
+                peer_software: None,
             },
             hello,
         )
+    }
+
+    /// The software version the peer's `Hello` said it runs; `None` before
+    /// it arrives, or when the peer did not say.
+    pub fn peer_software(&self) -> Option<&str> {
+        self.peer_software.as_deref()
     }
 
     /// Feeds the machine one input; the returned effects must be resolved
@@ -102,6 +111,7 @@ impl Puller {
                         theirs: peer.version,
                     });
                 }
+                self.peer_software = peer.software;
                 self.state = State::AwaitContains;
                 vec![Effect::Ask(Query::ContainsEnvelope(peer.head))]
             }
@@ -245,6 +255,7 @@ mod tests {
         Message::Hello(Hello {
             version: PROTOCOL_VERSION,
             head,
+            software: None,
         })
     }
 
@@ -261,7 +272,7 @@ mod tests {
     /// Drives a fresh puller to the point of awaiting batches, with the
     /// split at `split`.
     fn streaming(split: EnvelopeDigest) -> Puller {
-        let (mut puller, _) = Puller::new(d(0x01));
+        let (mut puller, _) = Puller::new(d(0x01), None);
         puller.handle(Input::Message(peer_hello(d(0x02))));
         puller.handle(Input::Answer(Answer::Contains(false)));
         puller.handle(Input::Answer(Answer::Locator(vec![d(0x01), split])));
@@ -285,7 +296,7 @@ mod tests {
 
     #[test]
     fn a_new_puller_opens_with_hello() {
-        let (_, effect) = Puller::new(d(0x01));
+        let (_, effect) = Puller::new(d(0x01), None);
         assert!(matches!(
             effect,
             Effect::Send(Message::Hello(hello))
@@ -294,11 +305,28 @@ mod tests {
     }
 
     #[test]
+    fn each_side_learns_the_software_the_other_runs() {
+        let (mut puller, opening) = Puller::new(d(0x01), Some("1.0.0".into()));
+        assert!(matches!(
+            opening,
+            Effect::Send(Message::Hello(hello)) if hello.software.as_deref() == Some("1.0.0")
+        ));
+        assert_eq!(puller.peer_software(), None);
+        puller.handle(Input::Message(Message::Hello(Hello {
+            version: PROTOCOL_VERSION,
+            head: d(0x02),
+            software: Some("2.0.0".into()),
+        })));
+        assert_eq!(puller.peer_software(), Some("2.0.0"));
+    }
+
+    #[test]
     fn a_version_mismatch_is_a_breach() {
-        let (mut puller, _) = Puller::new(d(0x01));
+        let (mut puller, _) = Puller::new(d(0x01), None);
         let effect = one(puller.handle(Input::Message(Message::Hello(Hello {
             version: PROTOCOL_VERSION + 1,
             head: d(0x02),
+            software: None,
         }))));
         assert!(matches!(
             effect,
@@ -310,7 +338,7 @@ mod tests {
     /// means nothing to fetch.
     #[test]
     fn a_known_peer_head_is_already_current() {
-        let (mut puller, _) = Puller::new(d(0x01));
+        let (mut puller, _) = Puller::new(d(0x01), None);
         let effect = one(puller.handle(Input::Message(peer_hello(d(0x02)))));
         assert!(matches!(
             effect,
@@ -323,7 +351,7 @@ mod tests {
 
     #[test]
     fn an_unknown_peer_head_negotiates_a_split() {
-        let (mut puller, _) = Puller::new(d(0x01));
+        let (mut puller, _) = Puller::new(d(0x01), None);
         puller.handle(Input::Message(peer_hello(d(0x02))));
 
         let effect = one(puller.handle(Input::Answer(Answer::Contains(false))));
@@ -341,7 +369,7 @@ mod tests {
     /// including at an envelope we can't build on.
     #[test]
     fn a_split_outside_the_locator_is_a_breach() {
-        let (mut puller, _) = Puller::new(d(0x01));
+        let (mut puller, _) = Puller::new(d(0x01), None);
         puller.handle(Input::Message(peer_hello(d(0x02))));
         puller.handle(Input::Answer(Answer::Contains(false)));
         puller.handle(Input::Answer(Answer::Locator(vec![d(0x01)])));
@@ -355,7 +383,7 @@ mod tests {
 
     #[test]
     fn no_split_ends_with_no_common_history() {
-        let (mut puller, _) = Puller::new(d(0x01));
+        let (mut puller, _) = Puller::new(d(0x01), None);
         puller.handle(Input::Message(peer_hello(d(0x02))));
         puller.handle(Input::Answer(Answer::Contains(false)));
         puller.handle(Input::Answer(Answer::Locator(vec![d(0x01)])));
@@ -491,7 +519,7 @@ mod tests {
     /// Any frame outside its phase is a breach naming both sides.
     #[test]
     fn an_out_of_phase_frame_is_a_breach() {
-        let (mut puller, _) = Puller::new(d(0x01));
+        let (mut puller, _) = Puller::new(d(0x01), None);
         let effect = one(puller.handle(Input::Message(Message::CaughtUp(CaughtUp {}))));
         assert!(matches!(
             effect,
@@ -505,14 +533,14 @@ mod tests {
     #[test]
     #[should_panic(expected = "driver answered a query nothing asked for")]
     fn an_unasked_answer_panics() {
-        let (mut puller, _) = Puller::new(d(0x01));
+        let (mut puller, _) = Puller::new(d(0x01), None);
         puller.handle(Input::Answer(Answer::Contains(true)));
     }
 
     #[test]
     #[should_panic(expected = "after the session ended")]
     fn input_after_the_end_panics() {
-        let (mut puller, _) = Puller::new(d(0x01));
+        let (mut puller, _) = Puller::new(d(0x01), None);
         puller.handle(Input::Message(peer_hello(d(0x02))));
         puller.handle(Input::Answer(Answer::Contains(true)));
         puller.handle(Input::Message(peer_hello(d(0x02))));

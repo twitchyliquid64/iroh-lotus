@@ -469,7 +469,10 @@ async fn serve_join(server: &ServerHandle, conn: &Connection) -> Result<KeyId, S
 /// Serves the pull the joiner opens on its next bi-stream.
 async fn serve_pull(server: &ServerHandle, conn: &Connection) -> Result<(), ServeError> {
     let (send, recv) = step(conn.accept_bi()).await.map_err(ServeError::Accept)?;
-    match sync_driver::serve(tokio::io::join(recv, send), server).await {
+    match sync_driver::serve(tokio::io::join(recv, send), server)
+        .await
+        .outcome
+    {
         Ok(_) => Ok(()),
         // Routine: a joiner already at our head learns so from `Hello`
         // and closes without another frame.
@@ -669,6 +672,7 @@ async fn pull(conn: &Connection, core: &mut Core) -> Result<(), JoinError> {
     let (send, recv) = step(conn.open_bi()).await.map_err(JoinError::Open)?;
     match sync_driver::pull(tokio::io::join(recv, send), core)
         .await
+        .outcome
         .map_err(JoinError::Sync)?
     {
         sync::PullOutcome::Synced { .. } | sync::PullOutcome::AlreadyCurrent => Ok(()),

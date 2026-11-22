@@ -111,10 +111,36 @@ async fn sync_once(
     Result<ServeOutcome, SyncError>,
 ) {
     let (pull_end, serve_end) = tokio::io::duplex(64 * 1024);
-    tokio::join!(
+    let (pulled, served) = tokio::join!(
         sync_driver::pull(pull_end, puller),
         sync_driver::serve(serve_end, server),
-    )
+    );
+    (pulled.outcome, served.outcome)
+}
+
+/// Each side of a session learns the software version the other runs from
+/// its `Hello` — the server too, though a puller already current hangs up
+/// without another frame.
+#[tokio::test]
+async fn each_side_learns_the_software_the_other_runs() {
+    let (_da, _db, _genesis, _keys, a, b) = cluster_pair().await;
+
+    let (pull_end, serve_end) = tokio::io::duplex(64 * 1024);
+    let (pulled, served) = tokio::join!(
+        sync_driver::pull(pull_end, &a),
+        sync_driver::serve(serve_end, &b),
+    );
+
+    assert!(
+        matches!(pulled.outcome, Ok(PullOutcome::AlreadyCurrent)),
+        "{pulled:?}"
+    );
+    assert_eq!(pulled.peer_software.as_deref(), Some(lotusd::VERSION));
+    assert!(
+        matches!(served.outcome, Err(SyncError::PeerClosed)),
+        "{served:?}"
+    );
+    assert_eq!(served.peer_software.as_deref(), Some(lotusd::VERSION));
 }
 
 /// A compacted node still serves a peer standing at or above its cut:
@@ -389,7 +415,7 @@ async fn an_oversized_frame_claim_fails_the_session() {
     })
     .0;
 
-    assert!(matches!(pulled, Err(SyncError::Frame(_))));
+    assert!(matches!(pulled.outcome, Err(SyncError::Frame(_))));
 }
 
 /// A peer speaking another protocol version is a breach at `Hello`.
@@ -403,7 +429,11 @@ async fn a_version_mismatch_is_a_breach() {
         let mut frame = BytesMut::new();
         sync::Codec
             .encode(
-                Message::Hello(sync::Hello { version: 999, head }),
+                Message::Hello(sync::Hello {
+                    version: 999,
+                    head,
+                    software: None,
+                }),
                 &mut frame,
             )
             .unwrap();
@@ -412,7 +442,7 @@ async fn a_version_mismatch_is_a_breach() {
     .0;
 
     assert!(matches!(
-        pulled,
+        pulled.outcome,
         Err(SyncError::Breach(sync::Breach::Version { theirs: 999, .. }))
     ));
 }
@@ -432,5 +462,5 @@ async fn a_close_mid_frame_is_truncated() {
     })
     .0;
 
-    assert!(matches!(pulled, Err(SyncError::Truncated)));
+    assert!(matches!(pulled.outcome, Err(SyncError::Truncated)));
 }

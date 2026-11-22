@@ -67,8 +67,10 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 pub enum PeerState {
     /// A dial is in progress; `attempt` counts the failures before it.
     Dialing { attempt: u32 },
-    /// The connection is up.
-    Connected,
+    /// The connection is up. `software` is the version the peer's
+    /// `Hello` named: `None` until a session hears it, or when the peer
+    /// does not say.
+    Connected { software: Option<String> },
     /// The last dial failed; waiting before the next one.
     Backoff { attempt: u32 },
 }
@@ -78,7 +80,10 @@ impl fmt::Display for PeerState {
         match self {
             PeerState::Dialing { attempt: 0 } => f.write_str("dialing"),
             PeerState::Dialing { attempt } => write!(f, "dialing (retry {attempt})"),
-            PeerState::Connected => f.write_str("connected"),
+            PeerState::Connected { software: None } => f.write_str("connected"),
+            PeerState::Connected {
+                software: Some(software),
+            } => write!(f, "connected, running {software}"),
             PeerState::Backoff { attempt } => write!(f, "backoff after {attempt} failures"),
         }
     }
@@ -415,13 +420,16 @@ async fn maintain(
         match dialled {
             Ok(conn) => {
                 attempt = 0;
-                state.send_replace(PeerState::Connected);
+                state.send_replace(PeerState::Connected { software: None });
                 tracing::info!("connected to peer");
                 // Server about to be garbage collected.
                 let Some(server) = server.upgrade() else {
                     return node;
                 };
-                if hold(conn, server, &mut head, &cancel).await.is_break() {
+                if hold(conn, server, &mut head, &state, &cancel)
+                    .await
+                    .is_break()
+                {
                     return node;
                 }
                 last_up = Instant::now();
@@ -451,11 +459,14 @@ async fn maintain(
 ///
 /// Announces this node's head as it moves, starting with where it stands
 /// now so a peer that was apart catches up at once, and serves the pulls
-/// the peer opens in answer.
+/// the peer opens in answer. Pulls once on connect too: that catches this
+/// node up, and its `Hello`s are where `state` learns what the peer runs —
+/// a peer already at our head would otherwise never open a session.
 async fn hold(
     conn: Connection,
     server: ServerHandle,
     head: &mut watch::Receiver<EnvelopeDigest>,
+    state: &watch::Sender<PeerState>,
     cancel: &CancellationToken,
 ) -> ControlFlow<()> {
     let mut link = Link::new(conn.clone(), server);
@@ -464,6 +475,7 @@ async fn hold(
     if let Err(e) = link.announce(current).await {
         tracing::debug!(error = %e, "announcing head on connect");
     }
+    link.pull();
     loop {
         let flow = tokio::select! {
             bi = conn.accept_bi() => match bi {
@@ -487,7 +499,18 @@ async fn hold(
                 // The egress is gone; so are we.
                 Err(_) => ControlFlow::Break(CloseReason::ShuttingDown),
             },
-            Some(session) = link.next_session() => link.settle(session),
+            Some(session) = link.next_session() => {
+                let flow = link.settle(session);
+                let software = link.peer_software();
+                state.send_if_modified(|state| match state {
+                    PeerState::Connected { software: known } if known.as_deref() != software => {
+                        *known = software.map(str::to_owned);
+                        true
+                    }
+                    _ => false,
+                });
+                flow
+            }
             closed = conn.closed() => {
                 tracing::info!(reason = ?closed, "peer connection lost");
                 return ControlFlow::Continue(());

@@ -25,7 +25,7 @@ use wire::EnvelopeDigest;
 use crate::{
     ServerHandle,
     peer_ingress::CloseReason,
-    sync_driver::{self, SyncError},
+    sync_driver::{self, Finished, SyncError},
 };
 
 /// The most bytes an announce stream may carry: one frame is a length
@@ -52,8 +52,8 @@ pub enum AnnounceError {
 /// How one session on the connection ended.
 #[derive(Debug)]
 pub(crate) enum Session {
-    Served(Result<ServeOutcome, SyncError>),
-    Pulled(Result<PullOutcome, SyncError>),
+    Served(Finished<ServeOutcome>),
+    Pulled(Finished<PullOutcome>),
     /// The pull's stream could not be opened; the connection is on its
     /// way down and will say so itself.
     PullNotOpened(ConnectionError),
@@ -78,6 +78,8 @@ pub(crate) struct Link {
     server: ServerHandle,
     sessions: JoinSet<Session>,
     pull: Pull,
+    /// The software version the peer's latest `Hello` named.
+    peer_software: Option<String>,
 }
 
 impl Link {
@@ -87,7 +89,14 @@ impl Link {
             server,
             sessions: JoinSet::new(),
             pull: Pull::Idle,
+            peer_software: None,
         }
+    }
+
+    /// The software version the peer last said it runs, if any session
+    /// on this connection has heard it say.
+    pub(crate) fn peer_software(&self) -> Option<&str> {
+        self.peer_software.as_deref()
     }
 
     /// Serves the pull the peer opened on this stream pair.
@@ -157,7 +166,7 @@ impl Link {
     }
 
     /// Opens a pull now, or owes one if a pull is already running.
-    fn pull(&mut self) {
+    pub(crate) fn pull(&mut self) {
         self.pull = match self.pull {
             Pull::Idle => {
                 self.spawn_pull();
@@ -202,22 +211,41 @@ impl Link {
     /// close over it, carrying the close reason if so.
     pub(crate) fn settle(&mut self, session: Session) -> ControlFlow<CloseReason> {
         let was_pull = !matches!(session, Session::Served(_));
+        let software = match &session {
+            Session::Served(finished) => finished.peer_software.as_ref(),
+            Session::Pulled(finished) => finished.peer_software.as_ref(),
+            Session::PullNotOpened(_) => None,
+        };
+        if let Some(software) = software {
+            self.peer_software = Some(software.clone());
+        }
         let flow = match session {
-            Session::Served(Ok(outcome)) => {
+            Session::Served(Finished {
+                outcome: Ok(outcome),
+                ..
+            }) => {
                 tracing::info!(?outcome, "served pull");
                 ControlFlow::Continue(())
             }
             // Routine: the peer learned from `Hello` that it needed nothing.
-            Session::Served(Err(SyncError::PeerClosed)) => {
+            Session::Served(Finished {
+                outcome: Err(SyncError::PeerClosed),
+                ..
+            }) => {
                 tracing::debug!("peer parted between frames");
                 ControlFlow::Continue(())
             }
-            Session::Served(Err(e)) => {
+            Session::Served(Finished {
+                outcome: Err(e), ..
+            }) => {
                 let reason = close_reason(&e);
                 tracing::warn!(error = %e, ?reason, "closing peer connection");
                 ControlFlow::Break(reason)
             }
-            Session::Pulled(Ok(outcome)) => {
+            Session::Pulled(Finished {
+                outcome: Ok(outcome),
+                ..
+            }) => {
                 match &outcome {
                     PullOutcome::Synced { .. } => tracing::info!(?outcome, "pulled from peer"),
                     PullOutcome::AlreadyCurrent => tracing::debug!("pulled: already current"),
@@ -228,7 +256,9 @@ impl Link {
                 }
                 ControlFlow::Continue(())
             }
-            Session::Pulled(Err(e)) => {
+            Session::Pulled(Finished {
+                outcome: Err(e), ..
+            }) => {
                 let reason = close_reason(&e);
                 tracing::warn!(error = %e, ?reason, "closing peer connection");
                 ControlFlow::Break(reason)

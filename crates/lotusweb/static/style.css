@@ -374,6 +374,7 @@ dl.status .absent { color: var(--muted); }
 
 .peers .entries .state { white-space: nowrap; }
 .peers .entries .node-name { font-weight: 600; }
+.peers .entries .version .absent { color: var(--muted); }
 
 .dot {
   display: inline-block;

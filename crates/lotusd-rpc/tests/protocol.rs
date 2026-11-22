@@ -992,7 +992,7 @@ fn a_peer_without_a_name_decodes() {
     let before = Before {
         node: KeyId::from_bytes([7; 32]),
         endpoint: "abc".to_owned(),
-        state: PeerState::Connected(Connected {}),
+        state: PeerState::Connected(Connected::default()),
     };
     let info = wire::decode::<PeerInfo>(&wire::encode(&before).unwrap()).unwrap();
     assert_eq!(info.node, before.node);
