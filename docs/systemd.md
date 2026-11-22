@@ -1,6 +1,7 @@
 # Running lotusd under systemd
 
-Unit files for a Debian (or any systemd) host live in [`systemd/`](systemd/):
+Unit files for a Debian (or any systemd) host live in [`systemd/`](systemd/), and ship in
+each release tarball under `docs/systemd/`:
 
 | File | Installs to | Role |
 |------|-------------|------|
@@ -20,7 +21,8 @@ or joining one, are done *through* systemd, which has the access.
 
 ```sh
 tar -xzf iroh-lotus-v*-linux-amd64.tar.gz
-sudo install iroh-lotus-v*-linux-amd64/lotus{d,ctl,web} /usr/local/bin
+cd iroh-lotus-v*-linux-amd64
+sudo install lotus{d,ctl,web} /usr/local/bin
 sudo install -m 0644 docs/systemd/lotusd.service docs/systemd/lotusd-bootstrap.service /etc/systemd/system/
 sudo install -m 0644 docs/systemd/lotusd.sysusers.conf /usr/lib/sysusers.d/lotusd.conf
 sudo install -m 0644 docs/systemd/lotusd.default /etc/default/lotusd

@@ -95,6 +95,10 @@ jobs:
                      target/${{ matrix.target }}/release/lotusctl \
                      target/${{ matrix.target }}/release/lotusweb \
                      LICENSE README.md "dist/$name/"
+                  # Same docs/ layout as the repo, so docs/systemd.md's install
+                  # commands run as written from the unpacked directory.
+                  mkdir -p "dist/$name/docs"
+                  cp -r docs/systemd docs/systemd.md "dist/$name/docs/"
                   tar -czf "dist/$name.tar.gz" -C dist "$name"
                   (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
                   echo "name=$name" >> "$GITHUB_OUTPUT"
