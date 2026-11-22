@@ -74,7 +74,10 @@ lotusweb = { path = "crates/lotusweb" }
 render = { path = "crates/render" }
 schema = { path = "crates/schema" }
 state = { path = "crates/state" }
-storage = { path = "crates/storage" }
+# No backend by default: `schema` wants the value helpers alone, and a member
+# cannot switch off defaults the workspace leaves on. Whoever opens a store
+# asks for `sqlite`.
+storage = { path = "crates/storage", default-features = false }
 sync = { path = "crates/sync" }
 version = { path = "crates/version" }
 wire = { path = "crates/wire" }

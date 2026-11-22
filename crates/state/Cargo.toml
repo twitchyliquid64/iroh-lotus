@@ -13,4 +13,6 @@ storage.workspace = true
 wire = { workspace = true, features = ["iroh"] }
 
 [dev-dependencies]
+# The schema tests run on every backend.
+storage = { workspace = true, features = ["sqlite"] }
 ed25519-zebra.workspace = true

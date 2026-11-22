@@ -8,5 +8,5 @@ publish.workspace = true
 
 [dependencies]
 # Only the pure value helpers: a client reading schemas builds no backend.
-storage = { workspace = true, default-features = false }
+storage.workspace = true
 wire.workspace = true

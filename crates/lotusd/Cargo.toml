@@ -30,7 +30,7 @@ tracing-subscriber.workspace = true
 lotusd-rpc.workspace = true
 render = { workspace = true, features = ["clap"] }
 state.workspace = true
-storage.workspace = true
+storage = { workspace = true, features = ["sqlite"] }
 sync.workspace = true
 version.workspace = true
 wire = { workspace = true, features = ["iroh"] }
