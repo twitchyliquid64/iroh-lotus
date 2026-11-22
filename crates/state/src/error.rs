@@ -5,6 +5,8 @@ use std::collections::BTreeSet;
 
 use wire::{EnvelopeDigest, keys::KeyId, msg::NamespaceKey, subkey::SubkeyPath};
 
+use crate::{SchemaSetError, Violation};
+
 /// An error produced while working with a ledger.
 ///
 /// Generic over the storage backend's error `E`; a backend that cannot
@@ -103,13 +105,21 @@ pub enum ApplyError<E> {
         path: Option<SubkeyPath>,
     },
     /// The value the namespace would hold after the write violates the
-    /// rules for that namespace — today, the baked-in rules for the
-    /// reserved `_lotus_` keys.
+    /// baked-in rules for that reserved `_lotus_` namespace.
     InvalidValue {
         /// The namespace whose rules refused the value.
         key: NamespaceKey,
         /// Which rule refused it, and why.
         reason: ValueError,
+    },
+    /// The value the namespace would hold after the write — or holds
+    /// now, when the write is to its schema — breaks the schema the
+    /// ledger holds for it.
+    SchemaViolation {
+        /// The namespace whose value breaks its schema.
+        key: NamespaceKey,
+        /// Where, and how.
+        violation: Violation,
     },
     /// The envelope's verified signature weight is below the minimum the
     /// ledger requires at this position.
@@ -154,6 +164,8 @@ pub enum ValueError {
     TrustedKeys(TrustedKeysError),
     /// The set of nodes in the cluster could not be read.
     ClusterNodes(String),
+    /// The schema set could not be read.
+    Schema(SchemaSetError),
 }
 
 impl fmt::Display for ValueError {
@@ -170,6 +182,7 @@ impl fmt::Display for ValueError {
             ),
             ValueError::TrustedKeys(err) => write!(f, "{err}"),
             ValueError::ClusterNodes(err) => write!(f, "cluster nodes: {err}"),
+            ValueError::Schema(err) => write!(f, "{err}"),
         }
     }
 }
@@ -182,6 +195,7 @@ impl core::error::Error for ValueError {
             | ValueError::MinEnvelopeSignatures
             | ValueError::ClusterNodes(_) => None,
             ValueError::TrustedKeys(err) => Some(err),
+            ValueError::Schema(err) => Some(err),
         }
     }
 }
@@ -291,6 +305,9 @@ impl<E> fmt::Display for ApplyError<E> {
             ApplyError::InvalidValue { key, reason } => {
                 write!(f, "namespace {key} refused the value: {reason}")
             }
+            ApplyError::SchemaViolation { key, violation } => {
+                write!(f, "namespace {key} breaks its schema: {violation}")
+            }
             ApplyError::InsufficientWeight { required, found } => {
                 write!(
                     f,
@@ -351,6 +368,7 @@ impl<E: core::error::Error + 'static> core::error::Error for ApplyError<E> {
         match self {
             ApplyError::Wire(err) => Some(err),
             ApplyError::InvalidValue { reason, .. } => Some(reason),
+            ApplyError::SchemaViolation { violation, .. } => Some(violation),
             ApplyError::Storage(err) => Some(err),
             _ => None,
         }

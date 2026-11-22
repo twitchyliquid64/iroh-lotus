@@ -1,8 +1,11 @@
 //! The state a chain of envelopes folds down to.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
+};
 
-use storage::{NamespaceOp, NodeKind, Resolution, Storage};
+use storage::{NamespaceOp, NodeKind, Resolution, Storage, ValueMeta};
 use wire::{
     Envelope, EnvelopeDigest, Msg, VerificationStatus,
     keys::{Key, KeyId},
@@ -12,7 +15,10 @@ use wire::{
     subkey::{Subkey, SubkeyPath},
 };
 
-use crate::{ApplyError, Error, TrustedKeysError, ValueError};
+use crate::{
+    ApplyError, Error, Schema, SchemaSetError, TrustedKeysError, ValueError,
+    schema::{Local, Standing, parse_set},
+};
 
 /// The reserved namespace holding the minimum number of minutes every
 /// node must keep a message before it is eligible for compaction. Writes
@@ -66,6 +72,19 @@ pub const TRUSTED_KEYS_KEY: &str = "_lotus_trusted_keys";
 /// its iroh address under `iroh`. Writes are validated.
 pub const CLUSTER_NODES_KEY: &str = "_lotus_nodes";
 
+/// The reserved namespace holding the schemas other namespaces are held
+/// to: a [`Value::Map`] from a namespace's name to its [`Schema`], spelled
+/// as a value. Writes are validated twice over — every entry must be a
+/// schema, and the namespace an added or changed entry names must already
+/// satisfy it — so a namespace with a schema conforms to it at every
+/// head. Absent, or holding no entry for a namespace, nothing is
+/// required of it.
+///
+/// The schema in force is the one at an envelope's *parent*. An absent
+/// namespace satisfies any schema, and the reserved `_lotus_` namespaces
+/// keep their baked-in rules: an entry naming one is refused.
+pub const SCHEMA_KEY: &str = "_lotus_schema";
+
 /// The field of a node's [`CLUSTER_NODES_KEY`] entry naming it for people.
 ///
 /// Read leniently and never validated: anything but a non-empty string
@@ -106,12 +125,7 @@ impl Ledger {
     pub fn init<S: Storage>(storage: &mut S, envelope: &Envelope) -> Result<Self, Error<S::Error>> {
         match envelope.payload() {
             Msg::Init(init) => {
-                // The boundary covers genesis too: a checkpoint can't
-                // smuggle in a value an update would be refused for.
-                init.state
-                    .namespaces
-                    .iter()
-                    .try_for_each(|(key, namespace)| Self::validate_value(key, &namespace.value))?;
+                Self::validate_checkpoint(&init.state)?;
 
                 let head = envelope.digest()?;
                 storage
@@ -141,10 +155,7 @@ impl Ledger {
         envelope: &Envelope,
         state: &FullCheckpoint,
     ) -> Result<Self, Error<S::Error>> {
-        state
-            .namespaces
-            .iter()
-            .try_for_each(|(key, namespace)| Self::validate_value(key, &namespace.value))?;
+        Self::validate_checkpoint(state)?;
 
         let head = envelope.digest()?;
         storage
@@ -204,10 +215,7 @@ impl Ledger {
             // Unreachable: Init is the only variant without a prev digest,
             // so the check above has already rejected it.
             Msg::Init(_) => return Err(ApplyError::UnexpectedInit),
-            Msg::SetNamespace(set) => {
-                Self::validate_value(&set.key, &set.namespace.value)?;
-                NamespaceOp::Put(set.key.clone(), set.namespace.clone())
-            }
+            Msg::SetNamespace(set) => NamespaceOp::Put(set.key.clone(), set.namespace.clone()),
             Msg::SetNamespaceKey(set) => self.validate_set_key(storage, set)?,
             Msg::AmendNamespaceKey(amend) => self.validate_amend_key(storage, amend)?,
             Msg::DeleteNamespace(del) => {
@@ -217,7 +225,7 @@ impl Ledger {
             }
         };
 
-        self.validate_nested(storage, &op)?;
+        self.validate_result(storage, &op)?;
 
         storage
             .commit(self.head, head, op)
@@ -615,8 +623,8 @@ impl Ledger {
 
     /// The rule judging what `key`'s namespace may hold, if it has one.
     ///
-    /// Today the lookup has two baked-in arms; a schema published under a
-    /// reserved key can become another without the callers moving.
+    /// Only the reserved namespaces have one; the rest answer to the
+    /// [`Schema`] the ledger holds for them, if any.
     fn rule(key: &NamespaceKey) -> Option<Rule> {
         match key.as_ref() {
             MIN_KEEP_MINUTES_KEY => Some(|value| {
@@ -644,6 +652,7 @@ impl Ledger {
                     .map(|_| ())
                     .map_err(ValueError::ClusterNodes)
             }),
+            SCHEMA_KEY => Some(|value| parse_set(value).map(|_| ()).map_err(ValueError::Schema)),
             _ => None,
         }
     }
@@ -658,39 +667,198 @@ impl Ledger {
             })
     }
 
-    /// Re-judges a nested write against its namespace's rule.
+    /// Judges a whole checkpoint at the boundary — genesis, or a cut being
+    /// adopted — so it can't smuggle in state an update would be refused
+    /// for: every reserved namespace against its rule, every namespace
+    /// with a schema against it.
+    fn validate_checkpoint<E>(state: &FullCheckpoint) -> Result<(), ApplyError<E>> {
+        state
+            .namespaces
+            .iter()
+            .try_for_each(|(key, namespace)| Self::validate_value(key, &namespace.value))?;
+
+        let Some((schema_key, schemas)) = state.namespaces.get_key_value(SCHEMA_KEY) else {
+            return Ok(());
+        };
+        parse_set(&schemas.value)
+            .map_err(|reason| ApplyError::InvalidValue {
+                key: schema_key.clone(),
+                reason: ValueError::Schema(reason),
+            })?
+            .iter()
+            .try_for_each(|(key, schema)| {
+                state
+                    .namespaces
+                    .get(key)
+                    .map_or(Ok(()), |namespace| conforms(key, schema, &namespace.value))
+            })
+    }
+
+    /// Judges the value a write would leave its namespace holding: a
+    /// reserved namespace against its rule, any other against its schema.
     ///
-    /// [`validate_value`](Self::validate_value) judges whole values, and
-    /// the `SetAt`/`AmendAt` paths check only the shape of the path they
-    /// walk — so a nested write could otherwise leave a reserved
-    /// namespace holding something a whole-value write would have been
-    /// refused for. Only namespaces with a rule are materialized; every
-    /// other write stays O(path).
-    fn validate_nested<S: Storage>(
+    /// A reserved namespace's rule judges whole values, so its nested
+    /// writes materialize the result — O(namespace), and fine for the
+    /// ledger's own small config. A schema is judged along the write's
+    /// path instead, and a namespace with neither is not read at all.
+    fn validate_result<S: Storage>(
         &self,
         storage: &S,
         op: &NamespaceOp,
     ) -> Result<(), ApplyError<S::Error>> {
-        match op {
-            NamespaceOp::SetAt { key, path, value } if Self::rule(key).is_some() => {
-                let mut result = self.ruled_value(storage, key)?;
-                storage::value::set_at(&mut result, path, value.clone());
-                Self::validate_value(key, &result)
+        let key = match op {
+            NamespaceOp::Put(key, _)
+            | NamespaceOp::SetAt { key, .. }
+            | NamespaceOp::AmendAt { key, .. } => key,
+            // Absent, which every rule and every schema allows.
+            NamespaceOp::Delete(_) => return Ok(()),
+        };
+
+        if key.as_ref() == SCHEMA_KEY {
+            let result = self.result_of(storage, op)?;
+            let schemas = parse_set(&result).map_err(|reason| ApplyError::InvalidValue {
+                key: key.clone(),
+                reason: ValueError::Schema(reason),
+            })?;
+            return self.validate_schema_change(storage, &schemas);
+        }
+        if Self::rule(key).is_some() {
+            let result = self.result_of(storage, op)?;
+            return Self::validate_value(key, &result);
+        }
+        let Some(schema) = self.schema(storage, key)? else {
+            return Ok(());
+        };
+        // A nested write is judged from the path it lands on, never by
+        // materializing the namespace around it — which may be far larger
+        // than anything the write touches.
+        let standing = StandingAt {
+            storage,
+            head: self.head,
+            key,
+        };
+        let judged = match op {
+            NamespaceOp::SetAt { path, value, .. } => {
+                schema.check_set(path, value.as_ref(), &standing)
             }
-            NamespaceOp::AmendAt { key, path, op } if Self::rule(key).is_some() => {
-                let mut result = self.ruled_value(storage, key)?;
-                storage::value::amend_at(&mut result, path.as_ref(), op.clone());
-                Self::validate_value(key, &result)
+            NamespaceOp::AmendAt { path, op, .. } => {
+                schema.check_amend(path.as_ref(), op, &standing)
             }
-            // A whole-value write is judged where it is built; a delete
-            // leaves the namespace absent, which every rule allows.
-            _ => Ok(()),
+            NamespaceOp::Put(..) | NamespaceOp::Delete(_) => Ok(Local::Whole),
+        }
+        .map_err(ApplyError::Storage)?;
+
+        match judged {
+            Local::Judged(verdict) => verdict.map_err(|violation| ApplyError::SchemaViolation {
+                key: key.clone(),
+                violation,
+            }),
+            Local::Whole => {
+                let result = self.result_of(storage, op)?;
+                conforms(key, &schema, &result)
+            }
         }
     }
 
-    /// The value a nested write is about to change. O(namespace), which
-    /// is why only ruled namespaces reach it.
-    fn ruled_value<S: Storage>(
+    /// Holds every namespace whose schema a write to [`SCHEMA_KEY`] adds
+    /// or changes to that schema, as it stands at this ledger.
+    ///
+    /// Entries left as they were are skipped: their namespaces conformed
+    /// when the entry was written and at every write since.
+    fn validate_schema_change<S: Storage>(
+        &self,
+        storage: &S,
+        schemas: &BTreeMap<NamespaceKey, Schema>,
+    ) -> Result<(), ApplyError<S::Error>> {
+        // Read leniently: an entry that does not parse reads as absent,
+        // so whatever replaces it is judged as new.
+        let standing: BTreeMap<NamespaceKey, Schema> = match storage
+            .value_at(self.head, &schema_key(), &[])
+            .map_err(ApplyError::Storage)?
+        {
+            Some(Value::Map(entries)) => entries
+                .iter()
+                .filter_map(|(key, schema)| {
+                    Some((
+                        NamespaceKey::try_new(key.as_str()).ok()?,
+                        Schema::parse(schema).ok()?,
+                    ))
+                })
+                .collect(),
+            _ => BTreeMap::new(),
+        };
+
+        schemas
+            .iter()
+            .filter(|(key, schema)| standing.get(*key) != Some(*schema))
+            .try_for_each(|(key, schema)| {
+                self.namespace(storage, key)
+                    .map_err(ApplyError::Storage)?
+                    .map_or(Ok(()), |namespace| conforms(key, schema, &namespace.value))
+            })
+    }
+
+    /// The schema `key`'s namespace is held to, if the ledger has one.
+    ///
+    /// Absent is no schema; present but unreadable is an error, never a
+    /// silent pass — the same reasoning as
+    /// [`trusted_keys`](Self::trusted_keys).
+    pub fn schema<S: Storage>(
+        &self,
+        storage: &S,
+        key: &NamespaceKey,
+    ) -> Result<Option<Schema>, ApplyError<S::Error>> {
+        let unreadable = |reason| ApplyError::InvalidValue {
+            key: schema_key(),
+            reason: ValueError::Schema(reason),
+        };
+        let entry = [Subkey::Key(key.to_string())];
+
+        // Resolved before it is read: a schema set that is not a map has
+        // no entry for anyone, and reading it as "no schema" would let
+        // every write through.
+        match self.resolve(storage, &schema_key(), &entry)? {
+            None | Some(Resolution::Missing { .. }) => Ok(None),
+            Some(Resolution::Mismatch { .. }) => Err(unreadable(SchemaSetError::NotAMap)),
+            Some(Resolution::Node(_)) => storage
+                .value_at(self.head, &schema_key(), &entry)
+                .map_err(ApplyError::Storage)?
+                .map(|schema| Schema::parse(&schema))
+                .transpose()
+                .map_err(|error| {
+                    unreadable(SchemaSetError::Invalid {
+                        namespace: key.to_string(),
+                        error,
+                    })
+                }),
+        }
+    }
+
+    /// The value `op` would leave its namespace holding. Not for a
+    /// delete, which leaves none.
+    fn result_of<'a, S: Storage>(
+        &self,
+        storage: &S,
+        op: &'a NamespaceOp,
+    ) -> Result<Cow<'a, Value>, ApplyError<S::Error>> {
+        match op {
+            NamespaceOp::Put(_, namespace) => Ok(Cow::Borrowed(&namespace.value)),
+            NamespaceOp::SetAt { key, path, value } => {
+                let mut result = self.standing_value(storage, key)?;
+                storage::value::set_at(&mut result, path, value.clone());
+                Ok(Cow::Owned(result))
+            }
+            NamespaceOp::AmendAt { key, path, op } => {
+                let mut result = self.standing_value(storage, key)?;
+                storage::value::amend_at(&mut result, path.as_ref(), op.clone());
+                Ok(Cow::Owned(result))
+            }
+            NamespaceOp::Delete(_) => unreachable!("a delete leaves no value to judge"),
+        }
+    }
+
+    /// The value a nested write is about to change. O(namespace).
+    fn standing_value<S: Storage>(
         &self,
         storage: &S,
         key: &NamespaceKey,
@@ -822,6 +990,51 @@ fn parse_cluster_nodes(value: &Value) -> Result<BTreeMap<KeyId, ClusterNode>, St
             }))
         })
         .collect()
+}
+
+/// One namespace as it stands at a head, read a path at a time.
+struct StandingAt<'a, S> {
+    storage: &'a S,
+    head: EnvelopeDigest,
+    key: &'a NamespaceKey,
+}
+
+impl<S: Storage> Standing for StandingAt<'_, S> {
+    type Error = S::Error;
+
+    fn len(&self, path: &[Subkey]) -> Result<Option<u64>, S::Error> {
+        Ok(match self.storage.meta_at(self.head, self.key, path)? {
+            Some(ValueMeta::Array { len }) => Some(len),
+            // usize to u64 is lossless on every target Rust supports.
+            Some(ValueMeta::Map { keys }) => Some(keys.len() as u64),
+            Some(ValueMeta::Leaf) | None => None,
+        })
+    }
+
+    fn contains(&self, path: &[Subkey]) -> Result<bool, S::Error> {
+        Ok(matches!(
+            self.storage.resolve(self.head, self.key, path)?,
+            Some(Resolution::Node(_))
+        ))
+    }
+
+    fn value(&self, path: &[Subkey]) -> Result<Option<Value>, S::Error> {
+        self.storage.value_at(self.head, self.key, path)
+    }
+}
+
+fn schema_key() -> NamespaceKey {
+    NamespaceKey::try_new(SCHEMA_KEY).expect("the reserved key is static")
+}
+
+/// Holds `value`, the whole of `key`'s namespace, to `schema`.
+fn conforms<E>(key: &NamespaceKey, schema: &Schema, value: &Value) -> Result<(), ApplyError<E>> {
+    schema
+        .check(value)
+        .map_err(|violation| ApplyError::SchemaViolation {
+            key: key.clone(),
+            violation,
+        })
 }
 
 /// A reserved namespace's rule: what its value must satisfy, and why it
@@ -3648,5 +3861,289 @@ mod tests {
             ledger.checkpoint(&store).unwrap()
         );
         assert_ne!(reopened.head(), ledger.head(), "new chain, new head");
+    }
+
+    /// The schema [`nested`] conforms to: `count` required and at most
+    /// 10, `list` at most three strings, `a` a map of strings.
+    fn nested_schema() -> Value {
+        let of = |kind: &str| map([("type", kind.into())]);
+        map([
+            ("type", "struct".into()),
+            ("required", ["count"].into_iter().collect()),
+            (
+                "fields",
+                map([
+                    ("a", map([("type", "map".into()), ("values", of("string"))])),
+                    ("count", map([("type", "int".into()), ("max", 10.into())])),
+                    (
+                        "list",
+                        map([
+                            ("type", "array".into()),
+                            ("items", of("string")),
+                            ("max_len", 3.into()),
+                        ]),
+                    ),
+                ]),
+            ),
+        ])
+    }
+
+    fn set_value(prev: EnvelopeDigest, k: &str, value: Value) -> Envelope {
+        Envelope::new(Msg::SetNamespace(SetNamespace {
+            prev,
+            key: key(k),
+            namespace: Namespace { value },
+        }))
+    }
+
+    /// [`nested_ledger`], with [`nested_schema`] in force over `n`.
+    fn schema_ledger() -> (MemStorage, Ledger) {
+        let (mut store, mut ledger) = nested_ledger();
+        let schemas = map([("n", nested_schema())]);
+        ledger
+            .apply(&mut store, &set_value(ledger.head(), SCHEMA_KEY, schemas))
+            .unwrap();
+        (store, ledger)
+    }
+
+    /// Applies `envelope`, expecting `n` to be refused for breaking its
+    /// schema, and yields how.
+    fn violation(store: &mut MemStorage, ledger: &mut Ledger, envelope: &Envelope) -> String {
+        let before = ledger.head();
+        match ledger.apply(store, envelope) {
+            Err(ApplyError::SchemaViolation { key: k, violation }) if k == key("n") => {
+                assert_eq!(ledger.head(), before, "a refused envelope moves nothing");
+                violation.to_string()
+            }
+            other => panic!("expected a schema violation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_schema_refuses_a_whole_value_that_breaks_it() {
+        let (mut store, mut ledger) = schema_ledger();
+        let envelope = set(ledger.head(), "n", "flat");
+        assert_eq!(
+            violation(&mut store, &mut ledger, &envelope),
+            "expected map, found string"
+        );
+    }
+
+    #[test]
+    fn a_schema_admits_writes_that_keep_to_it() {
+        let (mut store, mut ledger) = schema_ledger();
+        ledger
+            .apply(
+                &mut store,
+                &set_key(ledger.head(), path([sub("count")]), Some(Value::Int(9))),
+            )
+            .unwrap();
+        ledger
+            .apply(
+                &mut store,
+                &amend(ledger.head(), path([sub("list")]), append("z")),
+            )
+            .unwrap();
+        assert_eq!(at(&store, &ledger, &[sub("count")]), Some(Value::Int(9)));
+    }
+
+    #[test]
+    fn a_schema_judges_a_nested_set() {
+        let (mut store, mut ledger) = schema_ledger();
+        let envelope = set_key(
+            ledger.head(),
+            path([sub("a"), sub("b")]),
+            Some(Value::Int(1)),
+        );
+        assert_eq!(
+            violation(&mut store, &mut ledger, &envelope),
+            "expected string, found int at a.b"
+        );
+    }
+
+    #[test]
+    fn a_schema_refuses_clearing_a_required_field() {
+        let (mut store, mut ledger) = schema_ledger();
+        let envelope = set_key(ledger.head(), path([sub("count")]), None);
+        assert_eq!(
+            violation(&mut store, &mut ledger, &envelope),
+            "required field `count` is missing"
+        );
+    }
+
+    #[test]
+    fn a_schema_judges_what_an_amend_leaves() {
+        let (mut store, mut ledger) = schema_ledger();
+
+        let envelope = amend(ledger.head(), path([sub("count")]), inc(6));
+        assert_eq!(
+            violation(&mut store, &mut ledger, &envelope),
+            "11 is out of range, must be at most 10 at count"
+        );
+
+        ledger
+            .apply(
+                &mut store,
+                &amend(ledger.head(), path([sub("list")]), append("z")),
+            )
+            .unwrap();
+        let envelope = amend(ledger.head(), path([sub("list")]), append("one too many"));
+        assert_eq!(
+            violation(&mut store, &mut ledger, &envelope),
+            "length 4 is out of range, must be at most 3 at list"
+        );
+    }
+
+    #[test]
+    fn a_schema_is_refused_when_its_namespace_already_breaks_it() {
+        let (mut store, mut ledger) = nested_ledger();
+        let schemas = map([("n", map([("type", "int".into())]))]);
+        let envelope = set_value(ledger.head(), SCHEMA_KEY, schemas);
+        assert_eq!(
+            violation(&mut store, &mut ledger, &envelope),
+            "expected int, found map"
+        );
+    }
+
+    /// A nested write into the schema set tightens a schema just as a
+    /// whole one does, so it is held to the same check.
+    #[test]
+    fn a_nested_schema_write_is_judged_against_its_namespace() {
+        let (mut store, mut ledger) = schema_ledger();
+        let max = path([sub("n"), sub("fields"), sub("count"), sub("max")]);
+        let tighten = |prev, max: &SubkeyPath, to| {
+            Envelope::new(Msg::SetNamespaceKey(SetNamespaceKey {
+                prev,
+                key: key(SCHEMA_KEY),
+                path: max.clone(),
+                value: Some(Value::Int(to)),
+            }))
+        };
+
+        let envelope = tighten(ledger.head(), &max, 4);
+        assert_eq!(
+            violation(&mut store, &mut ledger, &envelope),
+            "5 is out of range, must be at most 4 at count"
+        );
+        ledger
+            .apply(&mut store, &tighten(ledger.head(), &max, 5))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_malformed_schema_is_refused() {
+        let (mut store, mut ledger) = nested_ledger();
+        let schemas = map([("n", map([("type", "float".into())]))]);
+        assert!(matches!(
+            ledger.apply(&mut store, &set_value(ledger.head(), SCHEMA_KEY, schemas)),
+            Err(ApplyError::InvalidValue {
+                key: k,
+                reason: ValueError::Schema(SchemaSetError::Invalid { namespace, .. }),
+            }) if k == key(SCHEMA_KEY) && namespace == "n"
+        ));
+
+        // A nested write cannot leave one behind either.
+        let (mut store, mut ledger) = schema_ledger();
+        let envelope = Envelope::new(Msg::SetNamespaceKey(SetNamespaceKey {
+            prev: ledger.head(),
+            key: key(SCHEMA_KEY),
+            path: path([sub("n"), sub("pattern")]),
+            value: Some(Value::String(".*".into())),
+        }));
+        assert!(matches!(
+            ledger.apply(&mut store, &envelope),
+            Err(ApplyError::InvalidValue {
+                reason: ValueError::Schema(_),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_reserved_namespace_cannot_be_given_a_schema() {
+        let (mut store, mut ledger) = setup(&init());
+        let schemas = map([(CLUSTER_NODES_KEY, map([("type", "any".into())]))]);
+        assert!(matches!(
+            ledger.apply(&mut store, &set_value(ledger.head(), SCHEMA_KEY, schemas)),
+            Err(ApplyError::InvalidValue {
+                reason: ValueError::Schema(SchemaSetError::Reserved(_)),
+                ..
+            })
+        ));
+    }
+
+    /// Absent satisfies any schema: the namespace can go, and what comes
+    /// back under its name is held to the schema that waited for it.
+    #[test]
+    fn a_schema_outlives_its_namespace() {
+        let (mut store, mut ledger) = schema_ledger();
+        ledger
+            .apply(&mut store, &delete(ledger.head(), "n"))
+            .unwrap();
+
+        let envelope = set(ledger.head(), "n", "flat");
+        assert_eq!(
+            violation(&mut store, &mut ledger, &envelope),
+            "expected map, found string"
+        );
+        ledger
+            .apply(&mut store, &set_value(ledger.head(), "n", nested().value))
+            .unwrap();
+    }
+
+    #[test]
+    fn removing_a_schema_lifts_it() {
+        let (mut store, mut ledger) = schema_ledger();
+        ledger
+            .apply(
+                &mut store,
+                &Envelope::new(Msg::SetNamespaceKey(SetNamespaceKey {
+                    prev: ledger.head(),
+                    key: key(SCHEMA_KEY),
+                    path: path([sub("n")]),
+                    value: None,
+                })),
+            )
+            .unwrap();
+        assert_eq!(ledger.schema(&store, &key("n")).unwrap(), None);
+        ledger
+            .apply(&mut store, &set(ledger.head(), "n", "flat"))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_schema_leaves_other_namespaces_alone() {
+        let (mut store, mut ledger) = schema_ledger();
+        ledger
+            .apply(&mut store, &set(ledger.head(), "other", "anything"))
+            .unwrap();
+    }
+
+    #[test]
+    fn init_rejects_a_checkpoint_that_breaks_its_own_schema() {
+        let mut store = MemStorage::default();
+        let checkpoint = |n: Namespace| {
+            Envelope::new(Msg::Init(InitMsg {
+                state: FullCheckpoint {
+                    namespaces: [
+                        (key("n"), n),
+                        (
+                            key(SCHEMA_KEY),
+                            Namespace {
+                                value: map([("n", nested_schema())]),
+                            },
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                },
+            }))
+        };
+
+        assert!(matches!(
+            Ledger::init(&mut store, &checkpoint(ns("flat"))),
+            Err(Error::Apply(ApplyError::SchemaViolation { key: k, .. })) if k == key("n")
+        ));
+        Ledger::init(&mut store, &checkpoint(nested())).unwrap();
     }
 }

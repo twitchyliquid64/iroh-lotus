@@ -22,8 +22,13 @@ pub use change::{Change, ChangeDiffer, ChangeSet, Movement};
 mod error;
 pub use error::{ApplyError, Error, TrustedKeysError, ValueError};
 
+mod schema;
+pub use schema::{
+    Bounds, Schema, SchemaError, SchemaErrorKind, SchemaSetError, Violation, ViolationKind,
+};
+
 mod ledger;
 pub use ledger::{
     CLUSTER_NODES_KEY, ClusterNode, DEFAULT_MIN_KEEP_MINUTES, Ledger, MIN_ENVELOPE_SIGNATURES_KEY,
-    MIN_ENVELOPE_WEIGHT_KEY, MIN_KEEP_MINUTES_KEY, NODE_NAME_FIELD, TRUSTED_KEYS_KEY,
+    MIN_ENVELOPE_WEIGHT_KEY, MIN_KEEP_MINUTES_KEY, NODE_NAME_FIELD, SCHEMA_KEY, TRUSTED_KEYS_KEY,
 };
