@@ -2,14 +2,14 @@
 //! control socket, against a real daemon — alone, and with a peer it keeps
 //! a connection to over an in-memory iroh network.
 
-use std::{collections::BTreeMap, path::Path, process::Stdio, time::Duration};
+use std::{path::Path, process::Stdio, time::Duration};
 
 use iroh::{
     Endpoint, EndpointAddr, RelayMode, SecretKey, endpoint::presets,
     test_utils::test_transport::TestNetwork,
 };
 use lotusd::{Core, IfInitialized, NodeKeys, Server, ServerHandle, peer_ingress::Protocol};
-use state::CLUSTER_NODES_KEY;
+use state::{CLUSTER_NODES_KEY, NODE_NAME_FIELD};
 use tempfile::TempDir;
 use tokio::{net::UnixListener, process::Command, task::JoinHandle, time::timeout};
 use wire::{
@@ -132,17 +132,31 @@ impl Node {
 
     /// Lists `entries` as this node's `cluster-nodes`.
     async fn list(&self, entries: impl IntoIterator<Item = (KeyId, EndpointAddr)>) {
+        self.list_named(entries.into_iter().map(|(node, addr)| (node, addr, None)))
+            .await;
+    }
+
+    /// Lists `entries` as this node's `cluster-nodes`, each under the name
+    /// it is given, if any.
+    async fn list_named(
+        &self,
+        entries: impl IntoIterator<Item = (KeyId, EndpointAddr, Option<&str>)>,
+    ) {
         let prev = self.handle.head().await.unwrap();
         let value = Value::Map(
             entries
                 .into_iter()
-                .map(|(node, addr)| {
+                .map(|(node, addr, name)| {
                     (
                         node.to_hex().as_ref().to_owned(),
-                        Value::Map(BTreeMap::from_iter([(
-                            "iroh".to_owned(),
-                            Value::try_from(&addr).unwrap(),
-                        )])),
+                        Value::Map(
+                            [("iroh".to_owned(), Value::try_from(&addr).unwrap())]
+                                .into_iter()
+                                .chain(name.map(|name| {
+                                    (NODE_NAME_FIELD.to_owned(), Value::String(name.to_owned()))
+                                }))
+                                .collect(),
+                        ),
                     )
                 })
                 .collect(),
@@ -278,6 +292,35 @@ async fn status_shows_each_side_of_a_kept_connection() {
 
     assert!(b_text.contains("inbound    1 connection\n"), "got {b_text}");
     assert!(b_text.contains("peers      0 kept\n"), "got {b_text}");
+}
+
+/// A name the cluster's listing gives a node is shown beside it — this
+/// node's own, and each peer's.
+#[tokio::test]
+async fn status_shows_the_names_the_cluster_gives_its_nodes() {
+    let (a, b) = pair().await;
+    let peer = KeyId::from_bytes([1; 32]);
+    a.list_named([
+        (a.id, EndpointAddr::new(a.endpoint().id()), Some("alpha")),
+        (peer, EndpointAddr::new(b.endpoint().id()), Some("bravo")),
+    ])
+    .await;
+
+    let text = output(&a.dir, &["status"]).await;
+    assert!(text.contains("\nname       alpha\n"), "got {text}");
+    assert!(
+        text.contains(&format!(
+            "           bravo  {}  {}  ",
+            peer.to_hex().as_ref(),
+            b.endpoint().id().to_z32(),
+        )),
+        "got {text}"
+    );
+
+    let json = output(&a.dir, &["--format", "json", "status"]).await;
+    let json: serde_json::Value = serde_json::from_str(&json).expect("one JSON document");
+    assert_eq!(json["name"], "alpha");
+    assert_eq!(json["peers"][0]["name"], "bravo");
 }
 
 #[tokio::test]

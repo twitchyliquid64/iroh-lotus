@@ -81,6 +81,7 @@ enum ServerMsg {
     ),
     PeerConnections(Responder<usize, ()>),
     PeerAddresses(Responder<BTreeMap<KeyId, EndpointAddr>, ChainError>),
+    NodeNames(Responder<BTreeMap<KeyId, String>, ChainError>),
     Peers(Responder<Vec<PeerStatus>, ()>),
     Identity(Responder<Identity, ()>),
     Read(rpc::Read, Responder<rpc::ValueAt, ChainError>),
@@ -422,6 +423,7 @@ impl Server {
             ServerMsg::WatchOrphaned(digest, r) => r.respond(core.watch_orphaned(digest)),
             ServerMsg::PeerConnections(r) => r.handle(peers.connections()).await,
             ServerMsg::PeerAddresses(r) => r.respond(core.peer_addresses()),
+            ServerMsg::NodeNames(r) => r.respond(core.node_names()),
             ServerMsg::Peers(r) => r.handle(peers.statuses()).await,
             ServerMsg::Identity(r) => r.respond(Ok(Identity {
                 node: core.key_id(),
@@ -783,10 +785,17 @@ impl Rpc {
         let peers = self.0.peers().await.map_err(|()| gone())?;
         let inbound = self.0.peer_connections().await.map_err(|()| gone())?;
         let published = self.0.published().await.map_err(|()| gone())?;
+        // Names are a nicety: an unreadable listing is reported, not fatal
+        // to the rest of the status.
+        let mut names = self.0.node_names().await.unwrap_or_else(|error| {
+            tracing::warn!(%error, "reading node names for status");
+            BTreeMap::new()
+        });
 
         Ok(rpc::NodeStatus {
             version: VERSION.to_owned(),
             node: identity.node,
+            name: names.remove(&identity.node),
             endpoint: identity.endpoint.map(|addr| rpc::EndpointInfo {
                 id: addr.id.to_z32(),
                 addrs: addr.addrs.iter().map(ToString::to_string).collect(),
@@ -801,6 +810,7 @@ impl Rpc {
                 .into_iter()
                 .map(|peer| rpc::PeerInfo {
                     node: peer.node,
+                    name: names.remove(&peer.node),
                     endpoint: peer.addr.id.to_z32(),
                     state: match peer.state {
                         PeerState::Dialing { attempt } => {
@@ -1091,6 +1101,13 @@ impl ServerHandle {
     pub async fn peer_addresses(&self) -> Result<BTreeMap<KeyId, EndpointAddr>, RequestError> {
         let (send, recv) = Responder::channel();
         let _ = self.0.send(ServerMsg::PeerAddresses(send)).await;
+        Self::answer(recv.await)
+    }
+
+    /// What the cluster calls each node it lists a name for.
+    pub async fn node_names(&self) -> Result<BTreeMap<KeyId, String>, RequestError> {
+        let (send, recv) = Responder::channel();
+        let _ = self.0.send(ServerMsg::NodeNames(send)).await;
         Self::answer(recv.await)
     }
 

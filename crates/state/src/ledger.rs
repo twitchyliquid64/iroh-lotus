@@ -61,8 +61,26 @@ pub const MIN_ENVELOPE_SIGNATURES_KEY: &str = "_lotus_min_envelope_signatures";
 /// the same on every node and can never go stale.
 pub const TRUSTED_KEYS_KEY: &str = "_lotus_trusted_keys";
 
-/// The reserved namespace describing nodes known to the cluster.
+/// The reserved namespace describing nodes known to the cluster: a
+/// [`Value::Map`] from a node's key id, in hex, to a map holding at least
+/// its iroh address under `iroh`. Writes are validated.
 pub const CLUSTER_NODES_KEY: &str = "_lotus_nodes";
+
+/// The field of a node's [`CLUSTER_NODES_KEY`] entry naming it for people.
+///
+/// Read leniently and never validated: anything but a non-empty string
+/// is no name. Validating it would refuse writes nodes from before the
+/// field already accept — a chain split.
+pub const NODE_NAME_FIELD: &str = "name";
+
+/// One node as the cluster lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterNode {
+    /// How to reach it.
+    pub addr: iroh::EndpointAddr,
+    /// What people call it, when its entry says.
+    pub name: Option<String>,
+}
 
 /// The ledger, as of some position in the chain.
 ///
@@ -433,14 +451,29 @@ impl Ledger {
     /// Returns how to reach each node the cluster knows of, under the
     /// reserved [`CLUSTER_NODES_KEY`] namespace. Absent, it knows of none.
     ///
-    /// A set that is present but unreadable is an error, not an empty
-    /// set. Validation refuses malformed sets at the boundary,
-    /// so this fires only on one written by something that did
-    /// not enforce those rules.
+    /// See [`cluster_nodes`](Self::cluster_nodes) for when this errors.
     pub fn peer_addresses<S: Storage>(
         &self,
         storage: &S,
     ) -> Result<BTreeMap<KeyId, iroh::EndpointAddr>, ApplyError<S::Error>> {
+        Ok(self
+            .cluster_nodes(storage)?
+            .into_iter()
+            .map(|(id, node)| (id, node.addr))
+            .collect())
+    }
+
+    /// Returns each node the cluster knows of, under the reserved
+    /// [`CLUSTER_NODES_KEY`] namespace. Absent, it knows of none.
+    ///
+    /// A set that is present but unreadable is an error, not an empty
+    /// set. Validation refuses malformed sets at the boundary,
+    /// so this fires only on one written by something that did
+    /// not enforce those rules.
+    pub fn cluster_nodes<S: Storage>(
+        &self,
+        storage: &S,
+    ) -> Result<BTreeMap<KeyId, ClusterNode>, ApplyError<S::Error>> {
         let key = NamespaceKey::try_new(CLUSTER_NODES_KEY).expect("the reserved key is static");
         self.namespace(storage, &key)
             .map_err(ApplyError::Storage)?
@@ -761,7 +794,7 @@ fn parse_trusted_keys(value: &Value) -> Result<BTreeMap<KeyId, Key>, TrustedKeys
 /// Ids are spelled the one way `KeyId::to_hex` writes them. Two spellings
 /// of one id are two entries in the ledger but one key here, and the
 /// second would silently displace the first.
-fn parse_cluster_nodes(value: &Value) -> Result<BTreeMap<KeyId, iroh::EndpointAddr>, String> {
+fn parse_cluster_nodes(value: &Value) -> Result<BTreeMap<KeyId, ClusterNode>, String> {
     let Value::Map(entries) = value else {
         return Err("not a map".to_string());
     };
@@ -779,7 +812,13 @@ fn parse_cluster_nodes(value: &Value) -> Result<BTreeMap<KeyId, iroh::EndpointAd
                 let Some(iroh) = inner.get("iroh") else {
                     return Err(format!("{id}: missing or invalid `iroh` value"));
                 };
-                iroh::EndpointAddr::try_from(iroh).map_err(|e| format!("{id}: {e}"))?
+                ClusterNode {
+                    addr: iroh::EndpointAddr::try_from(iroh).map_err(|e| format!("{id}: {e}"))?,
+                    name: match inner.get(NODE_NAME_FIELD) {
+                        Some(Value::String(name)) if !name.is_empty() => Some(name.clone()),
+                        _ => None,
+                    },
+                }
             }))
         })
         .collect()
@@ -2930,6 +2969,48 @@ mod tests {
         assert_eq!(
             ledger.peer_addresses(&store).unwrap(),
             BTreeMap::from([(node_key(0xaa), endpoint(1)), (node_key(0xbb), endpoint(2)),]),
+        );
+    }
+
+    /// A node's name is read where it is a non-empty string, and is no
+    /// name otherwise — never a refusal, so writes from before the field
+    /// existed still apply.
+    #[test]
+    fn cluster_nodes_reads_a_name_where_one_is_set() {
+        let (mut store, mut ledger) = setup(&init());
+        let entry = |seed, name: Option<Value>| {
+            Value::Map(
+                [("iroh".to_string(), iroh_addr(seed))]
+                    .into_iter()
+                    .chain(name.map(|name| (NODE_NAME_FIELD.to_string(), name)))
+                    .collect(),
+            )
+        };
+        let value = nodes([
+            (node_id(0xaa), entry(1, Some(Value::String("alice".into())))),
+            (node_id(0xbb), entry(2, None)),
+            (node_id(0xcc), entry(3, Some(Value::String(String::new())))),
+            (node_id(0xdd), entry(4, Some(Value::Int(7)))),
+        ]);
+
+        ledger
+            .apply(&mut store, &set_nodes(ledger.head(), value))
+            .unwrap();
+
+        let names: BTreeMap<_, _> = ledger
+            .cluster_nodes(&store)
+            .unwrap()
+            .into_iter()
+            .map(|(id, node)| (id, node.name))
+            .collect();
+        assert_eq!(
+            names,
+            BTreeMap::from([
+                (node_key(0xaa), Some("alice".to_string())),
+                (node_key(0xbb), None),
+                (node_key(0xcc), None),
+                (node_key(0xdd), None),
+            ]),
         );
     }
 

@@ -112,6 +112,10 @@ fn this_node(status: &NodeStatus) -> Markup {
     html! {
         h2 { "This node" }
         dl.status {
+            @if let Some(name) = &status.name {
+                dt { "name" }
+                dd { (name) }
+            }
             dt { "node id" }
             dd { (node(&status.node)) }
             @match &status.endpoint {
@@ -196,7 +200,10 @@ fn row(peer: &PeerInfo) -> Markup {
     html! {
         tr {
             td.state { (dot((&peer.state).into())) (state(&peer.state)) }
-            td.name { (node(&peer.node)) }
+            td.name {
+                @if let Some(name) = &peer.name { span.node-name { (name) } " " }
+                (node(&peer.node))
+            }
             td.endpoint { code title=(peer.endpoint) { (short) } }
         }
     }
@@ -258,6 +265,7 @@ mod tests {
             peers,
             inbound: 1,
             published,
+            name: None,
         }
     }
 
@@ -266,7 +274,38 @@ mod tests {
             node: KeyId::from_bytes([byte; 32]),
             endpoint: format!("peer{byte}xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"),
             state,
+            name: None,
         }
+    }
+
+    #[test]
+    fn names_are_shown_where_the_cluster_sets_them() {
+        let named = PeerInfo {
+            name: Some("bravo".into()),
+            ..peer(4, PeerState::Connected(Connected {}))
+        };
+        let page = pane(&NodeStatus {
+            name: Some("alpha".into()),
+            ..status(
+                true,
+                vec![named, peer(5, PeerState::Connected(Connected {}))],
+                None,
+            )
+        })
+        .into_string();
+
+        assert!(page.contains("<dt>name</dt><dd>alpha</dd>"), "{page}");
+        assert!(
+            page.contains(r#"<span class="node-name">bravo</span>"#),
+            "{page}"
+        );
+        assert_eq!(page.matches("node-name").count(), 1, "{page}");
+    }
+
+    #[test]
+    fn an_unnamed_node_shows_no_name_row() {
+        let page = pane(&status(true, vec![], None)).into_string();
+        assert!(!page.contains("<dt>name</dt>"), "{page}");
     }
 
     #[test]

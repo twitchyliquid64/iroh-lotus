@@ -447,6 +447,10 @@ pub struct NodeStatus {
     /// endpoint reports; `None` when it runs without an endpoint.
     #[cbor(key = 7)]
     pub published: Option<Published>,
+    /// What the cluster's listing of this node calls it; `None` when it
+    /// sets no name, or from a daemon too old to say.
+    #[cbor(key = 8)]
+    pub name: Option<String>,
 }
 
 /// Where the daemon's own `cluster-nodes` listing stands against the
@@ -553,6 +557,10 @@ pub struct PeerInfo {
     pub endpoint: String,
     #[cbor(key = 3)]
     pub state: PeerState,
+    /// What the cluster's listing of the peer calls it; `None` when it
+    /// sets no name, or from a daemon too old to say.
+    #[cbor(key = 4)]
+    pub name: Option<String>,
 }
 
 /// Where a peer's connection stands.

@@ -1310,6 +1310,9 @@ impl fmt::Display for StatusText<'_> {
         let status = self.0;
         writeln!(f, "version    {}", status.version)?;
         writeln!(f, "node id    {}", status.node.to_hex().as_ref())?;
+        if let Some(name) = &status.name {
+            writeln!(f, "name       {name}")?;
+        }
         match &status.endpoint {
             Some(endpoint) => {
                 writeln!(f, "endpoint   {}", endpoint.id)?;
@@ -1340,16 +1343,27 @@ impl fmt::Display for StatusText<'_> {
             plural(status.inbound as usize, "connection", "connections")
         )?;
         writeln!(f, "peers      {} kept", status.peers.len())?;
-        for peer in &status.peers {
+        // A name column only when some peer has a name, padded to the
+        // widest so the ids line up.
+        let width = status
+            .peers
+            .iter()
+            .filter_map(|peer| peer.name.as_deref())
+            .map(|name| name.chars().count())
+            .max();
+        status.peers.iter().try_for_each(|peer| {
+            write!(f, "           ")?;
+            if let Some(width) = width {
+                write!(f, "{:width$}  ", peer.name.as_deref().unwrap_or("-"))?;
+            }
             writeln!(
                 f,
-                "           {}  {}  {}",
+                "{}  {}  {}",
                 peer.node.to_hex().as_ref(),
                 peer.endpoint,
                 peer.state
-            )?;
-        }
-        Ok(())
+            )
+        })
     }
 }
 

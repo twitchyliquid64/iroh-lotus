@@ -4,13 +4,13 @@
 use std::collections::BTreeMap;
 
 use lotusd_rpc::{
-    Call, ChainRange, ChainWalk, Changed, Compact, Compacted, EndpointInfo, EnvelopeFrame,
-    EnvelopeSelector, Error, Failure, FailureKind, GetChainRange, GetEnvelopes, GetVersion,
-    Handler, InviteCode, IpFamily, Len, ListNamespaces, MAX_FRAME_LEN, MapMeta, Method,
-    NamespaceChange, NamespaceEntry, NamespaceList, NodeStatus, Queried, Query, QueryKind, Read,
-    Reorged, Request, Response, Responses, Shape, ValueAt, ValueMeta, Verification, Watch,
-    WatchEvent, WatchPath, WatchSelector, WeakDelete, WeakDeleteMatching, WeakIncrement, WeakPush,
-    WeakSet, WriteOutcome, Written, call, serve,
+    Call, ChainRange, ChainWalk, Changed, Compact, Compacted, Connected, EndpointInfo,
+    EnvelopeFrame, EnvelopeSelector, Error, Failure, FailureKind, GetChainRange, GetEnvelopes,
+    GetVersion, Handler, InviteCode, IpFamily, Len, ListNamespaces, MAX_FRAME_LEN, MapMeta, Method,
+    NamespaceChange, NamespaceEntry, NamespaceList, NodeStatus, PeerInfo, PeerState, Queried,
+    Query, QueryKind, Read, Reorged, Request, Response, Responses, Shape, ValueAt, ValueMeta,
+    Verification, Watch, WatchEvent, WatchPath, WatchSelector, WeakDelete, WeakDeleteMatching,
+    WeakIncrement, WeakPush, WeakSet, WriteOutcome, Written, call, serve,
 };
 use std::time::Duration;
 
@@ -186,6 +186,7 @@ impl Handler for Fake {
                         peers: Vec::new(),
                         inbound: 0,
                         published: None,
+                        name: None,
                     }))
                     .await
             }
@@ -971,6 +972,38 @@ fn an_endpoint_without_a_family_decodes() {
     };
     assert_eq!(
         wire::decode::<EndpointInfo>(&wire::encode(&info).unwrap()).unwrap(),
+        info
+    );
+}
+
+/// A peer as a daemon from before node names describes it decodes, with
+/// no name, and one that names the peer keeps it.
+#[test]
+fn a_peer_without_a_name_decodes() {
+    #[derive(cbor2::Cbor)]
+    struct Before {
+        #[cbor(key = 1)]
+        node: KeyId,
+        #[cbor(key = 2)]
+        endpoint: String,
+        #[cbor(key = 3)]
+        state: PeerState,
+    }
+    let before = Before {
+        node: KeyId::from_bytes([7; 32]),
+        endpoint: "abc".to_owned(),
+        state: PeerState::Connected(Connected {}),
+    };
+    let info = wire::decode::<PeerInfo>(&wire::encode(&before).unwrap()).unwrap();
+    assert_eq!(info.node, before.node);
+    assert_eq!(info.name, None);
+
+    let info = PeerInfo {
+        name: Some("bravo".to_owned()),
+        ..info
+    };
+    assert_eq!(
+        wire::decode::<PeerInfo>(&wire::encode(&info).unwrap()).unwrap(),
         info
     );
 }

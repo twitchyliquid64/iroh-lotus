@@ -576,6 +576,20 @@ impl Core {
             .map_err(ChainError::from)
     }
 
+    /// What the cluster calls each node it lists a name for, keyed by
+    /// node id. Reads the reserved `cluster-nodes` namespace at the current
+    /// head.
+    pub fn node_names(&self) -> Result<BTreeMap<KeyId, String>, ChainError> {
+        Ok(self
+            .chain
+            .ledger()
+            .cluster_nodes(&self.storage)
+            .map_err(ChainError::from)?
+            .into_iter()
+            .filter_map(|(id, node)| node.name.map(|name| (id, name)))
+            .collect())
+    }
+
     /// The envelope this node's chain is rooted at — what a joining node
     /// is handed to build on.
     pub fn root_envelope(&self) -> Result<Envelope, storage::sqlite::Error> {

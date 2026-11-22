@@ -373,6 +373,7 @@ dl.status .addr { display: block; }
 dl.status .absent { color: var(--muted); }
 
 .peers .entries .state { white-space: nowrap; }
+.peers .entries .node-name { font-weight: 600; }
 
 .dot {
   display: inline-block;
