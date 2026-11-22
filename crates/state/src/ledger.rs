@@ -15,10 +15,9 @@ use wire::{
     subkey::{Subkey, SubkeyPath},
 };
 
-use crate::{
-    ApplyError, Error, Schema, SchemaSetError, TrustedKeysError, ValueError,
-    schema::{Local, Standing, parse_set},
-};
+use schema::{Local, Standing, parse_set};
+
+use crate::{ApplyError, Error, Schema, SchemaSetError, TrustedKeysError, ValueError};
 
 /// The reserved namespace holding the minimum number of minutes every
 /// node must keep a message before it is eligible for compaction. Writes
@@ -83,7 +82,7 @@ pub const CLUSTER_NODES_KEY: &str = "_lotus_nodes";
 /// The schema in force is the one at an envelope's *parent*. An absent
 /// namespace satisfies any schema, and the reserved `_lotus_` namespaces
 /// keep their baked-in rules: an entry naming one is refused.
-pub const SCHEMA_KEY: &str = "_lotus_schema";
+pub const SCHEMA_KEY: &str = schema::SCHEMA_KEY;
 
 /// The field of a node's [`CLUSTER_NODES_KEY`] entry naming it for people.
 ///

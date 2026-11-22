@@ -20,6 +20,12 @@
 //! A string's length counts Unicode scalar values. `items` and `values`
 //! default to `any`. A `struct` is closed: a field its `fields` does not
 //! name is refused.
+//!
+//! Every type also takes `description`, a string saying what the value
+//! is for. It is carried for whoever reads the schema and judges nothing.
+//!
+//! The crate is the language alone — parsing, checking, and walking a
+//! schema — so a client can read one without the ledger that enforces it.
 
 use core::fmt;
 use std::collections::{BTreeMap, BTreeSet};
@@ -31,35 +37,62 @@ use wire::{
 
 /// The prefix of the namespaces the ledger reserves for itself. Their
 /// rules are baked in, so a schema may not name one.
-pub(crate) const RESERVED_PREFIX: &str = "_lotus_";
+pub const RESERVED_PREFIX: &str = "_lotus_";
+
+/// The reserved namespace holding the schemas other namespaces are held
+/// to: a [`Value::Map`] from a namespace's name to its [`Schema`], spelled
+/// as a value.
+pub const SCHEMA_KEY: &str = "_lotus_schema";
 
 /// What a value must look like.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Schema(Node);
+pub struct Schema {
+    kind: Kind,
+    description: Option<String>,
+}
 
+/// The type a [`Schema`] names, with that type's keywords.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Node {
+pub enum Kind {
+    /// Anything.
     Any,
+    /// A boolean.
     Bool,
+    /// A trusted key.
     Key,
+    /// A string.
     String {
+        /// How many Unicode scalar values it may hold.
         len: Bounds<u64>,
+        /// The only strings admitted, when `enum` lists them.
         allowed: Option<BTreeSet<String>>,
     },
+    /// An integer.
     Int {
+        /// The range it must lie in.
         range: Bounds<i64>,
+        /// The only integers admitted, when `enum` lists them.
         allowed: Option<BTreeSet<i64>>,
     },
+    /// An array.
     Array {
-        items: Box<Node>,
+        /// What every entry must look like.
+        items: Box<Schema>,
+        /// How many entries it may hold.
         len: Bounds<u64>,
     },
+    /// A map under free keys.
     Map {
-        values: Box<Node>,
+        /// What every entry must look like.
+        values: Box<Schema>,
+        /// How many entries it may hold.
         len: Bounds<u64>,
     },
+    /// A map under declared keys only.
     Struct {
-        fields: BTreeMap<String, Node>,
+        /// What each field must look like, by name.
+        fields: BTreeMap<String, Schema>,
+        /// The fields that must be present; each is one of `fields`.
         required: BTreeSet<String>,
     },
 }
@@ -69,6 +102,18 @@ enum Node {
 pub struct Bounds<T> {
     min: Option<T>,
     max: Option<T>,
+}
+
+impl<T: Copy> Bounds<T> {
+    /// The least admitted, when there is one.
+    pub fn min(&self) -> Option<T> {
+        self.min
+    }
+
+    /// The most admitted, when there is one.
+    pub fn max(&self) -> Option<T> {
+        self.max
+    }
 }
 
 impl<T: Ord + Copy> Bounds<T> {
@@ -89,25 +134,28 @@ impl<T: fmt::Display> fmt::Display for Bounds<T> {
 }
 
 impl Schema {
-    /// Parses a schema from the value that spells it.
-    ///
-    /// Strict: an unknown type or keyword is an error, never ignored. A
-    /// keyword one node enforced and another skipped would have them
-    /// accept different envelopes.
-    pub fn parse(value: &Value) -> Result<Self, SchemaError> {
-        Node::parse(value).map(Self)
+    /// The type the schema names, with its keywords.
+    pub fn kind(&self) -> &Kind {
+        &self.kind
     }
 
-    /// Checks `value` against the schema, reporting the first violation.
-    pub fn check(&self, value: &Value) -> Result<(), Violation> {
-        self.0.check(value)
+    /// What the schema's author says the value is for. Never judged.
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    /// The schema the value at `path` is held to; `None` where the path
+    /// leads nowhere a conforming value can have anything.
+    pub fn at(&self, path: &[Subkey]) -> Option<&Schema> {
+        path.iter()
+            .try_fold(self, |schema, segment| schema.descend(segment))
     }
 }
 
 /// What a path-local check may ask about the value a write lands on, as
 /// it stands before the write. Every answer is O(what the path addresses),
 /// never O(namespace).
-pub(crate) trait Standing {
+pub trait Standing {
     type Error;
 
     /// How many entries the array or map at `path` holds; `None` when
@@ -123,7 +171,7 @@ pub(crate) trait Standing {
 
 /// The outcome of judging a write by the path it lands on.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Local {
+pub enum Local {
     /// The verdict a check of the whole resulting value would reach.
     Judged(Result<(), Violation>),
     /// The write cannot be judged from its path: check the whole value.
@@ -165,52 +213,53 @@ impl Schema {
     /// Judges setting (`Some`) or clearing (`None`) the value at `path`.
     /// The write is pre-validated, as a
     /// [`NamespaceOp::SetAt`](storage::NamespaceOp::SetAt) is.
-    pub(crate) fn check_set<T: Standing>(
+    pub fn check_set<T: Standing>(
         &self,
         path: &SubkeyPath,
         value: Option<&Value>,
         standing: &T,
     ) -> Result<Local, T::Error> {
-        local(self.0.check_set(path.as_ref(), value, standing))
+        local(self.set_at(path.as_ref(), value, standing))
     }
 
     /// Judges amending the value at `path` — the whole value when `None`
     /// — by `op`. The write is pre-validated, as a
     /// [`NamespaceOp::AmendAt`](storage::NamespaceOp::AmendAt) is.
-    pub(crate) fn check_amend<T: Standing>(
+    pub fn check_amend<T: Standing>(
         &self,
         path: Option<&SubkeyPath>,
         op: &AmendOp,
         standing: &T,
     ) -> Result<Local, T::Error> {
         let path = path.map_or(&[][..], |path| path.as_ref());
-        local(self.0.check_amend(path, op, standing))
+        local(self.amend_at(path, op, standing))
     }
 }
 
 /// What every step below an `any` is held to.
-static ANY: Node = Node::Any;
+static ANY: Schema = Schema {
+    kind: Kind::Any,
+    description: None,
+};
 
-impl Node {
+impl Schema {
     /// The schema one step down, when the step fits this one.
-    fn descend(&self, segment: &Subkey) -> Option<&Node> {
-        match (self, segment) {
-            (Node::Any, _) => Some(&ANY),
-            (Node::Struct { fields, .. }, Subkey::Key(name)) => fields.get(name),
-            (Node::Map { values, .. }, Subkey::Key(_)) => Some(values),
-            (Node::Array { items, .. }, Subkey::Index(_)) => Some(items),
+    fn descend(&self, segment: &Subkey) -> Option<&Schema> {
+        match (&self.kind, segment) {
+            (Kind::Any, _) => Some(&ANY),
+            (Kind::Struct { fields, .. }, Subkey::Key(name)) => fields.get(name),
+            (Kind::Map { values, .. }, Subkey::Key(_)) => Some(values),
+            (Kind::Array { items, .. }, Subkey::Index(_)) => Some(items),
             _ => None,
         }
     }
 
     /// The schema `path` leads to.
-    fn locate<E>(&self, path: &[Subkey]) -> Result<&Node, Stop<E>> {
-        path.iter()
-            .try_fold(self, |node, segment| node.descend(segment))
-            .ok_or(Stop::Whole)
+    fn locate<E>(&self, path: &[Subkey]) -> Result<&Schema, Stop<E>> {
+        self.at(path).ok_or(Stop::Whole)
     }
 
-    fn check_set<T: Standing>(
+    fn set_at<T: Standing>(
         &self,
         path: &[Subkey],
         value: Option<&Value>,
@@ -226,27 +275,27 @@ impl Node {
         // The container's own faults are found at the container; the
         // value's, under the path it is written to.
         let at_container = |kind: ViolationKind| Stop::from(Violation::from(kind).within(parents));
-        let judge = |node: &Node, value: &Value| {
+        let judge = |node: &Schema, value: &Value| {
             node.check(value)
                 .map_err(|violation| Stop::from(violation.within(path)))
         };
 
-        match (self.locate(parents)?, last, value) {
-            (Node::Any, _, _) => Ok(()),
-            (Node::Struct { fields, .. }, Subkey::Key(name), Some(value)) => {
+        match (&self.locate(parents)?.kind, last, value) {
+            (Kind::Any, _, _) => Ok(()),
+            (Kind::Struct { fields, .. }, Subkey::Key(name), Some(value)) => {
                 let field = fields
                     .get(name)
                     .ok_or_else(|| at_container(ViolationKind::UnknownField(name.clone())))?;
                 judge(field, value)
             }
-            (Node::Struct { required, .. }, Subkey::Key(name), None) => {
+            (Kind::Struct { required, .. }, Subkey::Key(name), None) => {
                 if required.contains(name) {
                     return Err(at_container(ViolationKind::MissingField(name.clone())));
                 }
                 Ok(())
             }
             (
-                Node::Map {
+                Kind::Map {
                     values,
                     len: bounds,
                 },
@@ -261,9 +310,9 @@ impl Node {
                 }
                 judge(values, value)
             }
-            (Node::Array { items, .. }, Subkey::Index(_), Some(value)) => judge(items, value),
-            (Node::Map { len: bounds, .. }, Subkey::Key(_), None)
-            | (Node::Array { len: bounds, .. }, Subkey::Index(_), None) => {
+            (Kind::Array { items, .. }, Subkey::Index(_), Some(value)) => judge(items, value),
+            (Kind::Map { len: bounds, .. }, Subkey::Key(_), None)
+            | (Kind::Array { len: bounds, .. }, Subkey::Index(_), None) => {
                 if bounds.min.is_some_and(|min| min > 0) {
                     let shrunk = len()?.checked_sub(1).ok_or(Stop::Whole)?;
                     check_len(bounds, shrunk).map_err(|v| v.within(parents))?;
@@ -274,7 +323,7 @@ impl Node {
         }
     }
 
-    fn check_amend<T: Standing>(
+    fn amend_at<T: Standing>(
         &self,
         path: &[Subkey],
         op: &AmendOp,
@@ -286,11 +335,11 @@ impl Node {
                     // Nothing there: the append creates a one-entry array
                     // as a fresh key, which is a set by another name.
                     let created = Value::Array(vec![entry.clone()]);
-                    return self.check_set(path, Some(&created), standing);
+                    return self.set_at(path, Some(&created), standing);
                 };
-                match self.locate(path)? {
-                    Node::Any => Ok(()),
-                    Node::Array { items, len: bounds } => {
+                match &self.locate(path)?.kind {
+                    Kind::Any => Ok(()),
+                    Kind::Array { items, len: bounds } => {
                         let grown = len.checked_add(1).ok_or(Stop::Whole)?;
                         check_len(bounds, grown).map_err(|v| v.within(path))?;
                         let index = u32::try_from(len).map_err(|_| Stop::Whole)?;
@@ -301,28 +350,29 @@ impl Node {
                     _ => Err(Stop::Whole),
                 }
             }
-            AmendOp::IncrementDecrement(increment) => match self.locate(path)? {
-                Node::Any => Ok(()),
-                node => {
-                    let Some(Value::Int(n)) = standing.value(path).map_err(Stop::Standing)? else {
-                        return Err(Stop::Whole);
-                    };
-                    let sum = increment.apply(n).ok_or(Stop::Whole)?;
-                    node.check(&Value::Int(sum))
-                        .map_err(|violation| Stop::from(violation.within(path)))
+            AmendOp::IncrementDecrement(increment) => {
+                let node = self.locate(path)?;
+                if node.kind == Kind::Any {
+                    return Ok(());
                 }
-            },
+                let Some(Value::Int(n)) = standing.value(path).map_err(Stop::Standing)? else {
+                    return Err(Stop::Whole);
+                };
+                let sum = increment.apply(n).ok_or(Stop::Whole)?;
+                node.check(&Value::Int(sum))
+                    .map_err(|violation| Stop::from(violation.within(path)))
+            }
             AmendOp::DeleteMatching(_) => {
                 let node = self.locate(path)?;
                 // Removing entries can only break a floor: a minimum
                 // length, or a struct's required fields. Without one
                 // there is nothing to read.
-                let has_floor = match node {
-                    Node::Any => false,
-                    Node::Array { len, .. } | Node::Map { len, .. } => {
+                let has_floor = match &node.kind {
+                    Kind::Any => false,
+                    Kind::Array { len, .. } | Kind::Map { len, .. } => {
                         len.min.is_some_and(|min| min > 0)
                     }
-                    Node::Struct { required, .. } => !required.is_empty(),
+                    Kind::Struct { required, .. } => !required.is_empty(),
                     _ => return Err(Stop::Whole),
                 };
                 if !has_floor {
@@ -344,8 +394,16 @@ impl Node {
 
 type Keywords = BTreeMap<String, Value>;
 
-impl Node {
-    fn parse(value: &Value) -> Result<Self, SchemaError> {
+/// The keywords every type takes.
+const COMMON: [&str; 2] = ["type", "description"];
+
+impl Schema {
+    /// Parses a schema from the value that spells it.
+    ///
+    /// Strict: an unknown type or keyword is an error, never ignored. A
+    /// keyword one node enforced and another skipped would have them
+    /// accept different envelopes.
+    pub fn parse(value: &Value) -> Result<Self, SchemaError> {
         let Value::Map(keywords) = value else {
             return Err(SchemaErrorKind::NotAMap.into());
         };
@@ -354,10 +412,17 @@ impl Node {
             Some(_) => return Err(SchemaErrorKind::BadKeyword("type").into()),
             None => return Err(SchemaErrorKind::MissingKeyword("type").into()),
         };
+        let description = match keywords.get("description") {
+            None => None,
+            Some(Value::String(text)) => Some(text.clone()),
+            Some(_) => return Err(SchemaErrorKind::BadKeyword("description").into()),
+        };
         let only = |allowed: &[&str]| {
             keywords
                 .keys()
-                .find(|keyword| *keyword != "type" && !allowed.contains(&keyword.as_str()))
+                .find(|keyword| {
+                    !COMMON.contains(&keyword.as_str()) && !allowed.contains(&keyword.as_str())
+                })
                 .map_or(Ok(()), |keyword| {
                     Err(SchemaError::from(SchemaErrorKind::UnknownKeyword(
                         keyword.clone(),
@@ -365,13 +430,13 @@ impl Node {
                 })
         };
 
-        match kind {
-            "any" => only(&[]).map(|()| Node::Any),
-            "bool" => only(&[]).map(|()| Node::Bool),
-            "key" => only(&[]).map(|()| Node::Key),
+        let kind = match kind {
+            "any" => only(&[]).map(|()| Kind::Any),
+            "bool" => only(&[]).map(|()| Kind::Bool),
+            "key" => only(&[]).map(|()| Kind::Key),
             "string" => {
                 only(&["min_len", "max_len", "enum"])?;
-                Ok(Node::String {
+                Ok(Kind::String {
                     len: len_bounds(keywords)?,
                     allowed: allowed(keywords, |entry| match entry {
                         Value::String(s) => Some(s.clone()),
@@ -381,7 +446,7 @@ impl Node {
             }
             "int" => {
                 only(&["min", "max", "enum"])?;
-                Ok(Node::Int {
+                Ok(Kind::Int {
                     range: bounds(int(keywords, "min")?, int(keywords, "max")?)?,
                     allowed: allowed(keywords, |entry| match entry {
                         Value::Int(n) => Some(*n),
@@ -391,14 +456,14 @@ impl Node {
             }
             "array" => {
                 only(&["items", "min_len", "max_len"])?;
-                Ok(Node::Array {
+                Ok(Kind::Array {
                     items: Box::new(nested(keywords, "items")?),
                     len: len_bounds(keywords)?,
                 })
             }
             "map" => {
                 only(&["values", "min_len", "max_len"])?;
-                Ok(Node::Map {
+                Ok(Kind::Map {
                     values: Box::new(nested(keywords, "values")?),
                     len: len_bounds(keywords)?,
                 })
@@ -409,7 +474,7 @@ impl Node {
                     Some(Value::Map(fields)) => fields
                         .iter()
                         .map(|(name, schema)| {
-                            Node::parse(schema)
+                            Schema::parse(schema)
                                 .map(|node| (name.clone(), node))
                                 .map_err(|err| err.under(name).under("fields"))
                         })
@@ -431,29 +496,31 @@ impl Node {
                         .collect::<Result<_, SchemaError>>()?,
                     Some(_) => return Err(SchemaErrorKind::BadKeyword("required").into()),
                 };
-                Ok(Node::Struct { fields, required })
+                Ok(Kind::Struct { fields, required })
             }
             other => Err(SchemaErrorKind::UnknownType(other.to_string()).into()),
-        }
+        }?;
+        Ok(Schema { kind, description })
     }
 
-    fn check(&self, value: &Value) -> Result<(), Violation> {
+    /// Checks `value` against the schema, reporting the first violation.
+    pub fn check(&self, value: &Value) -> Result<(), Violation> {
         let wrong = |expected| {
             Err(Violation::from(ViolationKind::WrongType {
                 expected,
                 found: type_name(value),
             }))
         };
-        match (self, value) {
-            (Node::Any, _) | (Node::Bool, Value::Bool(_)) | (Node::Key, Value::Key(_)) => Ok(()),
-            (Node::String { len, allowed }, Value::String(s)) => {
+        match (&self.kind, value) {
+            (Kind::Any, _) | (Kind::Bool, Value::Bool(_)) | (Kind::Key, Value::Key(_)) => Ok(()),
+            (Kind::String { len, allowed }, Value::String(s)) => {
                 // Scalar values, not bytes or graphemes: the one count
                 // that needs no Unicode tables, so it cannot move under
                 // a dependency bump.
                 check_len(len, len_of(s.chars().count()))?;
                 check_allowed(allowed, s)
             }
-            (Node::Int { range, allowed }, Value::Int(n)) => {
+            (Kind::Int { range, allowed }, Value::Int(n)) => {
                 if !range.contains(*n) {
                     return Err(ViolationKind::OutOfRange {
                         value: *n,
@@ -463,7 +530,7 @@ impl Node {
                 }
                 check_allowed(allowed, n)
             }
-            (Node::Array { items, len }, Value::Array(entries)) => {
+            (Kind::Array { items, len }, Value::Array(entries)) => {
                 check_len(len, len_of(entries.len()))?;
                 entries.iter().zip(0u32..).try_for_each(|(entry, index)| {
                     items
@@ -471,7 +538,7 @@ impl Node {
                         .map_err(|violation| violation.under(Subkey::Index(index)))
                 })
             }
-            (Node::Map { values, len }, Value::Map(entries)) => {
+            (Kind::Map { values, len }, Value::Map(entries)) => {
                 check_len(len, len_of(entries.len()))?;
                 entries.iter().try_for_each(|(key, entry)| {
                     values
@@ -479,7 +546,7 @@ impl Node {
                         .map_err(|violation| violation.under(Subkey::Key(key.clone())))
                 })
             }
-            (Node::Struct { fields, required }, Value::Map(entries)) => {
+            (Kind::Struct { fields, required }, Value::Map(entries)) => {
                 if let Some(missing) = required.iter().find(|name| !entries.contains_key(*name)) {
                     return Err(ViolationKind::MissingField(missing.clone()).into());
                 }
@@ -491,12 +558,12 @@ impl Node {
                         .map_err(|violation| violation.under(Subkey::Key(name.clone())))
                 })
             }
-            (Node::Bool, _) => wrong("bool"),
-            (Node::Key, _) => wrong("key"),
-            (Node::String { .. }, _) => wrong("string"),
-            (Node::Int { .. }, _) => wrong("int"),
-            (Node::Array { .. }, _) => wrong("array"),
-            (Node::Map { .. } | Node::Struct { .. }, _) => wrong("map"),
+            (Kind::Bool, _) => wrong("bool"),
+            (Kind::Key, _) => wrong("key"),
+            (Kind::String { .. }, _) => wrong("string"),
+            (Kind::Int { .. }, _) => wrong("int"),
+            (Kind::Array { .. }, _) => wrong("array"),
+            (Kind::Map { .. } | Kind::Struct { .. }, _) => wrong("map"),
         }
     }
 }
@@ -578,15 +645,15 @@ fn allowed<T: Ord>(
     }
 }
 
-fn nested(keywords: &Keywords, name: &'static str) -> Result<Node, SchemaError> {
-    keywords.get(name).map_or(Ok(Node::Any), |schema| {
-        Node::parse(schema).map_err(|err| err.under(name))
+fn nested(keywords: &Keywords, name: &'static str) -> Result<Schema, SchemaError> {
+    keywords.get(name).map_or(Ok(ANY.clone()), |schema| {
+        Schema::parse(schema).map_err(|err| err.under(name))
     })
 }
 
 /// Parses the value of the schema namespace: a map from the name of a
 /// namespace to the schema its value must satisfy.
-pub(crate) fn parse_set(value: &Value) -> Result<BTreeMap<NamespaceKey, Schema>, SchemaSetError> {
+pub fn parse_set(value: &Value) -> Result<BTreeMap<NamespaceKey, Schema>, SchemaSetError> {
     let Value::Map(entries) = value else {
         return Err(SchemaSetError::NotAMap);
     };
@@ -1189,6 +1256,60 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn every_type_takes_a_description_that_judges_nothing() {
+        for (kind, value) in one_of_each() {
+            let plain = schema([("type", kind.into())]);
+            let described = schema([("type", kind.into()), ("description", "what for".into())]);
+            assert_eq!(plain.description(), None, "{kind}");
+            assert_eq!(described.description(), Some("what for"), "{kind}");
+            assert_eq!(described.check(&value), plain.check(&value), "{kind}");
+        }
+        let nested = schema([
+            ("type", "struct".into()),
+            (
+                "fields",
+                map([(
+                    "port",
+                    map([
+                        ("type", "int".into()),
+                        ("description", "listens here".into()),
+                    ]),
+                )]),
+            ),
+        ]);
+        let port = nested.at(&[Subkey::Key("port".into())]).unwrap();
+        assert_eq!(port.description(), Some("listens here"));
+    }
+
+    #[test]
+    fn a_description_must_be_a_string() {
+        assert_eq!(
+            kind_of_error([("type", "int".into()), ("description", 1.into())]),
+            SchemaErrorKind::BadKeyword("description")
+        );
+    }
+
+    #[test]
+    fn a_schema_is_walked_by_the_path_of_the_value_it_judges() {
+        let schema = servers();
+        let at = |path: &str| schema.at(path.parse::<SubkeyPath>().unwrap().as_ref());
+        assert!(matches!(
+            at("servers").map(Schema::kind),
+            Some(Kind::Array { .. })
+        ));
+        assert!(matches!(
+            at("servers[3].port").map(Schema::kind),
+            Some(Kind::Int { .. })
+        ));
+        // A closed struct has nothing under a name it does not declare,
+        // and a leaf has nothing under it at all.
+        assert_eq!(at("servers[0].colour"), None);
+        assert_eq!(at("servers.host"), None);
+        assert_eq!(at("servers[0].host.deeper"), None);
+        assert_eq!(schema.at(&[]), Some(&schema));
     }
 
     #[test]
@@ -2304,51 +2425,51 @@ mod tests {
 
     /// A random value built to fit `node` — though an enum at odds with
     /// its bounds can still leave it short, which the caller checks.
-    fn random_fit(rng: &mut Rng, node: &Node) -> Value {
+    fn random_fit(rng: &mut Rng, node: &Schema) -> Value {
         let count = |rng: &mut Rng, len: &Bounds<u64>| {
             let min = i64::try_from(len.min.unwrap_or(0)).unwrap();
             let max = len.max.map_or(min + 2, |max| i64::try_from(max).unwrap());
             usize::try_from(rng.between(min, max.max(min))).unwrap()
         };
-        match node {
-            Node::Any => random_value(rng, 2),
-            Node::Bool => rng.chance(50).into(),
-            Node::Key => a_key(),
-            Node::String {
+        match &node.kind {
+            Kind::Any => random_value(rng, 2),
+            Kind::Bool => rng.chance(50).into(),
+            Kind::Key => a_key(),
+            Kind::String {
                 allowed: Some(allowed),
                 ..
             } => rng
                 .pick(&allowed.iter().cloned().collect::<Vec<_>>())
                 .into(),
-            Node::String { len, allowed: None } => "xyz"
+            Kind::String { len, allowed: None } => "xyz"
                 .chars()
                 .cycle()
                 .skip(rng.below(3))
                 .take(count(rng, len))
                 .collect::<String>()
                 .into(),
-            Node::Int {
+            Kind::Int {
                 allowed: Some(allowed),
                 ..
             } => rng
                 .pick(&allowed.iter().copied().collect::<Vec<_>>())
                 .into(),
-            Node::Int {
+            Kind::Int {
                 range,
                 allowed: None,
             } => {
                 let lo = range.min.unwrap_or_else(|| range.max.unwrap_or(0) - 3);
                 rng.between(lo, range.max.unwrap_or(lo + 3)).into()
             }
-            Node::Array { items, len } => (0..count(rng, len))
+            Kind::Array { items, len } => (0..count(rng, len))
                 .map(|_| random_fit(rng, items))
                 .collect(),
-            Node::Map { values, len } => Value::Map(
+            Kind::Map { values, len } => Value::Map(
                 (0..count(rng, len))
                     .map(|i| (format!("k{i}"), random_fit(rng, values)))
                     .collect(),
             ),
-            Node::Struct { fields, required } => Value::Map(
+            Kind::Struct { fields, required } => Value::Map(
                 fields
                     .iter()
                     .filter(|(name, _)| required.contains(*name) || rng.chance(60))
@@ -2393,7 +2514,7 @@ mod tests {
         let path = |segments: Vec<Subkey>| SubkeyPath::try_new(segments).ok();
         // What to write at a path: something that fits the schema there,
         // or something that most likely does not.
-        let candidate = |rng: &mut Rng, at: &[Subkey]| match schema.0.locate::<Infallible>(at) {
+        let candidate = |rng: &mut Rng, at: &[Subkey]| match schema.locate::<Infallible>(at) {
             Ok(node) if rng.chance(60) => random_fit(rng, node),
             _ => random_value(rng, 2),
         };
@@ -2475,7 +2596,7 @@ mod tests {
         for _ in 0..4000 {
             let schema = Schema::parse(&random_schema(&mut rng, 3))
                 .expect("the generator spells only valid schemas");
-            let standing = random_fit(&mut rng, &schema.0);
+            let standing = random_fit(&mut rng, &schema);
             if schema.check(&standing).is_err() {
                 continue;
             }

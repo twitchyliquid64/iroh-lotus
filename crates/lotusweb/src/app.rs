@@ -16,14 +16,20 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use lotus_sdk::{Client, GetEnvelopes, NamespaceKey, Subkey, Value, Written};
+use lotus_sdk::{
+    Client, GetEnvelopes, NamespaceKey, Schema, Subkey, SubkeyPath, Value, Written,
+    schema::{RESERVED_PREFIX, SCHEMA_KEY},
+};
 use serde::Deserialize;
 
 use crate::{
     Error, Location,
     chain::{self, Walk},
+    form::{self, Fields},
     frame::Frame,
-    json, password, peers,
+    json,
+    known::{self, Known},
+    password, peers,
     view::{self, Active, Page, Sidebar},
 };
 
@@ -65,19 +71,6 @@ pub fn router(client: Client) -> Router {
 
 fn asset(content_type: &'static str, body: &'static str) -> impl IntoResponse {
     ([(header::CONTENT_TYPE, content_type)], body)
-}
-
-/// What the editor forms submit.
-#[derive(Debug, Deserialize)]
-struct ValueForm {
-    value: String,
-}
-
-/// What the add-entry form submits: a key for a map, none for an array.
-#[derive(Debug, Deserialize)]
-struct EntryForm {
-    key: Option<String>,
-    value: String,
 }
 
 /// What the amend forms submit: how much to add to an integer, negative
@@ -144,10 +137,10 @@ async fn replace(
     State(app): State<App>,
     frame: Frame,
     location: Location,
-    Form(form): Form<ValueForm>,
+    Form(fields): Form<Fields>,
 ) -> Response {
     let written = async {
-        let value = parse(&form.value)?;
+        let value = app.submitted(&fields, &location, Target::Itself).await?;
         app.client
             .set(location.key().clone(), location.path().cloned(), value)
             .await
@@ -172,13 +165,13 @@ async fn insert(
     State(app): State<App>,
     frame: Frame,
     location: Location,
-    Form(form): Form<EntryForm>,
+    Form(fields): Form<Fields>,
 ) -> Response {
     let written = async {
-        let value = parse(&form.value)?;
-        match form.key {
+        let value = app.submitted(&fields, &location, Target::Entry).await?;
+        match fields.get(form::KEY) {
             Some(key) => {
-                let child = location.child(Subkey::Key(key));
+                let child = location.child(Subkey::Key(key.to_string()));
                 let written = app
                     .client
                     .set(child.key().clone(), child.path().cloned(), value)
@@ -273,7 +266,71 @@ fn pushed(mut response: Response, url: &str) -> Response {
     response
 }
 
+/// What a form at a location writes.
+#[derive(Debug, Clone, Copy)]
+enum Target {
+    /// The value there.
+    Itself,
+    /// A new entry of the container there.
+    Entry,
+}
+
 impl App {
+    /// The schema the ledger holds `key`'s value to, if any. One this
+    /// build cannot read is as good as none: the pages fall back to JSON,
+    /// and the ledger still judges every write.
+    async fn schema(&self, key: &NamespaceKey) -> Option<Schema> {
+        if key.as_ref().starts_with(RESERVED_PREFIX) {
+            return None;
+        }
+        let schemas = NamespaceKey::try_new(SCHEMA_KEY).expect("the schema namespace is named");
+        let entry = SubkeyPath::try_new(vec![Subkey::Key(key.to_string())])
+            .expect("built from one segment");
+        let read = self.client.read(schemas, Some(entry)).await;
+        match read {
+            Ok(at) => at.value.and_then(|value| {
+                Schema::parse(&value)
+                    .inspect_err(
+                        |error| tracing::warn!(namespace = %key, %error, "reading the schema"),
+                    )
+                    .ok()
+            }),
+            Err(error) => {
+                let error = Error::from(error);
+                tracing::warn!(namespace = %key, error = %error.describe(), "reading the schema");
+                None
+            }
+        }
+    }
+
+    /// The value a form at `location` submitted: JSON as typed, or typed
+    /// fields read by the schema the form was drawn from.
+    async fn submitted(
+        &self,
+        fields: &Fields,
+        location: &Location,
+        target: Target,
+    ) -> Result<Value, Error> {
+        if let Some(text) = fields.get(form::JSON) {
+            return parse(text);
+        }
+        let namespace = self.schema(location.key()).await;
+        let held = namespace
+            .as_ref()
+            .and_then(|namespace| namespace.at(location.segments()));
+        let schema = match target {
+            Target::Itself => held,
+            Target::Entry => held.and_then(known::entry),
+        };
+        // The form was drawn from a schema that has since gone.
+        let schema = schema.ok_or_else(|| {
+            Error::Invalid(format!(
+                "the schema no longer types what this form writes at {location}; reload the page"
+            ))
+        })?;
+        form::decode(schema, fields)
+    }
+
     /// The namespace list, as far as the daemon allows.
     async fn sidebar(&self) -> Sidebar {
         match self.client.list_namespaces().await {
@@ -369,8 +426,15 @@ impl App {
             .await
             .map_err(Error::from);
         let sidebar = self.sidebar().await;
+        let namespace = self.schema(location.key()).await;
+        let known = namespace
+            .as_ref()
+            .and_then(|namespace| Known::locate(namespace, location));
         let (status, pane) = match &read {
-            Ok(at) => (StatusCode::OK, view::value_pane(location, at, notice)),
+            Ok(at) => (
+                StatusCode::OK,
+                view::value_pane(location, at, known.as_ref(), notice),
+            ),
             Err(error) => {
                 tracing::warn!(%location, error = %error.describe(), "reading");
                 let status = error.status();

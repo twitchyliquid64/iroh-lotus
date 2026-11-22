@@ -22,7 +22,6 @@ pub use change::{Change, ChangeDiffer, ChangeSet, Movement};
 mod error;
 pub use error::{ApplyError, Error, TrustedKeysError, ValueError};
 
-mod schema;
 pub use schema::{
     Bounds, Schema, SchemaError, SchemaErrorKind, SchemaSetError, Violation, ViolationKind,
 };

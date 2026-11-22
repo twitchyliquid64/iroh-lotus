@@ -822,3 +822,204 @@ async fn the_peers_page_shows_the_node_and_polls_for_itself() {
 fn short(digest: &lotus_sdk::EnvelopeDigest) -> String {
     digest.to_hex().as_ref().chars().take(12).collect()
 }
+
+/// Reads plain JSON as a ledger value.
+fn value(text: &str) -> Value {
+    fn from(json: serde_json::Value) -> Value {
+        match json {
+            serde_json::Value::String(text) => Value::String(text),
+            serde_json::Value::Bool(flag) => Value::Bool(flag),
+            serde_json::Value::Number(n) => Value::Int(n.as_i64().unwrap()),
+            serde_json::Value::Array(items) => items.into_iter().map(from).collect(),
+            serde_json::Value::Object(fields) => {
+                Value::Map(fields.into_iter().map(|(k, v)| (k, from(v))).collect())
+            }
+            serde_json::Value::Null => panic!("the ledger holds no null"),
+        }
+    }
+    from(serde_json::from_str(text).unwrap())
+}
+
+/// A node whose `site` namespace is held to a schema: a struct of a
+/// required map of routes, and an optional array, bool and int.
+async fn governed() -> Node {
+    let node = node().await;
+    let schema = value(
+        r#"{"site": {
+            "type": "struct",
+            "description": "One web site.",
+            "required": ["routes"],
+            "fields": {
+                "routes": {
+                    "type": "map",
+                    "description": "What serves each path prefix.",
+                    "values": {
+                        "type": "struct",
+                        "description": "One route.",
+                        "required": ["kind"],
+                        "fields": {
+                            "kind": {"type": "string", "enum": ["files", "proxy"]},
+                            "to": {"type": "string", "min_len": 1},
+                            "status": {"type": "int", "min": 0, "max": 65535}
+                        }
+                    }
+                },
+                "aliases": {"type": "array", "items": {"type": "string", "min_len": 1}},
+                "tls": {"type": "bool", "description": "Whether to serve HTTPS."},
+                "port": {"type": "int", "min": 1, "max": 65535}
+            }
+        }}"#,
+    );
+    node.client
+        .set(key("_lotus_schema"), None, schema)
+        .await
+        .unwrap();
+    node.client
+        .set(
+            key("site"),
+            None,
+            value(r#"{"routes": {"/": {"kind": "files"}}, "port": 443}"#),
+        )
+        .await
+        .unwrap();
+    node
+}
+
+#[tokio::test]
+async fn a_struct_lists_the_fields_its_schema_declares() {
+    let node = governed().await;
+
+    let (status, _, body) = send(&node, get("/ns/site")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("One web site."), "{body}");
+    // Every field has a row, set or not, saying what it is held to.
+    assert!(body.contains("int · 1 to 65535"), "{body}");
+    assert!(body.contains(r#"href="/ns/site/tls""#), "{body}");
+    assert!(body.contains("Whether to serve HTTPS."), "{body}");
+    assert!(body.contains("not set"), "{body}");
+    // A struct's keys are the schema's: there is none to add, and a
+    // required one cannot go.
+    assert!(!body.contains("Add entry"), "{body}");
+    assert!(body.contains(r#"hx-delete="/ns/site/port""#), "{body}");
+    assert!(!body.contains(r#"hx-delete="/ns/site/routes""#), "{body}");
+}
+
+#[tokio::test]
+async fn a_leaf_is_shown_and_edited_as_its_schema_types_it() {
+    let node = governed().await;
+
+    let (_, _, body) = send(&node, get("/ns/site/port")).await;
+    assert!(body.contains("int · 1 to 65535"), "{body}");
+    assert!(body.contains("optional"), "{body}");
+    assert!(
+        body.contains(
+            r#"<input type="number" name="f" step="1" value="443" min="1" max="65535" required>"#
+        ),
+        "{body}"
+    );
+    assert!(!body.contains(r#"name="value""#), "{body}");
+    // A struct's field keeps its name.
+    assert!(!body.contains("Rename key"), "{body}");
+
+    let request = htmx(form("PUT", "/ns/site/port", &[("f", "8443")]));
+    let (status, _, body) = send(&node, request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let at = node.client.read(key("site"), path("port")).await.unwrap();
+    assert_eq!(at.value, Some(Value::Int(8443)));
+
+    // What the schema refuses, the ledger says.
+    let request = htmx(form("PUT", "/ns/site/port", &[("f", "70000")]));
+    let (status, _, body) = send(&node, request).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(body.contains("out of range"), "{body}");
+}
+
+#[tokio::test]
+async fn a_map_entry_is_added_from_a_form_typed_by_the_schema() {
+    let node = governed().await;
+
+    let (_, _, body) = send(&node, get("/ns/site/routes")).await;
+    assert!(body.contains("What serves each path prefix."), "{body}");
+    assert!(body.contains("One route."), "{body}");
+    // In the page, not folded away, with an input per field.
+    assert!(body.contains(r#"<section class="add">"#), "{body}");
+    assert!(!body.contains(r#"<details class="add">"#), "{body}");
+    assert!(
+        body.contains(r#"<select name="f.kind" required>"#),
+        "{body}"
+    );
+    assert!(body.contains(r#"name="f.status""#), "{body}");
+    // The required map itself stays.
+    assert!(body.contains("cannot be deleted"), "{body}");
+
+    let request = htmx(form(
+        "POST",
+        "/ns/site/routes",
+        &[
+            ("key", "/api"),
+            ("f.kind", "proxy"),
+            ("f.to", "http://127.0.0.1:8080"),
+            ("f.status", ""),
+        ],
+    ));
+    let (status, _, body) = send(&node, request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let at = node
+        .client
+        .read(key("site"), path("routes['/api']"))
+        .await
+        .unwrap();
+    assert_eq!(
+        at.value,
+        Some(value(r#"{"kind": "proxy", "to": "http://127.0.0.1:8080"}"#))
+    );
+}
+
+#[tokio::test]
+async fn an_unset_field_is_created_and_appended_to_as_its_schema_types_it() {
+    let node = governed().await;
+
+    let (_, _, body) = send(&node, get("/ns/site/tls")).await;
+    assert!(body.contains("Nothing is held here."), "{body}");
+    assert!(body.contains(r#"<select name="f" required>"#), "{body}");
+
+    let request = htmx(form("PUT", "/ns/site/tls", &[("f", "true")]));
+    let (status, _, body) = send(&node, request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // An array of strings is typed a line each.
+    let request = htmx(form(
+        "PUT",
+        "/ns/site/aliases",
+        &[("f", "a.example\r\nb.example\r\n")],
+    ));
+    let (status, _, body) = send(&node, request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("Append item"), "{body}");
+    assert!(body.contains(r#"<section class="add">"#), "{body}");
+
+    let request = htmx(form("POST", "/ns/site/aliases", &[("f", "c.example")]));
+    let (status, _, body) = send(&node, request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let at = node.client.read(key("site"), None).await.unwrap();
+    assert_eq!(
+        at.value,
+        Some(value(
+            r#"{"routes": {"/": {"kind": "files"}}, "port": 443, "tls": true,
+                "aliases": ["a.example", "b.example", "c.example"]}"#
+        ))
+    );
+}
+
+#[tokio::test]
+async fn a_typed_form_with_no_schema_to_read_it_by_is_refused() {
+    let node = seeded().await;
+    let before = node.client.chain_range().await.unwrap().head;
+
+    let request = htmx(form("PUT", "/ns/cfg/host", &[("f", "b.example")]));
+    let (status, _, body) = send(&node, request).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(body.contains("reload the page"), "{body}");
+    assert_eq!(node.client.chain_range().await.unwrap().head, before);
+}

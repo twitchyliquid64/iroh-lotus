@@ -6,10 +6,18 @@
 //! carries the sidebar out of band, so both are always read at one head.
 
 use axum::http::StatusCode;
-use lotus_sdk::{EnvelopeDigest, NamespaceEntry, NamespaceKey, Subkey, Value, ValueAt};
+use std::collections::{BTreeMap, BTreeSet};
+
+use lotus_sdk::{
+    EnvelopeDigest, NamespaceEntry, NamespaceKey, Schema, Subkey, Value, ValueAt, schema::Kind,
+};
 use maud::{DOCTYPE, Markup, html};
 
-use crate::{Location, chain, json, peers};
+use crate::{
+    Location, chain, form, json,
+    known::{self, Known, Place},
+    peers,
+};
 
 /// Where the embedded htmx build is served.
 pub const HTMX_URL: &str = "/static/htmx.min.js";
@@ -175,7 +183,7 @@ pub fn home(notice: Option<&str>) -> Markup {
                 summary { "Create a namespace" }
                 form hx-post=(CREATE_URL) action=(CREATE_URL) method="post" {
                     label { "Name" input name="key" required; }
-                    (value_field("value", None, "{}"))
+                    (value_field(form::JSON, None, "{}"))
                     button { "Create" }
                 }
             }
@@ -202,8 +210,16 @@ fn crumbs(location: &Location) -> Markup {
     }
 }
 
-/// What `location` holds, and the forms that change it.
-pub fn value_pane(location: &Location, at: &ValueAt, notice: Option<&str>) -> Markup {
+/// What `location` holds, and the forms that change it. Where the
+/// namespace's schema speaks of the location — `known` — the page says
+/// what it says, and the forms are typed by it.
+pub fn value_pane(
+    location: &Location,
+    at: &ValueAt,
+    known: Option<&Known<'_>>,
+    notice: Option<&str>,
+) -> Markup {
+    let schema = known.map(|known| known.schema);
     html! {
         (crumbs(location))
         header.pane-head {
@@ -211,42 +227,154 @@ pub fn value_pane(location: &Location, at: &ValueAt, notice: Option<&str>) -> Ma
             @if let Some(value) = &at.value { span.badge { (kind(value)) } }
             span.head title=(at.head.to_hex().as_ref()) { "read at " code { (short(&at.head)) } }
         }
+        @if let Some(known) = known { (schema_note(known)) }
         @if let Some(notice) = notice { p.notice { (notice) } }
         @match &at.value {
-            None => (missing(location)),
-            Some(value @ Value::Map(fields)) => {
-                (entries(location, fields.iter().map(|(key, value)| (Subkey::Key(key.clone()), value))))
-                (set_password(location))
-                (add_entry(location, Some("Add entry")))
+            None => (missing(location, schema)),
+            Some(value @ Value::Map(held)) => {
+                @if let Some(Kind::Struct { fields, required }) = schema.map(Schema::kind) {
+                    // A struct's keys are the schema's: each is listed,
+                    // set or not, and there is none to add.
+                    (struct_fields(location, held, fields, required))
+                    (set_password(location))
+                } @else {
+                    (entries(location, held.iter().map(|(key, value)| (Subkey::Key(key.clone()), value))))
+                    (set_password(location))
+                    (add_entry(location, schema, Some("Add entry")))
+                }
                 (replace(location, value))
-                (rename(location))
-                (delete(location))
+                (moving(location, known))
             }
             Some(value @ Value::Array(items)) => {
                 // An index past `u32` is one no path can address, so no link.
                 (entries(location, items.iter().enumerate().filter_map(|(i, value)| {
                     u32::try_from(i).ok().map(|i| (Subkey::Index(i), value))
                 })))
-                (add_entry(location, None))
+                (add_entry(location, schema, None))
                 (replace(location, value))
-                (rename(location))
-                (delete(location))
+                (moving(location, known))
             }
             Some(value @ Value::Key(_)) => {
                 pre.value { (json::pretty(value)) }
                 p.note { "A trusted key: plain JSON cannot spell one, so it is edited with lotusctl." }
-                (rename(location))
-                (delete(location))
+                (moving(location, known))
             }
             Some(value) => {
                 form.editor hx-put=(location.url()) {
-                    (value_field("value", Some(value), ""))
+                    @match schema.filter(|schema| form::edits(schema, value)) {
+                        Some(schema) => (form::inputs(schema, Some(value))),
+                        None => (value_field(form::JSON, Some(value), "")),
+                    }
                     button { "Save" }
                 }
                 @if matches!(value, Value::Int(_)) { (increment(location)) }
-                (rename(location))
-                (delete(location))
+                (moving(location, known))
             }
+        }
+    }
+}
+
+/// What the schema says of the location: its type and restrictions, what
+/// it is for, and what each entry inside is held to.
+fn schema_note(known: &Known<'_>) -> Markup {
+    let schema = known.schema;
+    let entry = known::entry(schema).filter(|entry| !matches!(entry.kind(), Kind::Any));
+    // An `any` nobody described says nothing worth a line.
+    let silent = matches!(schema.kind(), Kind::Any) && schema.description().is_none();
+    html! {
+        @if !silent {
+            section.schema aria-label="Schema" {
+                p.schema-type {
+                    span.schema-label { "Schema" }
+                    code { (known::summary(schema)) }
+                    @match known.place {
+                        Place::Field { required: true } => span.required { "required" },
+                        Place::Field { required: false } => span.optional { "optional" },
+                        Place::Free => {},
+                    }
+                }
+                @if let Some(description) = schema.description() { p.description { (description) } }
+                @if let Some(entry) = entry {
+                    p.schema-type {
+                        span.schema-label { "Each entry" }
+                        code { (known::summary(entry)) }
+                    }
+                    @if let Some(description) = entry.description() { p.description { (description) } }
+                }
+            }
+        }
+    }
+}
+
+/// A struct's fields as its schema declares them, one row each whether
+/// or not it is set, then whatever else the map holds.
+fn struct_fields(
+    location: &Location,
+    held: &BTreeMap<String, Value>,
+    fields: &BTreeMap<String, Schema>,
+    required: &BTreeSet<String>,
+) -> Markup {
+    let undeclared = held.iter().filter(|(name, _)| !fields.contains_key(*name));
+    html! {
+        table.entries.fields {
+            thead { tr { th { "Field" } th { "Type" } th { "Value" } th {} } }
+            tbody {
+                @for (name, schema) in fields {
+                    @let child = location.child(Subkey::Key(name.clone()));
+                    @let needed = required.contains(name);
+                    tr {
+                        td.name {
+                            (link(&child, name))
+                            @if needed { span.required { "required" } }
+                            @if let Some(description) = schema.description() {
+                                p.description { (description) }
+                            }
+                        }
+                        td.kind { (known::summary(schema)) }
+                        @match held.get(name) {
+                            Some(value) => {
+                                td.preview { code { (json::preview(value, PREVIEW_WIDTH)) } }
+                                td.actions { @if !needed { (delete_row(&child)) } }
+                            }
+                            None => {
+                                td.preview { span.absent { "not set" } }
+                                td.actions {}
+                            }
+                        }
+                    }
+                }
+                @for (name, value) in undeclared {
+                    @let child = location.child(Subkey::Key(name.clone()));
+                    tr {
+                        td.name { (link(&child, name)) }
+                        td.kind { (kind(value)) }
+                        td.preview { code { (json::preview(value, PREVIEW_WIDTH)) } }
+                        td.actions { (delete_row(&child)) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The button that deletes the entry a listing's row shows.
+fn delete_row(child: &Location) -> Markup {
+    html! {
+        button.danger.small hx-delete=(child.url()) hx-confirm=(format!("Delete {child}?")) {
+            "Delete"
+        }
+    }
+}
+
+/// Renaming and deleting, as far as the schema lets the value move: a
+/// struct's field keeps its name, and a required one stays.
+fn moving(location: &Location, known: Option<&Known<'_>>) -> Markup {
+    html! {
+        @if known.is_none_or(Known::renamable) { (rename(location)) }
+        @if known.is_some_and(Known::required) {
+            p.note { "Required by the schema, so it cannot be deleted." }
+        } @else {
+            (delete(location))
         }
     }
 }
@@ -267,11 +395,7 @@ fn entries<'a>(location: &Location, entries: impl Iterator<Item = (Subkey, &'a V
                             td.name { (link(&child, &subkey.to_string())) }
                             td.kind { (kind(value)) }
                             td.preview { code { (json::preview(value, PREVIEW_WIDTH)) } }
-                            td.actions {
-                                button.danger.small hx-delete=(child.url()) hx-confirm=(format!("Delete {child}?")) {
-                                    "Delete"
-                                }
-                            }
+                            td.actions { (delete_row(&child)) }
                         }
                     }
                 }
@@ -304,20 +428,41 @@ fn value_field(name: &str, current: Option<&Value>, placeholder: &str) -> Markup
     }
 }
 
-/// Adds an entry to a map — `keyed` names the summary — or appends to an
-/// array.
-fn add_entry(location: &Location, keyed: Option<&str>) -> Markup {
-    html! {
-        details.add {
-            summary { (keyed.unwrap_or("Append item")) }
-            form hx-post=(location.url()) {
-                @if keyed.is_some() {
-                    label { "Key" input name="key" required; }
-                }
-                (value_field("value", None, "\"text\", 7, true, [ … ] or { … }"))
-                button { (keyed.map_or("Append", |_| "Add")) }
-            }
+/// Adds an entry to a map — `keyed` names the form — or appends to an
+/// array. Where `schema`, the container's, types its entries, the form is
+/// laid out in the page and typed by it; otherwise it is JSON, folded away.
+fn add_entry(location: &Location, schema: Option<&Schema>, keyed: Option<&str>) -> Markup {
+    let title = keyed.unwrap_or("Append item");
+    let key = html! {
+        @if keyed.is_some() {
+            label { "Key" input name=(form::KEY) required; }
         }
+    };
+    let button = html! { button { (keyed.map_or("Append", |_| "Add")) } };
+    match schema
+        .and_then(known::entry)
+        .filter(|entry| form::typed(entry))
+    {
+        Some(entry) => html! {
+            section.add {
+                h2 { (title) }
+                form hx-post=(location.url()) {
+                    (key)
+                    (form::inputs(entry, None))
+                    (button)
+                }
+            }
+        },
+        None => html! {
+            details.add {
+                summary { (title) }
+                form hx-post=(location.url()) {
+                    (key)
+                    (value_field(form::JSON, None, "\"text\", 7, true, [ … ] or { … }"))
+                    (button)
+                }
+            }
+        },
     }
 }
 
@@ -385,7 +530,7 @@ fn replace(location: &Location, value: &Value) -> Markup {
                 p.note { "Holds a trusted key, which plain JSON cannot spell; edit it with lotusctl." }
             } @else {
                 form hx-put=(location.url()) {
-                    (value_field("value", Some(value), ""))
+                    (value_field(form::JSON, Some(value), ""))
                     button { "Save" }
                 }
             }
@@ -408,8 +553,9 @@ fn delete(location: &Location) -> Markup {
     }
 }
 
-/// Nothing is held at `location`: say so, and offer to put something there.
-fn missing(location: &Location) -> Markup {
+/// Nothing is held at `location`: say so, and offer to put something
+/// there, typed by `schema` where it types what goes there.
+fn missing(location: &Location, schema: Option<&Schema>) -> Markup {
     html! {
         @if location.is_root() {
             p.empty { "This namespace does not exist yet." }
@@ -417,7 +563,10 @@ fn missing(location: &Location) -> Markup {
             p.empty { "Nothing is held here." }
         }
         form.editor hx-put=(location.url()) {
-            (value_field("value", None, "{}"))
+            @match schema.filter(|schema| form::typed(schema)) {
+                Some(schema) => (form::inputs(schema, None)),
+                None => (value_field(form::JSON, None, "{}")),
+            }
             button { "Create" }
         }
     }

@@ -6,6 +6,7 @@ members = [
     "crates/lotusd-rpc",
     "crates/lotusweb",
     "crates/render",
+    "crates/schema",
     "crates/state",
     "crates/storage",
     "crates/sync",
@@ -71,6 +72,7 @@ lotusd = { path = "crates/lotusd" }
 lotusd-rpc = { path = "crates/lotusd-rpc" }
 lotusweb = { path = "crates/lotusweb" }
 render = { path = "crates/render" }
+schema = { path = "crates/schema" }
 state = { path = "crates/state" }
 storage = { path = "crates/storage" }
 sync = { path = "crates/sync" }

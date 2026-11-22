@@ -270,6 +270,79 @@ button.danger {
 
 button.small { padding: .15rem .6rem; font-size: .8rem; }
 
+select {
+  padding: .45rem .6rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+}
+
+/* Schema: what a location is held to, and the forms typed by it */
+
+.schema {
+  border-left: 3px solid var(--accent-soft);
+  padding-left: .75rem;
+  margin-bottom: 1rem;
+}
+
+.schema p { margin: .2rem 0; }
+.schema-type { display: flex; align-items: baseline; gap: .5rem; flex-wrap: wrap; }
+
+.schema-label {
+  color: var(--muted);
+  font-size: .8rem;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+}
+
+.description { color: var(--muted); font-size: .9rem; margin: .2rem 0 0; white-space: pre-line; }
+.entries .name .description { font-family: var(--sans, inherit); white-space: normal; max-width: 28rem; }
+.fields .kind { white-space: normal; max-width: 20rem; }
+.fields .preview { min-width: 12rem; }
+.entries .absent { color: var(--muted); font-style: italic; }
+
+.required, .optional {
+  border-radius: 999px;
+  padding: 0 .5rem;
+  font-size: .75rem;
+  font-family: inherit;
+}
+
+.required { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.optional { color: var(--muted); border: 1px solid var(--line); }
+.entries .name .required { margin-left: .5rem; }
+
+.field-head { display: flex; align-items: baseline; gap: .5rem; flex-wrap: wrap; }
+.field-name { font-family: var(--mono); font-weight: 600; }
+.field-type { color: var(--muted); font-size: .85rem; }
+.field input[type="number"], .field select { width: 16rem; max-width: 100%; }
+
+fieldset.group {
+  display: flex;
+  flex-direction: column;
+  gap: .6rem;
+  width: 100%;
+  max-width: 40rem;
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: .6rem .75rem;
+}
+
+fieldset.group legend { display: flex; align-items: baseline; gap: .5rem; padding: 0 .25rem; }
+
+section.add { margin: 1.5rem 0; }
+
+section.add h2 {
+  font-size: .8rem;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: var(--muted);
+  margin: 0 0 .6rem;
+}
+
 details.increment input { width: 8rem; }
 details.rename input { width: 16rem; }
 details.password input { width: 16rem; }

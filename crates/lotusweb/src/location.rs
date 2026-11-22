@@ -73,7 +73,8 @@ impl Location {
         self.path.is_none()
     }
 
-    fn segments(&self) -> &[Subkey] {
+    /// The path as steps; none at a namespace's root.
+    pub fn segments(&self) -> &[Subkey] {
         self.path.as_ref().map_or(&[], |path| path.as_ref())
     }
 

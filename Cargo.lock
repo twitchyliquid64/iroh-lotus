@@ -1929,6 +1929,7 @@ dependencies = [
  "dirs",
  "lotusd",
  "lotusd-rpc",
+ "schema",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -3216,6 +3217,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "schema"
+version = "0.0.1"
+dependencies = [
+ "storage",
+ "wire",
+]
+
+[[package]]
 name = "scoped-tls"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3536,6 +3545,7 @@ version = "0.0.1"
 dependencies = [
  "ed25519-zebra",
  "iroh",
+ "schema",
  "storage",
  "wire",
 ]

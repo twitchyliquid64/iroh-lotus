@@ -76,6 +76,7 @@ pub use lotusd_rpc::{
     NamespaceList, NodeStatus, Queried, QueryKind, Shape, ValueAt, ValueMeta, WatchEvent,
     WatchSelector, WriteOutcome, Written,
 };
+pub use schema::{self, Schema};
 pub use wire;
 pub use wire::{
     Envelope, EnvelopeDigest, KeyId,

@@ -11,6 +11,12 @@
 //! password, written beside the rest of it as its argon2id hash,
 //! `auth.users.<user>.password`.
 //!
+//! Where the ledger holds a schema for the namespace, in `_lotus_schema`,
+//! the pages read by it: a location says what its schema says of it —
+//! type, restrictions, description — a struct lists the fields it
+//! declares whether or not they are set, and the forms are typed, an
+//! input per value in place of JSON. The ledger still judges every write.
+//!
 //! The pages are plain HTML over [htmx](https://htmx.org) 4: every link and
 //! form fetches the main pane alone and swaps it in, the sidebar riding
 //! along out of band so the namespace list and head never go stale. The
@@ -41,8 +47,10 @@ mod chain;
 mod error;
 pub use error::Error;
 
+mod form;
 mod frame;
 mod json;
+mod known;
 
 mod location;
 pub use location::Location;
