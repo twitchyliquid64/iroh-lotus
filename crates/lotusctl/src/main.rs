@@ -5,10 +5,10 @@ use clap_complete::Shell;
 use lotus_sdk::{
     Client,
     rpc::{
-        AnsweredOnce, ChainWalk, Compacted, EnvelopeFrame, GetEnvelopes, InviteCode, Len, MapMeta,
-        Method, NamespaceChange, NamespaceList, NodeStatus, Queried, QueryKind, Shape, ValueAt,
-        ValueMeta, WatchEvent, WatchSelector, WeakDelete, WeakDeleteMatching, WeakIncrement,
-        WeakPush, WeakSet, WriteOutcome, Written,
+        AnsweredOnce, Attempt, ChainWalk, Compacted, Connected, EnvelopeFrame, GetEnvelopes,
+        InviteCode, Len, MapMeta, Method, NamespaceChange, NamespaceList, NodeStatus, PeerInfo,
+        PeerState, Queried, QueryKind, Shape, ValueAt, ValueMeta, WatchEvent, WatchSelector,
+        WeakDelete, WeakDeleteMatching, WeakIncrement, WeakPush, WeakSet, WriteOutcome, Written,
     },
     wire::{
         EnvelopeDigest,
@@ -1343,27 +1343,57 @@ impl fmt::Display for StatusText<'_> {
             plural(status.inbound as usize, "connection", "connections")
         )?;
         writeln!(f, "peers      {} kept", status.peers.len())?;
-        // A name column only when some peer has a name, padded to the
-        // widest so the ids line up.
-        let width = status
+        status
             .peers
             .iter()
-            .filter_map(|peer| peer.name.as_deref())
-            .map(|name| name.chars().count())
-            .max();
-        status.peers.iter().try_for_each(|peer| {
-            write!(f, "           ")?;
-            if let Some(width) = width {
-                write!(f, "{:width$}  ", peer.name.as_deref().unwrap_or("-"))?;
+            .try_for_each(|peer| write!(f, "\n{}", PeerText(peer)))
+    }
+}
+
+/// One kept peer as a stanza, indented under `peers` but with its values
+/// in the same column as the node's own, so that whole ids still fit a
+/// terminal.
+struct PeerText<'a>(&'a PeerInfo);
+
+impl fmt::Display for PeerText<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let line = |f: &mut fmt::Formatter<'_>, label: &str, value: fmt::Arguments<'_>| {
+            writeln!(f, "  {label:<8} {value}")
+        };
+        let peer = self.0;
+        line(
+            f,
+            "node id",
+            format_args!("{}", peer.node.to_hex().as_ref()),
+        )?;
+        if let Some(name) = &peer.name {
+            line(f, "name", format_args!("{name}"))?;
+        }
+        line(f, "endpoint", format_args!("{}", peer.endpoint))?;
+        match &peer.state {
+            PeerState::Connected(Connected { version, route }) => {
+                line(f, "state", format_args!("connected"))?;
+                if let Some(route) = route {
+                    line(f, "route", format_args!("{route}"))?;
+                }
+                if let Some(version) = version {
+                    line(f, "version", format_args!("{version}"))?;
+                }
+                Ok(())
             }
-            writeln!(
+            PeerState::Dialing(Attempt { attempt: 0 }) => line(f, "state", format_args!("dialing")),
+            PeerState::Dialing(Attempt { attempt }) => {
+                line(f, "state", format_args!("dialing, retry {attempt}"))
+            }
+            PeerState::Backoff(Attempt { attempt }) => line(
                 f,
-                "{}  {}  {}",
-                peer.node.to_hex().as_ref(),
-                peer.endpoint,
-                peer.state
-            )
-        })
+                "state",
+                format_args!(
+                    "backing off after {attempt} failed {}",
+                    plural(*attempt as usize, "dial", "dials")
+                ),
+            ),
+        }
     }
 }
 

@@ -33,7 +33,7 @@ use crate::{
     bootstrap::{InviteError, Invites, Welcomed},
     invite::{self, Invite, Token},
     ip_family::IpFamily,
-    peer_egress::{PeerEgress, PeerEgressHandle, PeerState, PeerStatus},
+    peer_egress::{PeerEgress, PeerEgressHandle, PeerState, PeerStatus, Route},
     peer_ingress::{PeerIngress, PeerIngressHandle},
 };
 
@@ -816,8 +816,19 @@ impl Rpc {
                         PeerState::Dialing { attempt } => {
                             rpc::PeerState::Dialing(rpc::Attempt { attempt })
                         }
-                        PeerState::Connected { software } => {
-                            rpc::PeerState::Connected(rpc::Connected { version: software })
+                        PeerState::Connected { software, route } => {
+                            rpc::PeerState::Connected(rpc::Connected {
+                                version: software,
+                                route: route.map(|route| match route {
+                                    Route::Direct(addr) => rpc::Route::Direct(rpc::Direct {
+                                        addr: addr.to_string(),
+                                    }),
+                                    Route::Relay(url) => rpc::Route::Relay(rpc::Relay {
+                                        url: url.to_string(),
+                                    }),
+                                    Route::Custom(addr) => rpc::Route::Custom(rpc::Custom { addr }),
+                                }),
+                            })
                         }
                         PeerState::Backoff { attempt } => {
                             rpc::PeerState::Backoff(rpc::Attempt { attempt })

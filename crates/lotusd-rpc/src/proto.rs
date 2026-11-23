@@ -580,10 +580,7 @@ impl fmt::Display for PeerState {
         match self {
             PeerState::Dialing(Attempt { attempt: 0 }) => f.write_str("dialing"),
             PeerState::Dialing(Attempt { attempt }) => write!(f, "dialing (retry {attempt})"),
-            PeerState::Connected(Connected { version: None }) => f.write_str("connected"),
-            PeerState::Connected(Connected {
-                version: Some(version),
-            }) => write!(f, "connected, running {version}"),
+            PeerState::Connected(connected) => connected.fmt(f),
             PeerState::Backoff(Attempt { attempt }) => {
                 write!(f, "backing off after {attempt} failed dials")
             }
@@ -605,6 +602,69 @@ pub struct Connected {
     /// said, when it does not, or from a daemon too old to ask.
     #[cbor(key = 1)]
     pub version: Option<String>,
+    /// The path the connection's traffic takes; `None` while iroh has
+    /// selected none, or from a daemon too old to say.
+    #[cbor(key = 2)]
+    pub route: Option<Route>,
+}
+
+impl fmt::Display for Connected {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("connected")?;
+        if let Some(route) = &self.route {
+            write!(f, " ({route})")?;
+        }
+        if let Some(version) = &self.version {
+            write!(f, ", running {version}")?;
+        }
+        Ok(())
+    }
+}
+
+/// The path a connection's traffic takes to its peer.
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Route {
+    /// Straight to the peer's address.
+    Direct(Direct),
+    /// Through a relay server.
+    Relay(Relay),
+    /// Over a custom transport.
+    Custom(Custom),
+}
+
+impl fmt::Display for Route {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Route::Direct(Direct { addr }) => write!(f, "direct {addr}"),
+            Route::Relay(Relay { url }) => write!(f, "relay {url}"),
+            Route::Custom(Custom { addr }) => write!(f, "custom {addr}"),
+        }
+    }
+}
+
+/// A direct path.
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+pub struct Direct {
+    /// The peer's socket address, as `ip:port`.
+    #[cbor(key = 1)]
+    pub addr: String,
+}
+
+/// A path over a custom transport.
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+pub struct Custom {
+    /// The peer's address on that transport.
+    #[cbor(key = 1)]
+    pub addr: String,
+}
+
+/// A relayed path.
+#[derive(Debug, Clone, Cbor, PartialEq, Eq)]
+pub struct Relay {
+    /// The relay server's URL.
+    #[cbor(key = 1)]
+    pub url: String,
 }
 
 /// Asks the daemon for envelopes it holds.

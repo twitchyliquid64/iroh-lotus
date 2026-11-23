@@ -20,13 +20,14 @@ pub use frame::MAX_FRAME_LEN;
 
 mod proto;
 pub use proto::{
-    Attempt, ChainRange, ChainWalk, Changed, Compact, Compacted, Connected, CreateInvite,
-    EndpointInfo, EnvelopeFrame, EnvelopeSelector, Failure, FailureKind, GetChainRange,
+    Attempt, ChainRange, ChainWalk, Changed, Compact, Compacted, Connected, CreateInvite, Custom,
+    Direct, EndpointInfo, EnvelopeFrame, EnvelopeSelector, Failure, FailureKind, GetChainRange,
     GetEnvelopes, GetStatus, GetVersion, InviteCode, IpFamily, Len, ListNamespaces, MapMeta,
     NamespaceChange, NamespaceEntry, NamespaceList, NodeStatus, OtherEndpoint, PeerInfo, PeerState,
-    Published, Queried, Query, QueryKind, Read, Reason, Reorged, Request, Response, Shape,
-    Unchecked, ValueAt, ValueMeta, Verification, Watch, WatchEvent, WatchPath, WatchSelector,
-    WeakDelete, WeakDeleteMatching, WeakIncrement, WeakPush, WeakSet, WriteOutcome, Written,
+    Published, Queried, Query, QueryKind, Read, Reason, Relay, Reorged, Request, Response, Route,
+    Shape, Unchecked, ValueAt, ValueMeta, Verification, Watch, WatchEvent, WatchPath,
+    WatchSelector, WeakDelete, WeakDeleteMatching, WeakIncrement, WeakPush, WeakSet, WriteOutcome,
+    Written,
 };
 
 mod method;

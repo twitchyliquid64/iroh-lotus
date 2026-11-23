@@ -175,18 +175,20 @@ impl Node {
         self.handle.insert([envelope]).await.unwrap();
     }
 
-    /// Waits until every peer this node keeps has said what it runs: the
-    /// pull on connect that learns it lands after the connection does.
+    /// Waits until every peer this node keeps has said what it runs and
+    /// has a route: the pull on connect that learns the former, and the
+    /// path selection behind the latter, land after the connection does.
     async fn wait_for_peer_software(&self) {
         timeout(GRACE, async {
-            while !self
-                .handle
-                .peers()
-                .await
-                .unwrap()
-                .iter()
-                .all(|peer| matches!(peer.state, PeerState::Connected { software: Some(_) }))
-            {
+            while !self.handle.peers().await.unwrap().iter().all(|peer| {
+                matches!(
+                    peer.state,
+                    PeerState::Connected {
+                        software: Some(_),
+                        route: Some(_)
+                    }
+                )
+            }) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -296,14 +298,22 @@ async fn status_shows_each_side_of_a_kept_connection() {
         a_text.contains(&format!("endpoint   {}\n", a.endpoint().id().to_z32())),
         "got {a_text}"
     );
-    assert!(a_text.contains("peers      1 kept\n"), "got {a_text}");
     assert!(
         a_text.contains(&format!(
-            "           {}  {}  connected, running {}\n",
+            "peers      1 kept\n\n\
+             \x20 node id  {}\n\
+             \x20 endpoint {}\n\
+             \x20 state    connected\n\
+             \x20 route    custom ",
             KeyId::from_bytes([1; 32]).to_hex().as_ref(),
             b.endpoint().id().to_z32(),
-            lotusd::VERSION,
         )),
+        "got {a_text}"
+    );
+    // The peer's stanza closes the output, so this is its version line,
+    // not the node's own.
+    assert!(
+        a_text.ends_with(&format!("\n  version  {}\n", lotusd::VERSION)),
         "got {a_text}"
     );
     assert!(
@@ -334,7 +344,7 @@ async fn status_shows_the_names_the_cluster_gives_its_nodes() {
     assert!(text.contains("\nname       alpha\n"), "got {text}");
     assert!(
         text.contains(&format!(
-            "           bravo  {}  {}  ",
+            "\n  node id  {}\n  name     bravo\n  endpoint {}\n",
             peer.to_hex().as_ref(),
             b.endpoint().id().to_z32(),
         )),
@@ -360,8 +370,10 @@ async fn status_renders_json_when_asked() {
     assert!(json["published"].is_object(), "got {json}");
     assert_eq!(json["peers"].as_array().map(Vec::len), Some(1));
     assert_eq!(json["peers"][0]["endpoint"], b.endpoint().id().to_z32());
-    assert_eq!(
-        json["peers"][0]["state"],
-        serde_json::json!({ "connected": { "version": lotusd::VERSION } })
+    let connected = &json["peers"][0]["state"]["connected"];
+    assert_eq!(connected["version"], lotusd::VERSION, "got {json}");
+    assert!(
+        connected["route"]["custom"]["addr"].is_string(),
+        "got {json}"
     );
 }

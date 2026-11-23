@@ -1,10 +1,15 @@
 //! A daemon following the `cluster-nodes` namespace: dialling what the
 //! ledger lists, dropping what it stops listing, and surviving what it
 //! changes — and, over the connections it keeps, announcing its head so
-//! listed peers pull it. All over real iroh endpoints on an in-memory
-//! network.
+//! listed peers pull it. All over real iroh endpoints, on an in-memory
+//! network or, where the transport is the point, real loopback sockets.
 
-use std::{collections::BTreeMap, path::Path, time::Duration};
+use std::{
+    collections::BTreeMap,
+    net::{Ipv4Addr, SocketAddr},
+    path::Path,
+    time::Duration,
+};
 
 use iroh::{
     Endpoint, EndpointAddr, RelayMode, SecretKey, endpoint::presets,
@@ -12,7 +17,7 @@ use iroh::{
 };
 use lotusd::{
     Core, IfInitialized, NodeKeys, Server, ServerHandle,
-    peer_egress::{PeerState, PeerStatus},
+    peer_egress::{PeerState, PeerStatus, Route},
     peer_ingress::Protocol,
 };
 use state::CLUSTER_NODES_KEY;
@@ -40,18 +45,31 @@ fn copy_state_dir(from: &Path, to: &Path) {
     }
 }
 
-/// An endpoint on `network` only, dialled by id alone.
-async fn endpoint(network: &TestNetwork, secret: SecretKey) -> Endpoint {
-    let transport = network.create_transport(secret.public()).unwrap();
-    Endpoint::builder(presets::Minimal)
-        .preset(transport)
-        .secret_key(secret)
-        .relay_mode(RelayMode::Disabled)
-        .clear_ip_transports()
-        .alpns(Protocol::alpns())
-        .bind()
-        .await
-        .unwrap()
+/// Where a test's endpoints talk.
+enum Net {
+    /// An in-memory network, dialled by id alone.
+    Memory(TestNetwork),
+    /// UDP on 127.0.0.1, dialled at the address an endpoint reports.
+    Loopback,
+}
+
+impl Net {
+    async fn endpoint(&self, secret: SecretKey) -> Endpoint {
+        let builder = Endpoint::builder(presets::Minimal)
+            .secret_key(secret.clone())
+            .relay_mode(RelayMode::Disabled)
+            .clear_ip_transports()
+            .alpns(Protocol::alpns());
+        let builder = match self {
+            Net::Memory(network) => {
+                builder.preset(network.create_transport(secret.public()).unwrap())
+            }
+            Net::Loopback => builder
+                .bind_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .unwrap(),
+        };
+        builder.bind().await.unwrap()
+    }
 }
 
 /// An envelope that writes `v` under `k`, chaining onto `prev`.
@@ -103,8 +121,8 @@ struct Node {
 
 impl Node {
     /// Starts a server over the cluster state in `dir`, on `secret`'s
-    /// endpoint on `network`.
-    async fn start(dir: TempDir, network: &TestNetwork, secret: Option<SecretKey>) -> Self {
+    /// endpoint on `net`.
+    async fn start(dir: TempDir, net: &Net, secret: Option<SecretKey>) -> Self {
         let core = Core::init_with_state_dir(dir.path().to_path_buf())
             .await
             .unwrap();
@@ -113,7 +131,7 @@ impl Node {
         // Short name on purpose: a unix socket path has to fit in SUN_LEN.
         let listener = UnixListener::bind(dir.path().join("s.sock")).unwrap();
         let secret = secret.unwrap_or_else(|| core.iroh_secret().clone());
-        let endpoint = endpoint(network, secret).await;
+        let endpoint = net.endpoint(secret).await;
         let (handle, join) = Server::new(core, listener)
             .unwrap()
             .with_endpoint(endpoint.clone())
@@ -221,6 +239,11 @@ impl Node {
 /// the copied state dirs share the genesis one, and two endpoints under
 /// one id cannot tell each other apart.
 async fn cluster(n: usize) -> Vec<Node> {
+    cluster_on(n, Net::Memory(TestNetwork::new())).await
+}
+
+/// [`cluster`], on `net`.
+async fn cluster_on(n: usize, net: Net) -> Vec<Node> {
     let dirs: Vec<TempDir> = (0..n).map(|_| TempDir::new().unwrap()).collect();
     {
         // The core drops here, closing its store before the copies.
@@ -232,11 +255,10 @@ async fn cluster(n: usize) -> Vec<Node> {
         copy_state_dir(dirs[0].path(), dir.path());
     }
 
-    let network = TestNetwork::new();
     let mut nodes = Vec::with_capacity(n);
     for (i, dir) in dirs.into_iter().enumerate() {
         let secret = (i > 0).then(SecretKey::generate);
-        nodes.push(Node::start(dir, &network, secret).await);
+        nodes.push(Node::start(dir, &net, secret).await);
     }
     nodes
 }
@@ -264,6 +286,27 @@ async fn a_node_listed_in_the_ledger_is_dialled() {
     b.wait_for_connections(1).await;
     // Listing is one-way: b lists nobody, so b dials nobody.
     assert!(b.handle.peers().await.unwrap().is_empty());
+}
+
+/// Two endpoints on one host reach each other straight over UDP, and the
+/// peer's state says so.
+#[tokio::test]
+async fn a_peer_reached_over_ip_is_routed_direct() {
+    let nodes = cluster_on(2, Net::Loopback).await;
+    let (a, b) = (&nodes[0], &nodes[1]);
+
+    a.list([(node_id(1), b.endpoint.addr())]).await;
+
+    a.wait_for_peers("a routed direct to b", |peers| {
+        peers.iter().any(|p| {
+            matches!(
+                &p.state,
+                PeerState::Connected { route: Some(Route::Direct(addr)), .. }
+                    if addr.ip() == Ipv4Addr::LOCALHOST
+            )
+        })
+    })
+    .await;
 }
 
 #[tokio::test]

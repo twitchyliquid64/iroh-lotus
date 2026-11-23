@@ -9,7 +9,8 @@
 use lotus_sdk::{
     KeyId, NamespaceKey, NodeStatus, Subkey,
     rpc::{
-        Attempt, Connected, EndpointInfo, OtherEndpoint, PeerInfo, PeerState, Published, Reason,
+        Attempt, Connected, Custom, Direct, EndpointInfo, OtherEndpoint, PeerInfo, PeerState,
+        Published, Reason, Relay, Route,
     },
 };
 use maud::{Markup, html};
@@ -188,7 +189,7 @@ fn peers(status: &NodeStatus) -> Markup {
             p.empty { "No other node is listed in the cluster." }
         } @else {
             table.entries.peers {
-                thead { tr { th { "State" } th { "Node" } th { "Version" } th { "Endpoint" } } }
+                thead { tr { th { "State" } th { "Route" } th { "Node" } th { "Version" } th { "Endpoint" } } }
                 tbody {
                     @for peer in &status.peers { (row(peer)) }
                 }
@@ -202,13 +203,19 @@ fn row(peer: &PeerInfo) -> Markup {
     html! {
         tr {
             td.state { (dot((&peer.state).into())) (state(&peer.state)) }
+            td.route {
+                @match &peer.state {
+                    PeerState::Connected(Connected { route: Some(route), .. }) => (self::route(route)),
+                    _ => span.absent { "—" },
+                }
+            }
             td.name {
                 @if let Some(name) = &peer.name { span.node-name { (name) } " " }
                 (node(&peer.node))
             }
             td.version {
                 @match &peer.state {
-                    PeerState::Connected(Connected { version: Some(version) }) => code { (version) },
+                    PeerState::Connected(Connected { version: Some(version), .. }) => code { (version) },
                     _ => span.absent { "—" },
                 }
             }
@@ -227,6 +234,17 @@ fn state(state: &PeerState) -> String {
             "backing off after {attempt} failed {}",
             if *attempt == 1 { "dial" } else { "dials" }
         ),
+    }
+}
+
+/// The path a connection takes: whether it is direct, and where to.
+fn route(route: &Route) -> Markup {
+    html! {
+        @match route {
+            Route::Direct(Direct { addr }) => { "direct " code.addr { (addr) } }
+            Route::Relay(Relay { url }) => { "relay " code.addr { (url) } }
+            Route::Custom(Custom { addr }) => { "custom " code.addr { (addr) } }
+        }
     }
 }
 
@@ -316,6 +334,7 @@ mod tests {
                     4,
                     PeerState::Connected(Connected {
                         version: Some("1.2.3".into()),
+                        route: None,
                     }),
                 ),
                 peer(5, PeerState::Backoff(Attempt { attempt: 1 })),
@@ -332,6 +351,44 @@ mod tests {
             page.contains(r#"<td class="version"><span class="absent">—</span></td>"#),
             "{page}"
         );
+    }
+
+    #[test]
+    fn a_connected_peer_shows_whether_its_route_is_direct_or_relayed() {
+        let connected = |route| {
+            PeerState::Connected(Connected {
+                version: None,
+                route: Some(route),
+            })
+        };
+        let page = pane(&status(
+            true,
+            vec![
+                peer(
+                    4,
+                    connected(Route::Direct(Direct {
+                        addr: "192.0.2.4:7000".into(),
+                    })),
+                ),
+                peer(
+                    5,
+                    connected(Route::Relay(Relay {
+                        url: "https://relay.example/".into(),
+                    })),
+                ),
+                peer(6, PeerState::Dialing(Attempt { attempt: 0 })),
+            ],
+            None,
+        ))
+        .into_string();
+
+        for cell in [
+            r#"<td class="route">direct <code class="addr">192.0.2.4:7000</code></td>"#,
+            r#"<td class="route">relay <code class="addr">https://relay.example/</code></td>"#,
+            r#"<td class="route"><span class="absent">—</span></td>"#,
+        ] {
+            assert!(page.contains(cell), "no `{cell}` in {page}");
+        }
     }
 
     #[test]

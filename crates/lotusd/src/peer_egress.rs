@@ -22,15 +22,19 @@
 //! *this*, so a read of the ledger runs on a task of its own and posts
 //! its result back here.
 
-use std::{collections::BTreeMap, fmt, ops::ControlFlow, time::Duration};
+use std::{collections::BTreeMap, fmt, net::SocketAddr, ops::ControlFlow, time::Duration};
 
-use iroh::{Endpoint, EndpointAddr, endpoint::Connection};
+use iroh::{
+    Endpoint, EndpointAddr, RelayUrl, TransportAddr,
+    endpoint::{Connection, Path, PathList},
+};
 use state::CLUSTER_NODES_KEY;
 use tokio::{
     sync::{mpsc, watch},
     task::{Id, JoinHandle, JoinSet},
     time::{Instant, sleep, timeout},
 };
+use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use wire::{EnvelopeDigest, KeyId, msg::NamespaceKey};
@@ -69,8 +73,12 @@ pub enum PeerState {
     Dialing { attempt: u32 },
     /// The connection is up. `software` is the version the peer's
     /// `Hello` named: `None` until a session hears it, or when the peer
-    /// does not say.
-    Connected { software: Option<String> },
+    /// does not say. `route` is the path iroh has selected for it: `None`
+    /// while none is.
+    Connected {
+        software: Option<String>,
+        route: Option<Route>,
+    },
     /// The last dial failed; waiting before the next one.
     Backoff { attempt: u32 },
 }
@@ -80,11 +88,57 @@ impl fmt::Display for PeerState {
         match self {
             PeerState::Dialing { attempt: 0 } => f.write_str("dialing"),
             PeerState::Dialing { attempt } => write!(f, "dialing (retry {attempt})"),
-            PeerState::Connected { software: None } => f.write_str("connected"),
-            PeerState::Connected {
-                software: Some(software),
-            } => write!(f, "connected, running {software}"),
+            PeerState::Connected { software, route } => {
+                f.write_str("connected")?;
+                if let Some(route) = route {
+                    write!(f, " ({route})")?;
+                }
+                if let Some(software) = software {
+                    write!(f, ", running {software}")?;
+                }
+                Ok(())
+            }
             PeerState::Backoff { attempt } => write!(f, "backoff after {attempt} failures"),
+        }
+    }
+}
+
+/// The path a connection's traffic takes to its peer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Route {
+    /// Straight to the peer's address, holepunched or not.
+    Direct(SocketAddr),
+    /// Through a relay server.
+    Relay(RelayUrl),
+    /// Over a custom transport — one lotusd itself never binds, but an
+    /// endpoint handed to it (as in tests) may. The address as iroh
+    /// renders it: its type is not public outside an unstable feature.
+    Custom(String),
+}
+
+impl Route {
+    /// The route of the path `paths` has selected, if any.
+    fn selected(paths: &PathList<'_>) -> Option<Self> {
+        paths
+            .iter()
+            .find(Path::is_selected)
+            .and_then(|path| match path.remote_addr() {
+                TransportAddr::Ip(addr) => Some(Route::Direct(*addr)),
+                TransportAddr::Relay(url) => Some(Route::Relay(url.clone())),
+                TransportAddr::Custom(addr) => Some(Route::Custom(addr.to_string())),
+                // `TransportAddr` is non-exhaustive; a kind this build
+                // cannot name is no route it can describe.
+                _ => None,
+            })
+    }
+}
+
+impl fmt::Display for Route {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Route::Direct(addr) => write!(f, "direct {addr}"),
+            Route::Relay(url) => write!(f, "relay {url}"),
+            Route::Custom(addr) => write!(f, "custom {addr}"),
         }
     }
 }
@@ -420,7 +474,10 @@ async fn maintain(
         match dialled {
             Ok(conn) => {
                 attempt = 0;
-                state.send_replace(PeerState::Connected { software: None });
+                state.send_replace(PeerState::Connected {
+                    software: None,
+                    route: None,
+                });
                 tracing::info!("connected to peer");
                 // Server about to be garbage collected.
                 let Some(server) = server.upgrade() else {
@@ -476,6 +533,7 @@ async fn hold(
         tracing::debug!(error = %e, "announcing head on connect");
     }
     link.pull();
+    let mut paths = conn.paths_stream();
     loop {
         let flow = tokio::select! {
             bi = conn.accept_bi() => match bi {
@@ -503,13 +561,26 @@ async fn hold(
                 let flow = link.settle(session);
                 let software = link.peer_software();
                 state.send_if_modified(|state| match state {
-                    PeerState::Connected { software: known } if known.as_deref() != software => {
+                    PeerState::Connected { software: known, .. } if known.as_deref() != software => {
                         *known = software.map(str::to_owned);
                         true
                     }
                     _ => false,
                 });
                 flow
+            }
+            // Ends with the connection; `closed` below sees to that.
+            Some(paths) = paths.next() => {
+                let selected = Route::selected(&paths);
+                state.send_if_modified(|state| match state {
+                    PeerState::Connected { route, .. } if *route != selected => {
+                        tracing::debug!(route = ?selected, "peer route changed");
+                        *route = selected;
+                        true
+                    }
+                    _ => false,
+                });
+                ControlFlow::Continue(())
             }
             closed = conn.closed() => {
                 tracing::info!(reason = ?closed, "peer connection lost");
