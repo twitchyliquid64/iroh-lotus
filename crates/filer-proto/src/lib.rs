@@ -3,7 +3,9 @@
 //! A connection is opened under [`ALPN`] and serves one volume. The client
 //! opens a bidirectional stream and sends a [`Hello`] naming the volume;
 //! the filer answers with a [`Welcome`] saying what the client may do
-//! there, or closes the connection with a [`Close`] code. Who the client
+//! there, or closes the connection with a [`Close`] code. From then on
+//! every further stream the client opens is one filesystem operation
+//! ([`fs`]). Who the client
 //! is never travels in a frame: it is the endpoint id iroh authenticated
 //! at the handshake, and the filer looks that up in the ledger.
 //!
@@ -21,6 +23,8 @@ use cbor2::Cbor;
 use nutype::nutype;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+pub mod fs;
 
 /// The ALPN a filer connection is opened under.
 pub const ALPN: &[u8] = b"lotus-filer/0";

@@ -2,7 +2,7 @@ use std::{io, net::SocketAddr, path::PathBuf, process::ExitCode};
 
 use clap::{Parser, ValueEnum};
 use filer_proto::VolumeName;
-use filerd::{Filer, key};
+use filerd::{Backing, Filer, key};
 use iroh::{
     Endpoint, RelayMode,
     endpoint::{default_relay_mode, presets},
@@ -81,12 +81,12 @@ enum MainError {
     NoLotusStateDir,
     #[error("volume {volume} is listed twice")]
     DuplicateVolume { volume: VolumeName },
-    #[error("volume {volume}: {} is not a directory", path.display())]
-    NotADirectory {
+    #[error("volume {volume}: opening the directory {}", path.display())]
+    OpenVolume {
         volume: VolumeName,
         path: PathBuf,
         #[source]
-        source: Option<io::Error>,
+        source: io::Error,
     },
     #[error(transparent)]
     Key(#[from] key::KeyError),
@@ -127,31 +127,24 @@ async fn async_main() -> Result<(), MainError> {
         .init();
 
     let cli = Cli::parse();
-    let filer = cli.volumes.into_iter().try_fold(
-        Vec::<(VolumeName, PathBuf)>::new(),
+    let volumes = cli.volumes.into_iter().try_fold(
+        Vec::<(VolumeName, Backing)>::new(),
         |mut volumes, (volume, path)| {
             if volumes.iter().any(|(listed, _)| *listed == volume) {
                 return Err(MainError::DuplicateVolume { volume });
             }
-            match std::fs::metadata(&path) {
-                Ok(meta) if meta.is_dir() => {}
-                Ok(_) => {
-                    return Err(MainError::NotADirectory {
-                        volume,
-                        path,
-                        source: None,
-                    });
+            match Backing::open(&path) {
+                Ok(backing) => {
+                    tracing::info!(%volume, path = %path.display(), "serving volume");
+                    volumes.push((volume, backing));
+                    Ok(volumes)
                 }
-                Err(source) => {
-                    return Err(MainError::NotADirectory {
-                        volume,
-                        path,
-                        source: Some(source),
-                    });
-                }
+                Err(source) => Err(MainError::OpenVolume {
+                    volume,
+                    path,
+                    source,
+                }),
             }
-            volumes.push((volume, path));
-            Ok(volumes)
         },
     )?;
 
@@ -192,11 +185,11 @@ async fn async_main() -> Result<(), MainError> {
         endpoint.id().to_z32()
     );
 
-    let handle = filer
+    let handle = volumes
         .into_iter()
         .fold(
             Filer::new(client, endpoint.clone()),
-            |filer, (volume, path)| filer.with_volume(volume, path),
+            |filer, (volume, backing)| filer.with_volume(volume, backing),
         )
         .with_takeover(cli.takeover)
         .spawn();

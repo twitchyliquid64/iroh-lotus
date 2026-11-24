@@ -10,6 +10,7 @@ publish.workspace = true
 cbor2.workspace = true
 nutype.workspace = true
 serde.workspace = true
+serde_bytes.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 

@@ -8,22 +8,35 @@
 //! stands: a client removed, or cut back from read-write, is hung up on.
 //! A change that leaves its grant alone leaves the connection alone.
 //!
+//! Once admitted, every stream the client opens is one operation on the
+//! volume ([`filer_proto::fs`]), each served on a task of its own. What a
+//! connection may do is fixed when it is admitted — a grant that narrows
+//! ends the connection rather than changing it — so an operation is held
+//! to the mode the client was welcomed at.
+//!
 //! A ledger that cannot be read admits nobody new. Connections already
 //! judged are kept through it — a restart of the local daemon should not
 //! unmount every client — and judged again once it reads.
 
-use std::time::Duration;
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use filer_proto::{Close, Hello, Mode, VolumeName, Welcome, read_frame, write_frame};
+use filer_proto::{
+    Close, Hello, Mode, VolumeName, Welcome,
+    fs::{Errno, Reply, Request},
+    read_frame, write_frame,
+};
 use iroh::{
     Endpoint, EndpointId,
-    endpoint::{Connection, Incoming, VarInt},
+    endpoint::{Connection, Incoming, RecvStream, SendStream, VarInt},
 };
 use tokio::{sync::watch, task::JoinSet, time::timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
-use crate::view::View;
+use crate::{backing::Backing, view::View};
+
+/// The directories behind the volumes a filer serves.
+pub(crate) type Volumes = Arc<BTreeMap<VolumeName, Arc<Backing>>>;
 
 /// How many client connections are served at once; further attempts are
 /// refused at the handshake.
@@ -86,6 +99,7 @@ fn revoked(
 /// The gate, before it is run.
 pub(crate) struct Gate {
     pub(crate) endpoint: Endpoint,
+    pub(crate) volumes: Volumes,
     pub(crate) view: watch::Receiver<View>,
     pub(crate) limit: usize,
 }
@@ -117,6 +131,7 @@ impl Gate {
                     conns.spawn(connection(
                         incoming,
                         self.endpoint.id(),
+                        Arc::clone(&self.volumes),
                         self.view.clone(),
                         cancel.clone(),
                     ));
@@ -150,6 +165,7 @@ impl Gate {
 async fn connection(
     incoming: Incoming,
     filer: EndpointId,
+    volumes: Volumes,
     view: watch::Receiver<View>,
     cancel: CancellationToken,
 ) {
@@ -171,7 +187,7 @@ async fn connection(
     let span = tracing::info_span!("client", remote = %conn.remote_id().fmt_short());
     async {
         let reason = tokio::select! {
-            reason = serve(&conn, filer, view) => reason,
+            reason = serve(&conn, filer, &volumes, view) => reason,
             () = cancel.cancelled() => Some(Close::ShuttingDown),
         };
         match reason {
@@ -191,6 +207,7 @@ async fn connection(
 async fn serve(
     conn: &Connection,
     filer: EndpointId,
+    volumes: &Volumes,
     mut view: watch::Receiver<View>,
 ) -> Option<Close> {
     let client = conn.remote_id();
@@ -199,11 +216,29 @@ async fn serve(
         Ok(Err(reason)) => return reason,
         Err(_) => return Some(Close::Breach),
     };
+    let Some(backing) = volumes.get(&volume) else {
+        tracing::error!(%volume, "admitted a client to a volume this filer has no directory for");
+        return Some(Close::Internal);
+    };
     tracing::info!(%volume, mode = %held, "client admitted");
 
+    // Dropped with the connection, which ends whatever is still running.
+    let mut operations: JoinSet<()> = JoinSet::new();
     loop {
         tokio::select! {
-            _ = conn.closed() => return None,
+            Some(res) = operations.join_next() => {
+                if let Err(e) = res && e.is_panic() {
+                    tracing::error!(error = %e, "operation task panicked");
+                }
+            }
+            // How many run at once is the connection's stream limit: a
+            // stream counts against it until its reply is read.
+            stream = conn.accept_bi() => match stream {
+                Ok((send, recv)) => {
+                    operations.spawn(operation(Arc::clone(backing), held, send, recv));
+                }
+                Err(_) => return None,
+            },
             changed = view.changed() => {
                 // The view's task is gone, and the filer with it.
                 if changed.is_err() {
@@ -243,6 +278,36 @@ async fn admit(
     // may overtake the welcome.
     send.finish().map_err(|_| None)?;
     Ok((hello.volume, mode))
+}
+
+/// Serves one operation: reads the request, carries it out, answers.
+async fn operation(backing: Arc<Backing>, held: Mode, mut send: SendStream, mut recv: RecvStream) {
+    let request: Request = match read_frame(&mut recv).await {
+        Ok(request) => request,
+        Err(error) => {
+            tracing::debug!(%error, "reading a request");
+            return;
+        }
+    };
+    let reply = if held < Mode::ReadWrite && request.mutates() {
+        Reply::Error(Errno::ReadOnly)
+    } else {
+        // The backing filesystem blocks.
+        tokio::task::spawn_blocking(move || backing.handle(request))
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "operation panicked");
+                Reply::Error(Errno::Io)
+            })
+    };
+    if let Err(error) = write_frame(&mut send, &reply).await {
+        tracing::debug!(%error, "writing a reply");
+        return;
+    }
+    // Finished rather than dropped, so the reply is not overtaken by a reset.
+    if let Err(error) = send.finish() {
+        tracing::debug!(%error, "finishing a reply");
+    }
 }
 
 #[cfg(test)]

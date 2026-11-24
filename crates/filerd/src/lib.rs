@@ -3,7 +3,7 @@
 //! ledger of the lotusd beside it.
 //!
 //! Which volumes a filer serves, and from where on disk, is its own
-//! configuration. The ledger is where it announces them — each volume's
+//! configuration ([`Backing`]). The ledger is where it announces them — each volume's
 //! entry in the `filers` namespace names the filer's endpoint and where it
 //! is reachable — and where an operator says who may connect
 //! ([`ledger`]). The filer reaches the ledger only through the local
@@ -14,16 +14,20 @@
 //!  - the view follows the `filers` namespace ([`View`]);
 //!  - the publisher claims the filer's volumes and keeps their listed
 //!    address current;
-//!  - the gate accepts clients and holds each to what the ledger permits
-//!    its endpoint id.
+//!  - the gate accepts clients, holds each to what the ledger permits its
+//!    endpoint id, and carries out the operations they send against the
+//!    volume's directory.
 
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use filer_proto::VolumeName;
 use iroh::Endpoint;
 use lotus_sdk::Client;
 use tokio::{sync::watch, task::JoinSet};
 use tokio_util::sync::CancellationToken;
+
+pub mod backing;
+pub use backing::Backing;
 
 pub mod key;
 pub mod ledger;
@@ -42,7 +46,7 @@ pub use view::View;
 pub struct Filer {
     client: Client,
     endpoint: Endpoint,
-    volumes: BTreeMap<VolumeName, PathBuf>,
+    volumes: BTreeMap<VolumeName, Arc<Backing>>,
     settle: Duration,
     takeover: bool,
     connection_limit: usize,
@@ -63,9 +67,9 @@ impl Filer {
         }
     }
 
-    /// Serves the directory `path` as the volume `name`.
-    pub fn with_volume(mut self, name: VolumeName, path: impl Into<PathBuf>) -> Self {
-        self.volumes.insert(name, path.into());
+    /// Serves the directory `backing` holds as the volume `name`.
+    pub fn with_volume(mut self, name: VolumeName, backing: Backing) -> Self {
+        self.volumes.insert(name, Arc::new(backing));
         self
     }
 
@@ -90,10 +94,7 @@ impl Filer {
 
     /// Starts the filer's tasks, returning the handle it is stopped by.
     pub fn spawn(self) -> FilerHandle {
-        self.volumes.iter().for_each(|(volume, path)| {
-            tracing::info!(%volume, path = %path.display(), "serving volume");
-        });
-        let volumes: Arc<[VolumeName]> = self.volumes.into_keys().collect();
+        let volumes: Arc<[VolumeName]> = self.volumes.keys().cloned().collect();
         let cancel = CancellationToken::new();
         let (view_tx, view) = watch::channel(View::Unreadable);
         let (standings_tx, standings) = watch::channel(BTreeMap::new());
@@ -120,6 +121,7 @@ impl Filer {
         tasks.spawn(
             serve::Gate {
                 endpoint: self.endpoint,
+                volumes: Arc::new(self.volumes),
                 view: view.clone(),
                 limit: self.connection_limit,
             }

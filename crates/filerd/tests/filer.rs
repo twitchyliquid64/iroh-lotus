@@ -3,9 +3,13 @@
 
 use std::time::Duration;
 
-use filer_proto::{Close, Hello, Mode, VolumeName, Welcome, read_frame, write_frame};
+use filer_proto::{
+    Close, Hello, Mode, VolumeName, Welcome,
+    fs::{Create, Errno, Lookup, Name, NodeId, Read, Reply, Request, Write},
+    read_frame, write_frame,
+};
 use filerd::{
-    Filer, FilerHandle, Standing, View,
+    Backing, Filer, FilerHandle, Standing, View,
     ledger::{self, ALLOWED_CLIENTS, ENDPOINT},
 };
 use iroh::{
@@ -25,6 +29,8 @@ const GRACE: Duration = Duration::from_secs(20);
 /// A daemon on a fresh state dir, and a client at its socket.
 struct Daemon {
     client: Client,
+    /// The directory a filer started by [`filer`] serves as `scratch`.
+    volume: TempDir,
     // Held so the socket and the mainloop outlive the test.
     _dir: TempDir,
     _handle: ServerHandle,
@@ -40,6 +46,7 @@ async fn daemon() -> Daemon {
     let (handle, join) = Server::new(core, listener).unwrap().run().await;
     Daemon {
         client: Client::in_state_dir(dir.path()),
+        volume: TempDir::new().unwrap(),
         _dir: dir,
         _handle: handle,
         _join: join,
@@ -74,7 +81,8 @@ fn path(text: &str) -> SubkeyPath {
 
 /// A filer serving `scratch` on `endpoint`.
 fn filer(daemon: &Daemon, endpoint: &Endpoint) -> Filer {
-    Filer::new(daemon.client.clone(), endpoint.clone()).with_volume(scratch(), "/nonexistent")
+    Filer::new(daemon.client.clone(), endpoint.clone())
+        .with_volume(scratch(), Backing::open(daemon.volume.path()).unwrap())
 }
 
 /// Waits for `scratch`'s listing to reach a standing `wanted` accepts.
@@ -387,4 +395,191 @@ async fn shutting_down_hangs_up_on_clients() {
     timeout(GRACE, handle.shutdown()).await.unwrap();
 
     assert_eq!(closed(&conn).await, Close::ShuttingDown);
+}
+
+/// Sends one operation on its own stream and reads the answer.
+async fn op(conn: &Connection, request: Request) -> Reply {
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    write_frame(&mut send, &request).await.unwrap();
+    timeout(GRACE, read_frame(&mut recv))
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+fn name(text: &str) -> Name {
+    Name::try_new(text).unwrap()
+}
+
+/// A filer serving `scratch` to `writer` read-write and `reader` read-only.
+async fn shared(
+    daemon: &Daemon,
+    endpoint: &Endpoint,
+    writer: EndpointId,
+    reader: EndpointId,
+) -> FilerHandle {
+    list(daemon, None).await;
+    permit(daemon, "writer", writer, "rw").await;
+    permit(daemon, "reader", reader, "ro").await;
+    let handle = filer(daemon, endpoint).spawn();
+    standing(&handle, |s| *s == Standing::Published).await;
+    sees(&handle, reader, Some(Mode::ReadOnly)).await;
+    handle
+}
+
+#[tokio::test]
+async fn what_one_client_writes_another_reads() {
+    let daemon = daemon().await;
+    let network = TestNetwork::new();
+    let endpoint = endpoint(&network, secret(1)).await;
+    let writer = client_endpoint(&network, 2).await;
+    let reader = client_endpoint(&network, 3).await;
+    let handle = shared(&daemon, &endpoint, writer.id(), reader.id()).await;
+    let (writing, _) = connect(&writer, endpoint.id()).await.unwrap();
+    let (reading, _) = connect(&reader, endpoint.id()).await.unwrap();
+
+    let Reply::Attr(created) = op(
+        &writing,
+        Request::Create(Create {
+            parent: NodeId::ROOT,
+            name: name("notes"),
+            mode: 0o644,
+            exclusive: true,
+        }),
+    )
+    .await
+    else {
+        panic!("expected the created file");
+    };
+    let written = op(
+        &writing,
+        Request::Write(Write {
+            node: created.node,
+            offset: 0,
+            data: b"over iroh".to_vec().into(),
+        }),
+    )
+    .await;
+    assert!(matches!(written, Reply::Done(_)), "{written:?}");
+
+    let Reply::Attr(found) = op(
+        &reading,
+        Request::Lookup(Lookup {
+            parent: NodeId::ROOT,
+            name: name("notes"),
+        }),
+    )
+    .await
+    else {
+        panic!("expected the file to be found");
+    };
+    assert_eq!((found.node, found.size), (created.node, 9));
+    assert_eq!(
+        op(
+            &reading,
+            Request::Read(Read {
+                node: found.node,
+                offset: 5,
+                len: 100,
+            }),
+        )
+        .await,
+        Reply::Data(b"iroh".to_vec().into())
+    );
+    assert_eq!(
+        std::fs::read(daemon.volume.path().join("notes")).unwrap(),
+        b"over iroh"
+    );
+
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_read_only_client_changes_nothing() {
+    let daemon = daemon().await;
+    let network = TestNetwork::new();
+    let endpoint = endpoint(&network, secret(1)).await;
+    let writer = client_endpoint(&network, 2).await;
+    let reader = client_endpoint(&network, 3).await;
+    let handle = shared(&daemon, &endpoint, writer.id(), reader.id()).await;
+    std::fs::write(daemon.volume.path().join("notes"), b"as it was").unwrap();
+    let (reading, _) = connect(&reader, endpoint.id()).await.unwrap();
+
+    let Reply::Attr(found) = op(
+        &reading,
+        Request::Lookup(Lookup {
+            parent: NodeId::ROOT,
+            name: name("notes"),
+        }),
+    )
+    .await
+    else {
+        panic!("expected the file to be found");
+    };
+    assert_eq!(
+        op(
+            &reading,
+            Request::Write(Write {
+                node: found.node,
+                offset: 0,
+                data: b"scribble".to_vec().into(),
+            }),
+        )
+        .await,
+        Reply::Error(Errno::ReadOnly)
+    );
+    assert_eq!(
+        op(
+            &reading,
+            Request::Create(Create {
+                parent: NodeId::ROOT,
+                name: name("planted"),
+                mode: 0o644,
+                exclusive: false,
+            }),
+        )
+        .await,
+        Reply::Error(Errno::ReadOnly)
+    );
+
+    assert_eq!(
+        std::fs::read(daemon.volume.path().join("notes")).unwrap(),
+        b"as it was"
+    );
+    assert!(!daemon.volume.path().join("planted").exists());
+
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn operations_run_side_by_side_on_one_connection() {
+    let daemon = daemon().await;
+    let network = TestNetwork::new();
+    let endpoint = endpoint(&network, secret(1)).await;
+    let writer = client_endpoint(&network, 2).await;
+    let reader = client_endpoint(&network, 3).await;
+    let handle = shared(&daemon, &endpoint, writer.id(), reader.id()).await;
+    let (conn, _) = connect(&writer, endpoint.id()).await.unwrap();
+
+    let created = (0..32).map(|i| {
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            op(
+                &conn,
+                Request::Create(Create {
+                    parent: NodeId::ROOT,
+                    name: name(&format!("file-{i}")),
+                    mode: 0o644,
+                    exclusive: true,
+                }),
+            )
+            .await
+        })
+    });
+    for reply in created.collect::<Vec<_>>() {
+        assert!(matches!(reply.await.unwrap(), Reply::Attr(_)));
+    }
+    assert_eq!(std::fs::read_dir(daemon.volume.path()).unwrap().count(), 32);
+
+    handle.shutdown().await;
 }
