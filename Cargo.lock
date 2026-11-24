@@ -955,6 +955,39 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "64cd1e32ddd350061ae6edb1b082d7c54915b5c672c389143b9a63403a109f24"
 
 [[package]]
+name = "filer-proto"
+version = "0.0.1"
+dependencies = [
+ "cbor2",
+ "nutype",
+ "serde",
+ "thiserror 2.0.21",
+ "tokio",
+ "wire",
+]
+
+[[package]]
+name = "filerd"
+version = "0.0.1"
+dependencies = [
+ "clap",
+ "dirs",
+ "filer-proto",
+ "iroh",
+ "lotus-sdk",
+ "lotusd",
+ "rand",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "version",
+ "wire",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"

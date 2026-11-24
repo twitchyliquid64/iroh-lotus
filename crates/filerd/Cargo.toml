@@ -1,0 +1,30 @@
+[package]
+name = "filerd"
+version.workspace = true
+rust-version.workspace = true
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+clap.workspace = true
+dirs.workspace = true
+iroh.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Our crates
+filer-proto.workspace = true
+lotus-sdk.workspace = true
+version.workspace = true
+wire = { workspace = true, features = ["iroh"] }
+
+# The tests run against a real daemon in-process, over an in-memory network.
+[dev-dependencies]
+iroh = { workspace = true, features = ["test-utils", "unstable-custom-transports"] }
+lotusd.workspace = true
+tempfile.workspace = true

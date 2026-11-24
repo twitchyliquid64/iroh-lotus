@@ -1,5 +1,7 @@
 [workspace]
 members = [
+    "crates/filer-proto",
+    "crates/filerd",
     "crates/lotus-sdk",
     "crates/lotusctl",
     "crates/lotusd",
@@ -67,6 +69,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Our crates
+filer-proto = { path = "crates/filer-proto" }
+filerd = { path = "crates/filerd" }
 lotus-sdk = { path = "crates/lotus-sdk" }
 lotusd = { path = "crates/lotusd" }
 lotusd-rpc = { path = "crates/lotusd-rpc" }
