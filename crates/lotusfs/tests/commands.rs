@@ -409,6 +409,132 @@ async fn put_writes_stdin_or_a_local_file_into_a_volume() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn mkdir_makes_a_directory_and_with_parents_the_way_to_it() {
+    let world = World::new().await;
+    std::fs::write(world.volume.path().join("file"), b"").unwrap();
+    let filer = world.start_filer();
+    let ticket = world.ticket().await;
+    world.permit("rw").await;
+    world.admitted(&["ls", &ticket]).await;
+    let is_dir = |path: &str| world.volume.path().join(path).is_dir();
+    let errno = |result: Result<String, lotusfs::cli::Error>| match result {
+        Err(lotusfs::cli::Error::Filer(e)) => e.errno(),
+        other => panic!("{other:?}"),
+    };
+
+    world.lotusfs(&["mkdir", &ticket, "/docs"]).await.unwrap();
+    assert!(is_dir("docs"));
+    world.lotusfs(&["mkdir", &ticket, "docs/a/"]).await.unwrap();
+    assert!(is_dir("docs/a"));
+
+    // Without --parents, a missing parent or a name taken is a failure.
+    assert_eq!(
+        errno(world.lotusfs(&["mkdir", &ticket, "x/y"]).await),
+        Some(Errno::NotFound)
+    );
+    assert!(!world.volume.path().join("x").exists());
+    assert_eq!(
+        errno(world.lotusfs(&["mkdir", &ticket, "docs"]).await),
+        Some(Errno::Exists)
+    );
+    assert_eq!(
+        errno(world.lotusfs(&["mkdir", &ticket, "/"]).await),
+        Some(Errno::Exists)
+    );
+
+    // With it, the way is made and what is there already is fine.
+    world
+        .lotusfs(&["mkdir", &ticket, "-p", "docs/a/b/c"])
+        .await
+        .unwrap();
+    assert!(is_dir("docs/a/b/c"));
+    world
+        .lotusfs(&["mkdir", &ticket, "--parents", "docs/a"])
+        .await
+        .unwrap();
+    world.lotusfs(&["mkdir", &ticket, "-p", "/"]).await.unwrap();
+
+    // But a file in the way is not a directory.
+    assert_eq!(
+        errno(world.lotusfs(&["mkdir", &ticket, "-p", "file/sub"]).await),
+        Some(Errno::NotDir)
+    );
+    assert_eq!(
+        errno(world.lotusfs(&["mkdir", &ticket, "-p", "file"]).await),
+        Some(Errno::NotDir)
+    );
+
+    // A client permitted to read only is refused.
+    world.permit("ro").await;
+    let refused =
+        eventually(async || world.lotusfs(&["mkdir", &ticket, "never"]).await.err()).await;
+    assert!(
+        matches!(
+            refused,
+            lotusfs::cli::Error::Filer(ref e) if e.errno() == Some(Errno::ReadOnly)
+        ),
+        "{refused:?}"
+    );
+    assert!(!world.volume.path().join("never").exists());
+
+    filer.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rm_removes_a_file_but_not_a_directory() {
+    let world = World::new().await;
+    let at = |path: &str| world.volume.path().join(path);
+    std::fs::create_dir(at("docs")).unwrap();
+    std::fs::write(at("docs/a"), b"a").unwrap();
+    std::fs::write(at("kept"), b"kept").unwrap();
+    std::os::unix::fs::symlink("kept", at("link")).unwrap();
+    let filer = world.start_filer();
+    let ticket = world.ticket().await;
+    world.permit("rw").await;
+    world.admitted(&["ls", &ticket]).await;
+
+    world.lotusfs(&["rm", &ticket, "/docs/a"]).await.unwrap();
+    assert!(!at("docs/a").exists());
+
+    // A symlink goes, and what it named stays.
+    world.lotusfs(&["rm", &ticket, "link"]).await.unwrap();
+    assert!(at("link").symlink_metadata().is_err());
+    assert_eq!(std::fs::read(at("kept")).unwrap(), b"kept");
+
+    // A directory, the root among them, is refused and stays.
+    for dir in ["docs", "/"] {
+        assert!(matches!(
+            world.lotusfs(&["rm", &ticket, dir]).await,
+            Err(lotusfs::cli::Error::IsDir { .. })
+        ));
+    }
+    assert!(at("docs").is_dir());
+
+    let missing = world.lotusfs(&["rm", &ticket, "docs/a"]).await.unwrap_err();
+    assert!(
+        matches!(
+            missing,
+            lotusfs::cli::Error::Filer(ref e) if e.errno() == Some(Errno::NotFound)
+        ),
+        "{missing:?}"
+    );
+
+    // A client permitted to read only is refused.
+    world.permit("ro").await;
+    let refused = eventually(async || world.lotusfs(&["rm", &ticket, "kept"]).await.err()).await;
+    assert!(
+        matches!(
+            refused,
+            lotusfs::cli::Error::Filer(ref e) if e.errno() == Some(Errno::ReadOnly)
+        ),
+        "{refused:?}"
+    );
+    assert!(at("kept").exists());
+
+    filer.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_ticket_for_a_volume_nobody_serves_is_refused() {
     let world = World::new().await;
 

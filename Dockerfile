@@ -39,7 +39,7 @@ FROM gcr.io/distroless/static-debian12:nonroot
 
 # filerd and lotusfs ride along: a filer is one more container beside the
 # daemon, sharing its state volume for the control socket. lotusfs can `id`,
-# `ls`, `cat` and `put` here but not `mount` — there is no fusermount3 in this image.
+# `ls`, `cat`, `put`, `mkdir` and `rm` here but not `mount` — there is no fusermount3 in this image.
 COPY --from=build /out/lotusd /out/lotusctl /out/lotusweb /out/filerd /out/lotusfs /usr/local/bin/
 # Owned by nonroot so a plain `docker run -v` works; under Kubernetes the
 # volume's own ownership wins, hence `fsGroup: 65532` in the pod spec.

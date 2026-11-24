@@ -15,8 +15,8 @@ use std::{
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use filer_client::{Session, Ticket, key};
 use filer_proto::fs::{
-    self, Attr, ByteBuf, Create, Errno, Fsync, Kind, Lookup, MAX_IO_LEN, Name, Read, Request,
-    SetAttr,
+    self, Attr, ByteBuf, Create, Errno, Fsync, Kind, Lookup, MAX_IO_LEN, Mkdir, Name, NodeId, Read,
+    Request, SetAttr, Unlink,
 };
 use iroh::{
     Endpoint, RelayMode,
@@ -75,6 +75,17 @@ enum Command {
         file holding what arrived."
     )]
     Put(PutArgs),
+    /// Makes a directory of a volume
+    #[command(long_about = "Makes a directory of a volume.\n\n\
+        With --parents, the directories leading to it are made too where \
+        they are missing, and one already there is no failure, as \
+        `mkdir -p` would.")]
+    Mkdir(MkdirArgs),
+    /// Removes a file or symlink of a volume
+    #[command(long_about = "Removes a file or symlink of a volume.\n\n\
+        A directory is refused, as `rm` without -r would refuse it; a symlink \
+        is removed itself, never what it points at.")]
+    Rm(PathArgs),
 }
 
 #[derive(Debug, Args)]
@@ -102,6 +113,17 @@ struct PutArgs {
     path: String,
     /// The local file to copy; standard input when absent or `-`
     file: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct MkdirArgs {
+    /// The volume's ticket, from `filerd ticket`
+    ticket: Ticket,
+    /// The path inside the volume of the directory to make
+    path: String,
+    /// Make missing parent directories too, and accept one already there
+    #[arg(short, long)]
+    parents: bool,
 }
 
 /// Where `put` reads what it writes.
@@ -175,7 +197,9 @@ pub enum Error {
     )]
     StillInUse { mountpoint: PathBuf },
     #[cfg(not(target_os = "linux"))]
-    #[error("mounting is only built for Linux so far; `ls`, `cat` and `put` work here")]
+    #[error(
+        "mounting is only built for Linux so far; `ls`, `cat`, `put`, `mkdir` and `rm` work here"
+    )]
     MountUnsupported,
 }
 
@@ -226,6 +250,15 @@ pub async fn execute(
             )
             .await
         }
+        Command::Mkdir(args) => {
+            mkdir(
+                Session::new(endpoint.clone(), args.ticket),
+                &args.path,
+                args.parents,
+            )
+            .await
+        }
+        Command::Rm(args) => rm(Session::new(endpoint.clone(), args.ticket), &args.path).await,
         Command::Mount(args) => {
             mount(
                 Session::new(endpoint.clone(), args.ticket),
@@ -297,10 +330,16 @@ enum Target {
     Dir(Attr),
 }
 
+/// `path` as the directory it is in and its last segment, which is empty
+/// for the root.
+fn split_last(path: &str) -> (&str, &str) {
+    let trimmed = path.trim_end_matches('/');
+    trimmed.rsplit_once('/').unwrap_or(("", trimmed))
+}
+
 /// Resolves `path` to where `put` writes.
 async fn target(session: &Session, path: &str) -> Result<Target, Error> {
-    let trimmed = path.trim_end_matches('/');
-    let (parent, last) = trimmed.rsplit_once('/').unwrap_or(("", trimmed));
+    let (parent, last) = split_last(path);
     let parent = session.walk(parent).await?;
     if last.is_empty() {
         return Ok(Target::Dir(parent));
@@ -425,6 +464,98 @@ async fn write_all(
             .map_err(Copy::Filer)?;
         offset += len;
     }
+}
+
+/// The permissions a directory `mkdir` makes is given, as `mkdir` gives
+/// one under the usual umask.
+const DIR_MODE: u32 = 0o755;
+
+async fn mkdir(session: Session, path: &str, parents: bool) -> Result<(), Error> {
+    let names = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| Name::try_new(segment).map_err(|_| filer_client::Error::Op(Errno::Invalid)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let Some((last, leading)) = names.split_last() else {
+        // The root is always there.
+        return match parents {
+            true => Ok(()),
+            false => Err(filer_client::Error::Op(Errno::Exists).into()),
+        };
+    };
+    let mut at = session.walk("").await?;
+    if !parents {
+        for name in leading {
+            at = lookup(&session, at.node, name).await?;
+        }
+        return session
+            .attr(make_dir(at.node, last.clone()))
+            .await
+            .map(drop)
+            .map_err(Error::Filer);
+    }
+    for name in &names {
+        at = ensure_dir(&session, at.node, name).await?;
+    }
+    Ok(())
+}
+
+fn make_dir(parent: NodeId, name: Name) -> Request {
+    Request::Mkdir(Mkdir {
+        parent,
+        name,
+        mode: DIR_MODE,
+    })
+}
+
+async fn lookup(session: &Session, parent: NodeId, name: &Name) -> Result<Attr, Error> {
+    session
+        .attr(Request::Lookup(Lookup {
+            parent,
+            name: name.clone(),
+        }))
+        .await
+        .map_err(Error::Filer)
+}
+
+/// The directory `name` in `parent`, made if it is missing.
+async fn ensure_dir(session: &Session, parent: NodeId, name: &Name) -> Result<Attr, Error> {
+    let found = match lookup(session, parent, name).await {
+        Err(Error::Filer(e)) if e.errno() == Some(Errno::NotFound) => {
+            match session.attr(make_dir(parent, name.clone())).await {
+                // Made by someone else since the lookup.
+                Err(e) if e.errno() == Some(Errno::Exists) => lookup(session, parent, name).await,
+                made => made.map_err(Error::Filer),
+            }
+        }
+        found => found,
+    }?;
+    match found.kind {
+        Kind::Dir => Ok(found),
+        Kind::File | Kind::Symlink => Err(filer_client::Error::Op(Errno::NotDir).into()),
+    }
+}
+
+async fn rm(session: Session, path: &str) -> Result<(), Error> {
+    let is_dir = || Error::IsDir {
+        path: path.to_owned(),
+    };
+    let (parent, last) = split_last(path);
+    if last.is_empty() {
+        return Err(is_dir());
+    }
+    let name = Name::try_new(last).map_err(|_| filer_client::Error::Op(Errno::Invalid))?;
+    let parent = session.walk(parent).await?;
+    session
+        .done(Request::Unlink(Unlink {
+            parent: parent.node,
+            name,
+        }))
+        .await
+        .map_err(|e| match e.errno() {
+            Some(Errno::IsDir) => is_dir(),
+            _ => Error::Filer(e),
+        })
 }
 
 #[cfg(target_os = "linux")]
