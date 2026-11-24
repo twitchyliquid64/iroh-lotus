@@ -25,9 +25,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target,sharing=locked \
     set -eux; \
     git config --global --add safe.directory /src; \
-    cargo build --release --locked -p lotusd -p lotusctl -p lotusweb; \
+    cargo build --release --locked -p lotusd -p lotusctl -p lotusweb -p filerd -p lotusfs; \
     mkdir -p /out /state; \
-    cp target/release/lotusd target/release/lotusctl target/release/lotusweb /out/
+    cp target/release/lotusd target/release/lotusctl target/release/lotusweb \
+       target/release/filerd target/release/lotusfs /out/
 
 # distroless/static carries the CA bundle lotusd trusts for the n0 relay's HTTPS
 # (read live from /etc/ssl/certs, or SSL_CERT_FILE/SSL_CERT_DIR when set, never
@@ -36,7 +37,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 # patched.
 FROM gcr.io/distroless/static-debian12:nonroot
 
-COPY --from=build /out/lotusd /out/lotusctl /out/lotusweb /usr/local/bin/
+# filerd and lotusfs ride along: a filer is one more container beside the
+# daemon, sharing its state volume for the control socket. lotusfs can `id`,
+# `ls` and `cat` here but not `mount` — there is no fusermount3 in this image.
+COPY --from=build /out/lotusd /out/lotusctl /out/lotusweb /out/filerd /out/lotusfs /usr/local/bin/
 # Owned by nonroot so a plain `docker run -v` works; under Kubernetes the
 # volume's own ownership wins, hence `fsGroup: 65532` in the pod spec.
 COPY --from=build --chown=65532:65532 /state /var/lib/lotus
@@ -44,7 +48,11 @@ COPY --from=build --chown=65532:65532 /state /var/lib/lotus
 # lotusd, lotusctl and lotusweb all read LOTUS_STATE_DIR, so one setting keeps
 # the daemon and a `kubectl exec ... lotusctl status` agreeing on where the
 # control socket lives.
+#
+# filerd keeps its own endpoint key apart from the daemon's, in a directory
+# beside them on the same volume, so one volume holds a node's whole identity.
 ENV LOTUS_STATE_DIR=/var/lib/lotus
+ENV LOTUS_FILER_STATE_DIR=/var/lib/lotus/filer
 VOLUME ["/var/lib/lotus"]
 
 # lotusweb only, and only once told to bind somewhere reachable: its default is

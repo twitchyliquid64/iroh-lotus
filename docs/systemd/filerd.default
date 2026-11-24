@@ -1,0 +1,24 @@
+# Environment for filerd.service. Install to /etc/default/filerd.
+
+# The volumes to serve, as NAME=DIRECTORY, comma-separated. Required: filerd
+# does not start without at least one. A name is lowercase letters, digits,
+# `-` and `_`; it is what the ledger lists the volume under and what a ticket
+# names. A directory must exist, be writable by the lotus-filer user, and sit
+# under /var/lib/lotus-filer/volumes unless a drop-in adds its path to
+# ReadWritePaths= (see docs/systemd.md).
+#
+# The unit makes /var/lib/lotus-filer/volumes/default, ready to serve:
+# uncomment this to serve it as the volume `default`.
+#LOTUS_FILER_VOLUMES=default=/var/lib/lotus-filer/volumes/default
+
+# Relay infrastructure: n0 (public relays, reached over outbound HTTPS) or
+# none (direct connections only).
+#LOTUS_FILER_RELAY=n0
+
+# UDP addresses the endpoint binds, comma-separated, one per IP family
+# (default 0.0.0.0:0 and [::]:0). A fixed port goes here too, which is what
+# to open in a firewall for clients that should connect directly.
+#LOTUS_FILER_BIND=0.0.0.0:0,[::]:0
+
+# Log filter, as tracing_subscriber's EnvFilter reads it.
+#RUST_LOG=info

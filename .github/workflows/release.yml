@@ -58,7 +58,7 @@ jobs:
                   musl-gcc --version
                   rustup target add ${{ matrix.target }}
 
-            - name: Build lotusd, lotusctl and lotusweb
+            - name: Build the binaries
               env:
                   # cc-rs guesses a prefixed cross-compiler for musl targets and
                   # never checks it exists: aarch64 resolves to the hardcoded
@@ -67,7 +67,7 @@ jobs:
                   # than relying on that guess on either arch.
                   CC_x86_64_unknown_linux_musl: musl-gcc
                   CC_aarch64_unknown_linux_musl: musl-gcc
-              run: cargo build --release --locked --target ${{ matrix.target }} -p lotusd -p lotusctl -p lotusweb
+              run: cargo build --release --locked --target ${{ matrix.target }} -p lotusd -p lotusctl -p lotusweb -p filerd -p lotusfs
 
             - name: Verify the binaries report the tag
               env:
@@ -75,7 +75,7 @@ jobs:
               run: |
                   set -euo pipefail
                   cd target/${{ matrix.target }}/release
-                  for bin in lotusd lotusctl lotusweb; do
+                  for bin in lotusd lotusctl lotusweb filerd lotusfs; do
                       reported=$(./"$bin" -V | awk '{print $2}')
                       if [ "$reported" != "${TAG#v}" ]; then
                           echo "::error::$bin reports $reported, expected ${TAG#v}"
@@ -94,6 +94,8 @@ jobs:
                   cp target/${{ matrix.target }}/release/lotusd \
                      target/${{ matrix.target }}/release/lotusctl \
                      target/${{ matrix.target }}/release/lotusweb \
+                     target/${{ matrix.target }}/release/filerd \
+                     target/${{ matrix.target }}/release/lotusfs \
                      LICENSE README.md "dist/$name/"
                   # Same docs/ layout as the repo, so docs/systemd.md's install
                   # commands run as written from the unpacked directory.

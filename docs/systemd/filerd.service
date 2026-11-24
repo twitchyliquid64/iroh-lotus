@@ -1,0 +1,77 @@
+# iroh-lotus filer. Install to /etc/systemd/system/filerd.service; see docs/systemd.md.
+[Unit]
+Description=iroh-lotus filer
+Documentation=https://github.com/twitchyliquid64/iroh-lotus
+After=network-online.target lotusd.service
+Wants=network-online.target lotusd.service
+# filerd reaches the ledger through lotusd's control socket but does not need
+# it to start: while the daemon is down it admits no new client, keeps the
+# ones it has, and picks the ledger up again when the daemon returns.
+
+[Service]
+Type=exec
+# A user of its own, not lotus: the filer holds no ledger key, and the files
+# clients write are owned by whoever it runs as, so that should be a fixed
+# account and not the daemon's. The lotus group is what reaches the control
+# socket (/var/lib/lotus is lotus:lotus 0750, the socket 0660).
+User=lotus-filer
+Group=lotus-filer
+SupplementaryGroups=lotus
+# /var/lib/lotus-filer holds the filer's endpoint key, and under volumes/ the
+# directories it serves. systemd makes both when missing, owned by the user
+# above, and leaves what is in them alone. volumes/default is there ready to
+# serve, and is served only once /etc/default/filerd names it.
+StateDirectory=lotus-filer lotus-filer/volumes/default
+StateDirectoryMode=0700
+Environment=LOTUS_STATE_DIR=/var/lib/lotus
+Environment=LOTUS_FILER_STATE_DIR=/var/lib/lotus-filer
+Environment=RUST_LOG=info
+# Which volumes to serve is LOTUS_FILER_VOLUMES in this file. There is no
+# default: with none set filerd exits with a usage error, which the unit
+# does not restart from.
+EnvironmentFile=-/etc/default/filerd
+ExecStart=/usr/local/bin/filerd run
+RestartPreventExitStatus=2
+# filerd shuts down cleanly on SIGTERM and SIGINT alike, hanging up on its
+# clients as it goes.
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5s
+
+# Hardening. The filer needs its key, the control socket, outbound UDP and
+# HTTPS, netlink for iroh to notice interfaces coming and going — and the
+# directories it serves, which are the one thing that varies by host.
+#
+# ProtectSystem=strict leaves the whole filesystem read-only but for the
+# state directory, so volumes under /var/lib/lotus-filer/volumes work as
+# shipped. A volume anywhere else needs a drop-in adding its directory to
+# ReadWritePaths= — see docs/systemd.md. ProtectHome=yes puts /home, /root
+# and /run/user out of reach altogether.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# Not the 0077 the daemon runs under: the umask is applied to every file a
+# client creates, and a tighter one would quietly strip the group and other
+# bits clients ask for. The key file is created 0600 whatever this says.
+UMask=0022
+
+[Install]
+WantedBy=multi-user.target

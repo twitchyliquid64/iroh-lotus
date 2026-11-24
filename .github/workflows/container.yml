@@ -87,7 +87,7 @@ jobs:
             - name: Verify the binaries in the image
               run: |
                   set -euo pipefail
-                  for bin in lotusd lotusctl lotusweb; do
+                  for bin in lotusd lotusctl lotusweb filerd lotusfs; do
                       reported=$(docker run --rm iroh-lotus:verify "$bin" -V | awk '{print $2}')
                       echo "$bin reports $reported"
                       if [ -n "$RELEASE_TAG" ] && [ "$reported" != "${RELEASE_TAG#v}" ]; then

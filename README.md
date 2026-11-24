@@ -63,7 +63,8 @@ Repeat for each additional node.
 
 [docs/systemd.md](docs/systemd.md) covers running it as a system service on Debian — the
 `lotus` user, the one-shot join before the daemon will start, which accounts reach the
-control socket, and an optional unit that serves `lotusweb` on loopback beside it.
+control socket, an optional unit that serves `lotusweb` on loopback beside it, and one
+for `filerd`, which serves directories on the host to `lotusfs` clients over iroh.
 `lotusctl` and `lotusweb` find a daemon in `/var/lib/lotus` on their own when the account
 runs none of its own.
 

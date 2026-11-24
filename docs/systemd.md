@@ -11,6 +11,9 @@ each release tarball under `docs/systemd/`:
 | `lotusd.default` | `/etc/default/lotusd` | Optional environment: relay, discovery, bind addresses, compaction, log level. |
 | `lotusweb.service` | `/etc/systemd/system/` | The web view, `lotusweb`, on loopback, as a throwaway user in the `lotus` group. Optional. |
 | `lotusweb.default` | `/etc/default/lotusweb` | Optional environment for it: listen address, log level. |
+| `filerd.service` | `/etc/systemd/system/` | The filer, `filerd run`, as the `lotus-filer` user. Optional. |
+| `filerd.sysusers.conf` | `/usr/lib/sysusers.d/filerd.conf` | The `lotus-filer` system user, and its membership of the `lotus` group. |
+| `filerd.default` | `/etc/default/filerd` | Its environment: the volumes to serve (required), relay, bind addresses, log level. |
 
 The daemon runs as the `lotus` user, and the state directory `/var/lib/lotus` is
 `lotus:lotus` `0750`, so no operator account can write it directly. That is deliberate:
@@ -22,7 +25,7 @@ or joining one, are done *through* systemd, which has the access.
 ```sh
 tar -xzf iroh-lotus-v*-linux-amd64.tar.gz
 cd iroh-lotus-v*-linux-amd64
-sudo install lotus{d,ctl,web} /usr/local/bin
+sudo install lotus{d,ctl,web,fs} filerd /usr/local/bin
 sudo install -m 0644 docs/systemd/lotusd.service docs/systemd/lotusd-bootstrap.service /etc/systemd/system/
 sudo install -m 0644 docs/systemd/lotusd.sysusers.conf /usr/lib/sysusers.d/lotusd.conf
 sudo install -m 0644 docs/systemd/lotusd.default /etc/default/lotusd
@@ -141,6 +144,105 @@ that authenticates (nginx with `auth_basic`, or whatever fronts the rest of the 
 pointed at `127.0.0.1:8080`; the unit drops the capability to bind a port below 1024, so
 the proxy is what should own port 80 or 443. It stops on SIGINT like the daemon, and
 `Restart=on-failure` covers crashes.
+
+## 6. Serve files with `filerd`
+
+A filer serves directories on this host to clients over iroh, and announces them in the
+ledger through the daemon beside it. It is optional, and runs on whichever nodes have
+files to serve.
+
+```sh
+sudo install -m 0644 docs/systemd/filerd.service /etc/systemd/system/
+sudo install -m 0644 docs/systemd/filerd.sysusers.conf /usr/lib/sysusers.d/filerd.conf
+sudo install -m 0644 docs/systemd/filerd.default /etc/default/filerd
+sudo systemd-sysusers
+sudo systemctl daemon-reload
+```
+
+The unit keeps everything under `/var/lib/lotus-filer`, which systemd creates for the
+`lotus-filer` user the first time it starts: the filer's key, and `volumes/default`, an
+empty directory ready to be a volume. Nothing is served yet: which directories are volumes
+is yours to say.
+
+### Say which volumes to serve
+
+A volume is a name and a directory. They are the filer's own configuration, not the
+ledger's — a directory is a fact about this host — and they go in `/etc/default/filerd`,
+comma-separated:
+
+```sh
+echo 'LOTUS_FILER_VOLUMES=default=/var/lib/lotus-filer/volumes/default' | sudo tee -a /etc/default/filerd
+sudo systemctl enable --now filerd
+```
+
+That serves the directory the unit makes, as the volume `default`. More volumes are more
+directories beside it. The state directory exists once the unit has started once, or
+`install -d` makes the whole path:
+
+```sh
+sudo install -d -o lotus-filer -g lotus-filer -m 0700 /var/lib/lotus-filer /var/lib/lotus-filer/volumes
+sudo install -d -o lotus-filer -g lotus-filer /var/lib/lotus-filer/volumes/media
+# LOTUS_FILER_VOLUMES=default=/var/lib/lotus-filer/volumes/default,media=/var/lib/lotus-filer/volumes/media
+```
+
+Two things decide whether the filer can serve a directory:
+
+- **It must be writable by `lotus-filer`.** Every client is served as that one user, and
+  the files clients create are owned by it.
+- **The unit must be able to see it.** The unit runs with `ProtectSystem=strict`, which
+  makes the whole filesystem read-only apart from its state directory,
+  `/var/lib/lotus-filer`. A volume anywhere else — another disk, say — needs a drop-in:
+
+  ```sh
+  sudo systemctl edit filerd
+  ```
+  ```ini
+  [Service]
+  ReadWritePaths=/mnt/media
+  ```
+
+  Nothing under `/home` can be served without also relaxing `ProtectHome=`.
+
+With no volumes set, `filerd run` exits with a usage error and the unit stays down rather
+than restarting; `systemctl status filerd` shows it. A directory that does not exist is
+retried every few seconds, since it may be a mount that has not arrived yet.
+
+### Admit a client
+
+The filer claims each volume in the ledger as it starts. From then on, on any node:
+
+```sh
+lotusctl get filers                 # the volume, and the filer's endpoint under it
+filerd ticket default               # the lotusfs1… word a client mounts with
+```
+
+A ticket only says where the filer is. A client is admitted by its endpoint id, which the
+client prints with `lotusfs id` and an operator lists under the volume, with what it may do:
+
+```sh
+lotusctl set filers default.allowed_clients \
+  '{"toms-laptop": {"endpoint_id": "<what lotusfs id printed>", "mode": "rw"}}'
+```
+
+`mode` is `ro` or `rw`. The change takes effect at once: a client removed, or cut back to
+`ro`, is hung up on mid-connection. On the client, which needs no lotus at all:
+
+```sh
+lotusfs mount lotusfs1… /mnt/default      # Linux; needs fusermount3 (the fuse3 package)
+lotusfs ls lotusfs1… /                    # anywhere
+```
+
+Worth knowing about the unit:
+
+- **Its key is its identity.** `/var/lib/lotus-filer/filer-secret` is the endpoint the
+  ledger lists each volume under. Lose it and the filer comes back as a stranger: the
+  ledger still names the old endpoint, and the new one will not take the volume over
+  unless started once with `filerd run --takeover`.
+- **It runs without the daemon, up to a point.** With `lotusd` down it keeps serving the
+  clients it has and admits no new ones, since it cannot read who is permitted.
+- **Clients connect directly where they can.** The endpoint binds an ephemeral UDP port
+  by default and falls back to n0's relays; set `LOTUS_FILER_BIND` to a fixed port and
+  open it for direct connections.
 
 ## Recovery
 

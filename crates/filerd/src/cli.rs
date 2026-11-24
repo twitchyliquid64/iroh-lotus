@@ -63,8 +63,17 @@ enum Command {
 
 #[derive(Debug, Args)]
 struct RunArgs {
-    /// A volume to serve, as NAME=DIRECTORY; repeat for more
-    #[arg(long = "volume", short, value_name = "NAME=DIRECTORY", value_parser = parse_volume, required = true)]
+    /// A volume to serve, as NAME=DIRECTORY; repeat for more, or separate
+    /// them with commas
+    #[arg(
+        long = "volume",
+        short,
+        value_name = "NAME=DIRECTORY",
+        value_parser = parse_volume,
+        required = true,
+        env = "LOTUS_FILER_VOLUMES",
+        value_delimiter = ','
+    )]
     volumes: Vec<(VolumeName, PathBuf)>,
 
     /// Where the filer keeps its endpoint key (default: iroh-lotus-filer
