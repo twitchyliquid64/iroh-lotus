@@ -1,7 +1,8 @@
-//! The secret key the filer's iroh endpoint is identified by.
+//! The secret key an iroh endpoint is identified by, kept in a file.
 //!
-//! Its own key, apart from the local daemon's: the filer is another
-//! endpoint, and its id is what the ledger lists a volume under.
+//! A filer and each of its clients has one of its own: the endpoint id it
+//! gives is what the ledger lists a volume under, and what it permits a
+//! client by.
 
 use std::{
     io,
@@ -11,9 +12,6 @@ use std::{
 use iroh::SecretKey;
 use rand::{TryRng, rngs::SysRng};
 use tokio::{fs, io::AsyncWriteExt};
-
-/// The file the key is kept in, under the filer's state directory.
-pub const SECRET_FILENAME: &str = "filer-secret";
 
 /// Why the key could not be loaded or created.
 #[derive(Debug, thiserror::Error)]
@@ -31,10 +29,10 @@ pub enum KeyError {
     Entropy(#[source] rand::rngs::SysError),
 }
 
-/// Loads the key in `state_dir`, drawing and saving one where there is
-/// none yet.
-pub async fn load_or_create(state_dir: &Path) -> Result<SecretKey, KeyError> {
-    let path = state_dir.join(SECRET_FILENAME);
+/// Loads the key in the file at `path`, drawing and saving one where there
+/// is none yet.
+pub async fn load_or_create(path: &Path) -> Result<SecretKey, KeyError> {
+    let path = path.to_path_buf();
     let io = |what| {
         let path = path.clone();
         move |source| KeyError::Io { what, path, source }
@@ -47,9 +45,9 @@ pub async fn load_or_create(state_dir: &Path) -> Result<SecretKey, KeyError> {
                 len: bytes.len(),
             }),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir_all(state_dir)
-                .await
-                .map_err(io("creating"))?;
+            if let Some(dir) = path.parent() {
+                fs::create_dir_all(dir).await.map_err(io("creating"))?;
+            }
             let mut secret = [0u8; 32];
             SysRng
                 .try_fill_bytes(&mut secret)
@@ -80,20 +78,21 @@ mod tests {
     #[tokio::test]
     async fn the_key_is_created_once_and_kept() {
         let dir = tempfile::TempDir::new().unwrap();
-        let state = dir.path().join("filer");
+        let path = dir.path().join("state/secret");
 
-        let first = load_or_create(&state).await.unwrap();
-        let second = load_or_create(&state).await.unwrap();
+        let first = load_or_create(&path).await.unwrap();
+        let second = load_or_create(&path).await.unwrap();
         assert_eq!(first.public(), second.public());
     }
 
     #[tokio::test]
     async fn a_file_that_is_not_a_key_is_refused() {
         let dir = tempfile::TempDir::new().unwrap();
-        std::fs::write(dir.path().join(SECRET_FILENAME), b"short").unwrap();
+        let path = dir.path().join("secret");
+        std::fs::write(&path, b"short").unwrap();
 
         assert!(matches!(
-            load_or_create(dir.path()).await,
+            load_or_create(&path).await,
             Err(KeyError::Length { len: 5, .. })
         ));
     }

@@ -1,10 +1,12 @@
 [workspace]
 members = [
+    "crates/filer-client",
     "crates/filer-proto",
     "crates/filerd",
     "crates/lotus-sdk",
     "crates/lotusctl",
     "crates/lotusd",
+    "crates/lotusfs",
     "crates/lotusd-rpc",
     "crates/lotusweb",
     "crates/render",
@@ -49,8 +51,13 @@ dirs = "7.0"
 ed25519-zebra = "5.0"
 # `platform-verifier`: relay, pkarr and DNS-over-HTTPS TLS trust the host's CA
 # store, not a compiled-in snapshot. See `ip_family::bind`.
+# The FUSE mount in lotusfs. Linux only, without libfuse: the kernel protocol
+# is spoken directly and `fusermount3` does the mounting.
+fuser = { version = "0.19", default-features = false }
 iroh = { version = "1.5", features = ["platform-verifier"] }
 # Compile-time HTML templates for lotusweb; `axum` makes a rendered page a response.
+# errno values for the FUSE mount's replies.
+libc = "0.2"
 maud = { version = "0.27", features = ["axum"] }
 
 # URL spelling of ledger keys and paths in lotusweb.
@@ -75,6 +82,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Our crates
+filer-client = { path = "crates/filer-client" }
 filer-proto = { path = "crates/filer-proto" }
 filerd = { path = "crates/filerd" }
 lotus-sdk = { path = "crates/lotus-sdk" }

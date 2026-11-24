@@ -1,0 +1,36 @@
+[package]
+name = "lotusfs"
+version.workspace = true
+rust-version.workspace = true
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+clap.workspace = true
+dirs.workspace = true
+iroh.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Our crates
+filer-client.workspace = true
+filer-proto.workspace = true
+version.workspace = true
+
+fuser.workspace = true
+libc.workspace = true
+
+# Lets the FUSE layer build, and its tests run, where there is no macFUSE to
+# mount with.
+[target.'cfg(target_os = "macos")'.dependencies]
+fuser = { workspace = true, features = ["macos-no-mount"] }
+
+# The tests run both commands in-process against a real daemon.
+[dev-dependencies]
+filerd.workspace = true
+lotus-sdk.workspace = true
+lotusd.workspace = true
+tempfile.workspace = true

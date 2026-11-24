@@ -29,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 pub mod backing;
 pub use backing::Backing;
 
-pub mod key;
+pub mod cli;
 pub mod ledger;
 
 mod publish;

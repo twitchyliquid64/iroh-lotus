@@ -3,6 +3,7 @@
 
 use std::time::Duration;
 
+use filer_client::{Session, Ticket};
 use filer_proto::{
     Close, Hello, Mode, VolumeName, Welcome,
     fs::{Create, Errno, Lookup, Name, NodeId, Read, Reply, Request, Write},
@@ -580,6 +581,109 @@ async fn operations_run_side_by_side_on_one_connection() {
         assert!(matches!(reply.await.unwrap(), Reply::Attr(_)));
     }
     assert_eq!(std::fs::read_dir(daemon.volume.path()).unwrap().count(), 32);
+
+    handle.shutdown().await;
+}
+
+/// A session from `from` for `scratch` on the filer at `to`.
+fn session(from: &Endpoint, to: EndpointId) -> Session {
+    Session::new(
+        from.clone(),
+        Ticket {
+            volume: scratch(),
+            filer: EndpointAddr::new(to),
+        },
+    )
+}
+
+#[tokio::test]
+async fn a_session_walks_lists_and_reads() {
+    let daemon = daemon().await;
+    let network = TestNetwork::new();
+    let endpoint = endpoint(&network, secret(1)).await;
+    let writer = client_endpoint(&network, 2).await;
+    let reader = client_endpoint(&network, 3).await;
+    let handle = shared(&daemon, &endpoint, writer.id(), reader.id()).await;
+    std::fs::create_dir(daemon.volume.path().join("docs")).unwrap();
+    std::fs::write(daemon.volume.path().join("docs/b"), b"second").unwrap();
+    std::fs::write(daemon.volume.path().join("docs/a"), b"first").unwrap();
+    let session = session(&reader, endpoint.id());
+
+    assert_eq!(session.connect().await.unwrap(), Mode::ReadOnly);
+    let docs = session.walk("/docs/").await.unwrap();
+    let listed = session.list(docs.node).await.unwrap();
+    assert_eq!(
+        listed.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+        ["a", "b"]
+    );
+    let file = session.walk("docs/b").await.unwrap();
+    let data = session
+        .data(Request::Read(Read {
+            node: file.node,
+            offset: 0,
+            len: 100,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(data.as_slice(), b"second");
+    assert_eq!(
+        session.walk("docs/missing").await.unwrap_err().errno(),
+        Some(Errno::NotFound)
+    );
+    assert_eq!(
+        session.walk("docs/../..").await.unwrap_err().errno(),
+        Some(Errno::Invalid)
+    );
+
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_session_refused_says_why() {
+    let daemon = daemon().await;
+    let network = TestNetwork::new();
+    let endpoint = endpoint(&network, secret(1)).await;
+    let writer = client_endpoint(&network, 2).await;
+    let reader = client_endpoint(&network, 3).await;
+    let stranger = client_endpoint(&network, 4).await;
+    let handle = shared(&daemon, &endpoint, writer.id(), reader.id()).await;
+
+    let refused = session(&stranger, endpoint.id()).connect().await;
+    assert!(
+        matches!(
+            refused,
+            Err(filer_client::Error::Refused(Close::NotPermitted))
+        ),
+        "{refused:?}"
+    );
+
+    handle.shutdown().await;
+}
+
+/// The filer keeps nothing per connection, so one that restarts costs a
+/// session nothing but the dial.
+#[tokio::test]
+async fn a_session_carries_on_across_a_filer_restart() {
+    let daemon = daemon().await;
+    let network = TestNetwork::new();
+    let endpoint = endpoint(&network, secret(1)).await;
+    let writer = client_endpoint(&network, 2).await;
+    let reader = client_endpoint(&network, 3).await;
+    let handle = shared(&daemon, &endpoint, writer.id(), reader.id()).await;
+    std::fs::write(daemon.volume.path().join("notes"), b"still here").unwrap();
+    let session = session(&reader, endpoint.id());
+    let before = session.walk("notes").await.unwrap();
+
+    handle.shutdown().await;
+    let handle = filer(&daemon, &endpoint).spawn();
+    standing(&handle, |s| *s == Standing::Published).await;
+    sees(&handle, reader.id(), Some(Mode::ReadOnly)).await;
+
+    let after = timeout(GRACE, session.walk("notes"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.node, before.node);
 
     handle.shutdown().await;
 }
