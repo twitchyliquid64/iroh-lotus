@@ -18,7 +18,7 @@ use filer_client::{
     Session, Ticket,
     proto::{
         Close,
-        fs::{Create, Kind, Lookup, MAX_IO_LEN, Mkdir, Request, Unlink},
+        fs::{Create, Errno, Kind, Lookup, MAX_IO_LEN, Mkdir, Request, Unlink},
     },
 };
 use lotus_sdk::{Client, NamespaceKey, Value};
@@ -128,8 +128,23 @@ impl World {
 
     /// Runs a `lotusfs` command that returns, and gives what it printed.
     async fn lotusfs(&self, args: &[&str]) -> Result<String, lotusfs::cli::Error> {
+        self.lotusfs_fed(args, b"").await
+    }
+
+    /// Runs a `lotusfs` command that returns with `stdin` as its standard
+    /// input, and gives what it printed.
+    async fn lotusfs_fed(
+        &self,
+        args: &[&str],
+        stdin: &[u8],
+    ) -> Result<String, lotusfs::cli::Error> {
         let mut out = Vec::new();
-        let run = lotusfs::cli::execute(self.lotusfs_cli(args), &mut out, std::future::pending());
+        let run = lotusfs::cli::execute(
+            self.lotusfs_cli(args),
+            stdin,
+            &mut out,
+            std::future::pending(),
+        );
         timeout(GRACE, run).await.expect("the command returns")?;
         Ok(String::from_utf8(out).unwrap())
     }
@@ -290,6 +305,105 @@ async fn a_volume_goes_from_served_to_read_through_the_commands() {
         world.lotusfs(&["cat", &ticket, "missing"]).await,
         Err(lotusfs::cli::Error::Filer(_))
     ));
+
+    filer.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn put_writes_stdin_or_a_local_file_into_a_volume() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let world = World::new().await;
+    std::fs::create_dir(world.volume.path().join("docs")).unwrap();
+    let filer = world.start_filer();
+    let ticket = world.ticket().await;
+    world.permit("rw").await;
+    world.admitted(&["ls", &ticket]).await;
+    let on_volume = |path: &str| std::fs::read(world.volume.path().join(path)).unwrap();
+
+    // From standard input, more than one request carries.
+    let big: Vec<u8> = (0..MAX_IO_LEN as usize * 2 + 17)
+        .map(|i| (i % 251) as u8)
+        .collect();
+    world
+        .lotusfs_fed(&["put", &ticket, "docs/big"], &big)
+        .await
+        .unwrap();
+    assert!(on_volume("docs/big") == big);
+
+    // Over a longer file, nothing of it is left.
+    world
+        .lotusfs_fed(&["put", &ticket, "/docs/big"], b"short")
+        .await
+        .unwrap();
+    assert_eq!(on_volume("docs/big"), b"short");
+
+    // `-` is standard input too, and an empty one makes an empty file.
+    world
+        .lotusfs_fed(&["put", &ticket, "empty", "-"], b"")
+        .await
+        .unwrap();
+    assert_eq!(on_volume("empty"), b"");
+
+    // A local file keeps its permissions, and goes into a directory
+    // under its own name.
+    let local = TempDir::new().unwrap();
+    let script = local.path().join("run.sh");
+    std::fs::write(&script, b"#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o750)).unwrap();
+    world
+        .lotusfs(&["put", &ticket, "docs/", script.to_str().unwrap()])
+        .await
+        .unwrap();
+    assert_eq!(on_volume("docs/run.sh"), b"#!/bin/sh\n");
+    let mode = std::fs::metadata(world.volume.path().join("docs/run.sh"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o750);
+    world
+        .lotusfs(&["put", &ticket, "copy", script.to_str().unwrap()])
+        .await
+        .unwrap();
+    assert_eq!(on_volume("copy"), b"#!/bin/sh\n");
+
+    // What makes no sense says so, and writes nothing.
+    assert!(matches!(
+        world.lotusfs_fed(&["put", &ticket, "docs"], b"x").await,
+        Err(lotusfs::cli::Error::IsDir { .. })
+    ));
+    let missing = local.path().join("missing");
+    assert!(matches!(
+        world
+            .lotusfs(&["put", &ticket, "never", missing.to_str().unwrap()])
+            .await,
+        Err(lotusfs::cli::Error::Input { .. })
+    ));
+    assert!(!world.volume.path().join("never").exists());
+    assert!(matches!(
+        world
+            .lotusfs_fed(&["put", &ticket, "nowhere/x"], b"x")
+            .await,
+        Err(lotusfs::cli::Error::Filer(_))
+    ));
+
+    // A client permitted to read only is refused.
+    world.permit("ro").await;
+    let refused = eventually(async || {
+        world
+            .lotusfs_fed(&["put", &ticket, "empty"], b"x")
+            .await
+            .err()
+    })
+    .await;
+    assert!(
+        matches!(
+            refused,
+            lotusfs::cli::Error::Filer(ref e) if e.errno() == Some(Errno::ReadOnly)
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(on_volume("empty"), b"");
 
     filer.stop().await;
 }

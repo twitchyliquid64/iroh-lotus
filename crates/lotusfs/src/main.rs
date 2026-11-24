@@ -37,7 +37,13 @@ async fn async_main() -> Result<(), cli::Error> {
         .init();
 
     let cli = Cli::parse();
-    cli::execute(cli, &mut std::io::stdout(), interrupted()).await
+    cli::execute(
+        cli,
+        tokio::io::stdin(),
+        &mut std::io::stdout(),
+        interrupted(),
+    )
+    .await
 }
 
 /// Resolves on the first interrupt or terminate signal; never, where the

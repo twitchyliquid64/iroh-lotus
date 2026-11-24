@@ -5,19 +5,25 @@
 //! read the arguments, set up logging and listen for signals.
 
 use std::{
+    fmt,
     future::Future,
     io::{self, Write},
-    path::PathBuf,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
 };
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use filer_client::{Session, Ticket, key};
-use filer_proto::fs::{Attr, Kind, MAX_IO_LEN, Read, Request};
+use filer_proto::fs::{
+    self, Attr, ByteBuf, Create, Errno, Fsync, Kind, Lookup, MAX_IO_LEN, Name, Read, Request,
+    SetAttr,
+};
 use iroh::{
     Endpoint, RelayMode,
     endpoint::{default_relay_mode, presets},
     tls::CaTlsConfig,
 };
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// The directory under the user's state directory the client keeps its key
 /// in by default.
@@ -60,6 +66,15 @@ enum Command {
     Ls(PathArgs),
     /// Writes a file of a volume to standard output
     Cat(PathArgs),
+    /// Writes standard input, or a local file, to a file of a volume
+    #[command(
+        long_about = "Writes standard input, or a local file, to a file of a volume.\n\n\
+        The file is created where it is missing and truncated where it is not, \
+        as a shell's `>` would. A path naming a directory takes a local file \
+        under its own name, as `cp` would. A write cut off part way leaves the \
+        file holding what arrived."
+    )]
+    Put(PutArgs),
 }
 
 #[derive(Debug, Args)]
@@ -77,6 +92,41 @@ struct PathArgs {
     /// The path inside the volume
     #[arg(default_value = "/")]
     path: String,
+}
+
+#[derive(Debug, Args)]
+struct PutArgs {
+    /// The volume's ticket, from `filerd ticket`
+    ticket: Ticket,
+    /// The path inside the volume to write to
+    path: String,
+    /// The local file to copy; standard input when absent or `-`
+    file: Option<PathBuf>,
+}
+
+/// Where `put` reads what it writes.
+#[derive(Debug, Clone)]
+pub enum Origin {
+    Stdin,
+    File(PathBuf),
+}
+
+impl Origin {
+    fn new(file: Option<PathBuf>) -> Self {
+        match file {
+            Some(path) if path != Path::new("-") => Origin::File(path),
+            _ => Origin::Stdin,
+        }
+    }
+}
+
+impl fmt::Display for Origin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Origin::Stdin => f.write_str("standard input"),
+            Origin::File(path) => write!(f, "{}", path.display()),
+        }
+    }
 }
 
 /// The relay infrastructure the endpoint binds with, as `--relay` names it.
@@ -103,6 +153,14 @@ pub enum Error {
     IsDir { path: String },
     #[error("writing the output")]
     Output(#[source] io::Error),
+    #[error("reading {origin}")]
+    Input {
+        origin: Origin,
+        #[source]
+        source: io::Error,
+    },
+    #[error("{} has no name a volume can hold", .0.display())]
+    Unnamed(PathBuf),
     #[cfg(target_os = "linux")]
     #[error("mounting at {}", mountpoint.display())]
     Mount {
@@ -117,7 +175,7 @@ pub enum Error {
     )]
     StillInUse { mountpoint: PathBuf },
     #[cfg(not(target_os = "linux"))]
-    #[error("mounting is only built for Linux so far; `ls` and `cat` work here")]
+    #[error("mounting is only built for Linux so far; `ls`, `cat` and `put` work here")]
     MountUnsupported,
 }
 
@@ -143,10 +201,12 @@ pub async fn endpoint(cli: &Cli) -> Result<Endpoint, Error> {
         .map_err(Error::Bind)
 }
 
-/// Carries out the command `cli` asks for, printing what it prints to
-/// `out`. A mount stays until `shutdown` resolves.
+/// Carries out the command `cli` asks for, reading what it reads from
+/// standard input from `stdin` and printing what it prints to `out`. A
+/// mount stays until `shutdown` resolves.
 pub async fn execute(
     cli: Cli,
+    stdin: impl AsyncRead + Unpin,
     out: &mut impl Write,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), Error> {
@@ -156,6 +216,15 @@ pub async fn execute(
         Command::Ls(args) => ls(Session::new(endpoint.clone(), args.ticket), &args.path, out).await,
         Command::Cat(args) => {
             cat(Session::new(endpoint.clone(), args.ticket), &args.path, out).await
+        }
+        Command::Put(args) => {
+            put(
+                Session::new(endpoint.clone(), args.ticket),
+                &args.path,
+                Origin::new(args.file),
+                stdin,
+            )
+            .await
         }
         Command::Mount(args) => {
             mount(
@@ -218,6 +287,143 @@ async fn cat(session: Session, path: &str, out: &mut impl Write) -> Result<(), E
         }
         out.write_all(&data).map_err(Error::Output)?;
         offset += data.len() as u64;
+    }
+}
+
+/// The file to write to: an entry of a directory, or a directory to take
+/// a local file under its own name.
+enum Target {
+    Entry { parent: Attr, name: Name },
+    Dir(Attr),
+}
+
+/// Resolves `path` to where `put` writes.
+async fn target(session: &Session, path: &str) -> Result<Target, Error> {
+    let trimmed = path.trim_end_matches('/');
+    let (parent, last) = trimmed.rsplit_once('/').unwrap_or(("", trimmed));
+    let parent = session.walk(parent).await?;
+    if last.is_empty() {
+        return Ok(Target::Dir(parent));
+    }
+    let name = Name::try_new(last).map_err(|_| filer_client::Error::Op(Errno::Invalid))?;
+    let found = session
+        .attr(Request::Lookup(Lookup {
+            parent: parent.node,
+            name: name.clone(),
+        }))
+        .await;
+    match found {
+        Ok(attr) if attr.kind == Kind::Dir => Ok(Target::Dir(attr)),
+        Ok(_) => Ok(Target::Entry { parent, name }),
+        Err(e) if e.errno() == Some(Errno::NotFound) => Ok(Target::Entry { parent, name }),
+        Err(e) => Err(e.into()),
+    }
+}
+
+async fn put(
+    session: Session,
+    path: &str,
+    origin: Origin,
+    stdin: impl AsyncRead + Unpin,
+) -> Result<(), Error> {
+    let read_err = |source| Error::Input {
+        origin: origin.clone(),
+        source,
+    };
+    // Opened before the volume is touched, so a missing local file
+    // changes nothing there.
+    let (input, mode): (Box<dyn AsyncRead + Unpin>, u32) = match &origin {
+        Origin::Stdin => (Box::new(stdin), 0o644),
+        Origin::File(file) => {
+            let opened = tokio::fs::File::open(file).await.map_err(read_err)?;
+            let meta = opened.metadata().await.map_err(read_err)?;
+            if meta.is_dir() {
+                return Err(read_err(io::ErrorKind::IsADirectory.into()));
+            }
+            (Box::new(opened), meta.permissions().mode() & 0o7777)
+        }
+    };
+
+    let (parent, name) = match (target(&session, path).await?, &origin) {
+        (Target::Entry { parent, name }, _) => (parent, name),
+        (Target::Dir(dir), Origin::File(file)) => (
+            dir,
+            file.file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| Name::try_new(name).ok())
+                .ok_or_else(|| Error::Unnamed(file.clone()))?,
+        ),
+        (Target::Dir(_), Origin::Stdin) => {
+            return Err(Error::IsDir {
+                path: path.to_owned(),
+            });
+        }
+    };
+
+    let node = session
+        .attr(Request::Create(Create {
+            parent: parent.node,
+            name,
+            mode,
+            exclusive: false,
+        }))
+        .await?
+        .node;
+    session
+        .attr(Request::SetAttr(SetAttr {
+            node,
+            mode: None,
+            size: Some(0),
+            atime: None,
+            mtime: None,
+        }))
+        .await?;
+    write_all(&session, node, input)
+        .await
+        .map_err(|e| match e {
+            Copy::Read(source) => read_err(source),
+            Copy::Filer(e) => Error::Filer(e),
+        })?;
+    session
+        .done(Request::Fsync(Fsync { node }))
+        .await
+        .map_err(Error::Filer)
+}
+
+/// How copying into a file of a volume failed.
+enum Copy {
+    Read(io::Error),
+    Filer(filer_client::Error),
+}
+
+/// Writes everything `input` holds into `node` from its start, a request
+/// at a time.
+async fn write_all(
+    session: &Session,
+    node: fs::NodeId,
+    mut input: impl AsyncRead + Unpin,
+) -> Result<(), Copy> {
+    let mut offset = 0;
+    loop {
+        let mut chunk = Vec::new();
+        (&mut input)
+            .take(MAX_IO_LEN.into())
+            .read_to_end(&mut chunk)
+            .await
+            .map_err(Copy::Read)?;
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        let len = chunk.len() as u64;
+        session
+            .done(Request::Write(fs::Write {
+                node,
+                offset,
+                data: ByteBuf::from(chunk),
+            }))
+            .await
+            .map_err(Copy::Filer)?;
+        offset += len;
     }
 }
 

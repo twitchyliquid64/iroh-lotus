@@ -230,6 +230,8 @@ lotusctl set filers default.allowed_clients \
 ```sh
 lotusfs mount lotusfs1… /mnt/default      # Linux; needs fusermount3 (the fuse3 package)
 lotusfs ls lotusfs1… /                    # anywhere
+lotusfs put lotusfs1… /notes.txt < notes.txt
+lotusfs put lotusfs1… /docs/ report.pdf   # into docs/, as report.pdf
 ```
 
 Worth knowing about the unit:
